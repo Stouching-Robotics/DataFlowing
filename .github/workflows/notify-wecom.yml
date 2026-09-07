@@ -1,15 +1,12 @@
 name: Notify WeCom Group
 
 # 仓库动态推送企业微信群:push / Issue / Issue 评论 / PR / PR 代码评论 / 星标 / fork
-# push 事件只监听 processor/ 目录(你的代码)和工作流自身;其余事件为仓库级
+# push 事件监听全仓库(processor 和 collector 都会通知)
 # 配置要求:仓库 secret 里要有 WECOM_WEBHOOK(企业微信群机器人 webhook 地址)
 # 企业微信机器人安全设置请选"关键词"并填 GitHub(消息首行永远包含 GitHub 三字)
 
 on:
   push:
-    paths:
-      - 'processor/**'
-      - '.github/workflows/**'
   issues:
     types: [opened, closed, reopened]
   issue_comment:

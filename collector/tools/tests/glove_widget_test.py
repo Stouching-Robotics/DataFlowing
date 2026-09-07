@@ -94,12 +94,18 @@ class MockBLE(QObject):
 
 class FakeGlove(QWidget):
     """主窗口集成测试用的手套控件替身。"""
-    def __init__(self, slot, address, role, label, parent=None):
+    created = []
+
+    def __init__(self, slot, address, role, label, parent=None,
+                 engine=None, on_log=None):
         super().__init__(parent)
         self.slot, self.address, self.role, self.label = slot, address, role, label
+        self.engine = engine
+        self.on_log = on_log
         self.started = None
         self.stopped = False
         self.pipeline = None
+        FakeGlove.created.append(self)
 
     def start(self, addr):
         self.started = addr
@@ -231,6 +237,72 @@ def main():
         win._teardown_all_workers()
         check(not win._workers and not win.grid.slot_ids(),
               "teardown 清理手套画面与条目")
+
+        # ── 5. USB (Type-C) 手套：仿生手掌 + 骨架画面进主网格 ──
+        print("── 5. USB 手套画面进主网格（GloveWidget + UsbGloveEngine） ──")
+        import core.device_detector as dd
+        import core.usb_glove_engine as uge
+        orig_prefer = dd.usb_glove_prefer_side
+        orig_engine = uge.UsbGloveEngine
+        dd.usb_glove_prefer_side = lambda serial: "left_glove"
+
+        class MockUSBEngine:
+            instances = []
+
+            def __init__(self, port=""):
+                self.port = port
+                MockUSBEngine.instances.append(self)
+
+            def connect_device(self, address=""):
+                self.address = address
+
+            def disconnect(self):
+                pass
+
+        uge.UsbGloveEngine = MockUSBEngine
+        FakeGlove.created = []
+        try:
+            usb_dev = _mk_dev("usbglove:2067376F3032", "usb_glove",
+                              "USB 手套·左手", address="/dev/ttyACM0")
+            win._on_device_toggled(usb_dev, True)
+            app.processEvents()
+            usb_slot = "sensor:usbglove:2067376F3032"
+            check(usb_slot in win.grid.slot_ids(),
+                  f"USB 手套画面进主网格: {win.grid.slot_ids()}")
+            entry = win._workers.get(usb_dev.key, {})
+            check(entry.get("kind") == "data_ble"
+                  and entry.get("sensor_column") == "left_glove",
+                  f"worker 条目 kind/角色: {entry.get('kind')}/"
+                  f"{entry.get('sensor_column')}")
+            check(len(FakeGlove.created) == 1
+                  and FakeGlove.created[0].slot == usb_slot
+                  and FakeGlove.created[0].role == "left_glove",
+                  "GloveWidget 以 slot/角色创建")
+            w = FakeGlove.created[0]
+            check(w.started == "/dev/ttyACM0", f"画面控件已启动: {w.started}")
+            check(w.pipeline is win._pipeline, "画面控件绑定录制管线")
+            check(isinstance(w.engine, MockUSBEngine)
+                  and w.engine.port == "/dev/ttyACM0",
+                  "UsbGloveEngine 以串口路径创建")
+            check(w.on_log == win._log,
+                  "on_log 接主窗口日志（与旧 GloveDataPump 同口径）")
+            check("left_glove" in win._pipeline._sensor_names,
+                  "传感器列已注册")
+            # 幂等：重复打开不建第二个控件
+            win._on_device_toggled(usb_dev, True)
+            app.processEvents()
+            check(len(FakeGlove.created) == 1, "重复打开幂等（单控件）")
+            # 关闭：控件停、画面撤、列注销、条目移除
+            win._on_device_toggled(usb_dev, False)
+            app.processEvents()
+            check(w.stopped, "关闭时画面控件停止")
+            check(usb_slot not in win.grid.slot_ids(), "关闭后网格画面移除")
+            check("left_glove" not in win._pipeline._sensor_names,
+                  "关闭后传感器列注销")
+            check(usb_dev.key not in win._workers, "关闭后 worker 条目移除")
+        finally:
+            dd.usb_glove_prefer_side = orig_prefer
+            uge.UsbGloveEngine = orig_engine
     finally:
         settings.DEVICE_NAMES_FILE = orig_names_file
         try:
@@ -239,6 +311,136 @@ def main():
             pass
         win.close()
         app.processEvents()
+
+    print("── 6. GloveDataPump._tick: IMU + 骨架关键点写入 ──")
+    import ui.glove_widget as gwp
+
+    class TickEngine:
+        def __init__(self):
+            self.imu = (np.zeros(64, np.float32), np.ones(16, np.float32),
+                        123456789)
+            self.latest_data_ts_us = 999
+
+        def process_frame(self):
+            return np.zeros((16, 16), np.float32), 0.0
+
+        def latest_imu(self):
+            return self.imu
+
+    class RecPipeline(FakePipeline):
+        def __init__(self):
+            super().__init__()
+            self.imu_writes = []
+            self.kpts_writes = []
+
+        def write_glove_imu(self, sn, q, v):
+            self.imu_writes.append(sn)
+
+        def write_glove_keypoints(self, sn, k):
+            self.kpts_writes.append((sn, k))
+
+    class FakeSolver:
+        def __init__(self, kpts):
+            self.kpts = kpts
+
+        def available(self):
+            return self.kpts is not None
+
+        def process(self, q, v, ts):
+            return self.kpts
+
+    kpts63 = np.arange(63, dtype=np.float32) / 63.0
+    pipe = RecPipeline()
+    pump = gwp.GloveDataPump("slot", "left_glove", TickEngine(),
+                             on_log=lambda m: None)
+    pump._running = True
+    pump.set_pipeline(pipe)
+    pump._solver = FakeSolver(kpts63)
+    pump._tick()
+    check(len(pipe.sensor_writes) == 1
+          and pipe.sensor_writes[0][0] == "left_glove",
+          "_tick 写触觉列")
+    check(pipe.imu_writes == ["left_glove"], "_tick 写 IMU 列")
+    check(pipe.kpts_writes == [("left_glove", kpts63)]
+          and np.array_equal(pipe.kpts_writes[0][1], kpts63),
+          "_tick 写骨架关键点")
+    pipe2 = RecPipeline()
+    pump2 = gwp.GloveDataPump("slot", "left_glove", TickEngine(),
+                              on_log=lambda m: None)
+    pump2._running = True
+    pump2.set_pipeline(pipe2)
+    pump2._solver = FakeSolver(None)
+    pump2._tick()
+    check(pipe2.kpts_writes == [] and pipe2.imu_writes == ["left_glove"],
+          "解算器不可用: 只写 IMU 不写骨架")
+
+    print("── 7. GloveWidget USB: 骨架小窗叠加 + write_glove_keypoints ──")
+
+    class RenderUSBEngine:
+        """UsbGloveEngine 替身：渲染所需的全部属性 + latest_imu。"""
+
+        def __init__(self):
+            self.imu = (np.zeros(64, np.float32), np.ones(16, np.float32),
+                        123456789)
+            self.latest_data_ts_us = 999
+            self.is_calibrating = False
+            self.hardware_fps = 60.0
+            self.base_noise_gate = 500
+            self.dynamic_noise_ratio = 0.0
+            self.spatial_filter_enabled = True
+            self.drift_baseline_val = 0
+
+        def process_frame(self):
+            return np.random.rand(16, 16).astype(np.float32) * 3000, 3000.0
+
+        def latest_imu(self):
+            return self.imu
+
+    class RecPipeline2(FakePipeline):
+        def __init__(self):
+            super().__init__()
+            self.imu_writes = []
+            self.kpts_writes = []
+
+        def write_glove_imu(self, sn, q, v):
+            self.imu_writes.append(sn)
+
+        def write_glove_keypoints(self, sn, k):
+            self.kpts_writes.append((sn, k))
+
+    logs = []
+    wgt = gw.GloveWidget("sensor:usbglove:X", "/dev/ttyACM0", "right_glove",
+                         "USB 右手套", engine=RenderUSBEngine(),
+                         on_log=lambda m: logs.append(m))
+    pipe3 = RecPipeline2()
+    wgt.set_pipeline(pipe3)
+    wgt._running = True
+    kpts213 = np.arange(63, dtype=np.float32).reshape(21, 3) / 63.0
+    wgt._solver = FakeSolver(kpts213)
+    wgt._render_tick()
+    check(pipe3.kpts_writes == [("right_glove", kpts213)]
+          and np.array_equal(pipe3.kpts_writes[0][1], kpts213),
+          "_render_tick 写骨架关键点（录制中）")
+    check(pipe3.imu_writes == ["right_glove"], "_render_tick 写 IMU 列")
+    pm = wgt.video_widget._pixmap
+    check(pm is not None, "画面帧已落 widget")
+    qimg = pm.toImage()
+    ptr = qimg.constBits()
+    ptr.setsize(qimg.byteCount())
+    frame = np.frombuffer(ptr, np.uint8).reshape(
+        qimg.height(), qimg.bytesPerLine())[:, :qimg.width() * 3].reshape(
+        qimg.height(), qimg.width(), 3)
+    region = frame[412:712, 8:348]
+    check(int(region.max()) > 40,
+          f"左下角骨架小窗出现（区域 max {int(region.max())}）")
+    # 解算器不可用: 不写骨架、不叠小窗
+    wgt._kpts = None
+    wgt._solver = FakeSolver(None)
+    pipe4 = RecPipeline2()
+    wgt.set_pipeline(pipe4)
+    wgt._render_tick()
+    check(pipe4.kpts_writes == [] and pipe4.imu_writes == ["right_glove"],
+          "解算器不可用: 只写 IMU 不写骨架")
 
     print()
     if FAILS:

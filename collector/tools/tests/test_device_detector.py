@@ -30,6 +30,7 @@ import core.device_detector as det
 from core.device_detector import (
     DeviceInfo, _parse_by_id_entry, _list_uvc_devices, _list_s80m_devices,
     _mac_norm, _bluetoothctl_paired, _list_ble_devices,
+    _glove_side_by_serial,
     detect_devices, DeviceScanner, set_ble_scan_suppressed,
 )
 
@@ -112,11 +113,13 @@ def _main():
     check(infos == [], "无 FTDI 时返回空")
 
     print("── 4. detect_devices 子模块异常不崩 ──")
+    # v1.1.3 起 detect_devices 有第五段 USB 手套枚举，同样要炸掉
     with patch("core.device_detector._list_uvc_devices", side_effect=OSError("boom")), \
          patch("core.device_detector._list_d435_devices", side_effect=OSError("boom")), \
          patch("core.device_detector._list_s80m_devices", side_effect=OSError("boom")), \
-         patch("core.device_detector._list_ble_devices", side_effect=OSError("boom")):
-        check(detect_devices() == [], "四段全炸 → 返回空列表不抛异常")
+         patch("core.device_detector._list_ble_devices", side_effect=OSError("boom")), \
+         patch("core.device_detector._list_usb_glove_devices", side_effect=OSError("boom")):
+        check(detect_devices() == [], "五段全炸 → 返回空列表不抛异常")
 
     print("── 5. DeviceScanner 信号投递 ──")
     app = QCoreApplication.instance() or QCoreApplication(sys.argv)
@@ -252,6 +255,24 @@ def _main():
         check(_settings.device_name("不存在的key") == "" and
               _settings.device_sensor_role("不存在的key") == "",
               "缺失条目安全回落空串")
+
+        # v1.1.3: USB 手套序列号注册的侧别是权威信息 —— 即便 BLE 陈旧绑定
+        # 占着 right_glove，也直接占用并驱逐（右手套不得落到 left_glove）
+        role = _settings.assign_glove_sensor_role("usbglove:2096376E3032",
+                                                  "right_glove")
+        check(role == "right_glove"
+              and _settings.device_sensor_role("usbglove:2096376E3032")
+              == "right_glove",
+              f"USB 权威侧别占用 right_glove: {role}")
+        check(_settings.device_sensor_role("ble:AA:11:22:33:44:55") == "",
+              "被抢占列的陈旧 BLE 绑定已释放")
+        check(_settings.assign_glove_sensor_role("usbglove:2096376E3032",
+                                                 "right_glove") == "right_glove",
+              "USB 手套重连保持绑定（幂等）")
+        # 非 usbglove 键（BLE）保持原有碰撞规避语义：right 被占 → 落 left
+        check(_settings.assign_glove_sensor_role("ble:FF:11:22:33:44:55",
+                                                 "right_glove") == "left_glove",
+              "BLE 键仍按空闲列规避碰撞")
     finally:
         _settings.DEVICE_NAMES_FILE = _orig_file
         try:
@@ -259,7 +280,17 @@ def _main():
         except OSError:
             pass
 
-    print("── 12. 真机段（蓝牙在位时） ──")
+    print("── 12. USB 手套序列号 → 侧别映射（真实注册表） ──")
+    det._glove_side_cache = None  # 清缓存强制重读
+    side_map = _glove_side_by_serial()
+    check(side_map.get("2095376e3032") == "right_glove",
+          f"右手套主序列号 → right_glove: {side_map}")
+    check(side_map.get("2096376e3032") == "right_glove",
+          f"右手套备用序列号（换机/固件变更）→ right_glove: {side_map}")
+    check(side_map.get("2067376f3032") == "left_glove",
+          f"左手套序列号 → left_glove: {side_map}")
+
+    print("── 13. 真机段（蓝牙在位时） ──")
     if os.path.exists("/usr/bin/bluetoothctl") or os.path.exists("/usr/local/bin/bluetoothctl"):
         paired = _bluetoothctl_paired()
         check(True, f"bluetoothctl 可用，已配对 {len(paired)} 台（不做断言）")

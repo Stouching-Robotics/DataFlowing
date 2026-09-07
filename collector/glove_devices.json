@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "left": {
+    "usb_serial": "2067376F3032"
+  },
+  "right": {
+    "usb_serial": "2095376E3032"
+  },
+  "extra_usb_serials": {
+    "2096376E3032": "right_glove"
+  }
+}

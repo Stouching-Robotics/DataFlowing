@@ -146,6 +146,14 @@ class CameraPipeline(QObject):
         # 队列元素: (sensor_name, data_array) 元组
         self._sensor_queue: queue.Queue = queue.Queue(maxsize=10)
 
+        # USB 手套 IMU 四元数：sensor_name → (quats 64×f32, valid 16×f32)
+        # 最新值覆盖式快照，写入线程每帧取走后清空（与传感器队列同节奏）
+        self._glove_imu: Dict[str, tuple] = {}
+        self._glove_imu_lock = threading.Lock()
+        # USB 手套骨架关键点：sensor_name → 63×f32（21×3 米），同节奏快照
+        self._glove_kpts: Dict[str, np.ndarray] = {}
+        self._glove_kpts_lock = threading.Lock()
+
         # 外部帧源（如双目子进程），不经过 CameraWorker
         # 帧通过队列传入写入线程，以固定帧率均匀消费，避免 GIL 导致的写入抖动
         # _external_queues[slot_id] = queue.Queue(maxsize=2)
@@ -513,6 +521,10 @@ class CameraPipeline(QObject):
         # 丢帧统计/IMU 防丢：每 episode 重置
         self._drop_stats.clear()
         self._pending_imu.clear()
+        with self._glove_imu_lock:
+            self._glove_imu.clear()
+        with self._glove_kpts_lock:
+            self._glove_kpts.clear()
         self._imu_overflow_count = 0
         self._frame_count = 0
         self._per_cam_frame = {sid: 0 for sid in self._slots}
@@ -569,6 +581,9 @@ class CameraPipeline(QObject):
                         sensor_data[s_name] = s_data
                     except queue.Empty:
                         break
+                # 手套 IMU/骨架快照随本帧行写入（USB 手套；空 dict 无影响）
+                glove_imu = self._pop_glove_imu()
+                glove_kpts = self._pop_glove_keypoints()
 
                 # 处理 CameraSlot 队列（排空取最新帧）
                 for sid, sl in self._slots.items():
@@ -586,7 +601,9 @@ class CameraPipeline(QObject):
                     if getattr(settings, 'CAMERA_MIRROR_HORIZONTAL', False):
                         frame = np.flip(frame, axis=1)
 
-                    self._write_one_frame(sid, frame, sensor_data)
+                    self._write_one_frame(sid, frame, sensor_data,
+                                          glove_imu=glove_imu,
+                                          glove_kpts=glove_kpts)
 
                 # 处理外部帧源队列（取一帧不排空，保证输出均匀无抖动）
                 # 双目帧已在 _on_stereo_frame 完成垂直翻转，此处不再重复翻转
@@ -624,7 +641,9 @@ class CameraPipeline(QObject):
                     self._write_one_frame(sid, frame, sensor_data,
                                           flip_vertical=False,
                                           hardware_ns=hw_ns,
-                                          imu_samples=imu_s)
+                                          imu_samples=imu_s,
+                                          glove_imu=glove_imu,
+                                          glove_kpts=glove_kpts)
 
             except Exception:
                 pass
@@ -633,7 +652,9 @@ class CameraPipeline(QObject):
                          sensor_data: Dict[str, np.ndarray],
                          flip_vertical: bool = True,
                          hardware_ns: int = 0,
-                         imu_samples: Optional[List] = None):
+                         imu_samples: Optional[List] = None,
+                         glove_imu: Optional[Dict[str, tuple]] = None,
+                         glove_kpts: Optional[Dict[str, np.ndarray]] = None):
         """写入单帧到 MP4 + Parquet。
 
         Args:
@@ -642,6 +663,8 @@ class CameraPipeline(QObject):
                            双目外部帧路径为 False（已在 _on_stereo_frame 完成翻转）。
             hardware_ns: SDK 硬件纳秒时间戳（双目相机帧）
             imu_samples: 本帧窗口的 IMU 样本列表（双目，随 stereo_left 携带）
+            glove_imu: {传感器名: (quats 64×f32, valid 16×f32)} USB 手套 IMU 快照
+            glove_kpts: {传感器名: 63×f32 骨架关键点} USB 手套骨架快照
         """
         cam_frame_idx = self._per_cam_frame.get(sid, 0)
         rel_ts = time.time() - self._episode_start_s
@@ -652,6 +675,8 @@ class CameraPipeline(QObject):
             connection_status=self._device_status,
             hardware_ns=hardware_ns,
             imu_samples=imu_samples,
+            glove_imu=glove_imu,
+            glove_kpts=glove_kpts,
         )
         self._per_cam_frame[sid] = cam_frame_idx + 1
         self._frame_count += 1
@@ -708,6 +733,52 @@ class CameraPipeline(QObject):
                 )
             except queue.Full:
                 self._drop_stats.inc("sensor_queue")  # 消费不及，丢弃旧数据
+
+    def write_glove_imu(self, sensor_name: str, quats, valid):
+        """USB 手套 IMU 四元数快照（主线程 → 写入线程，最新值覆盖）。
+
+        Args:
+            sensor_name: 传感器列名（如 "right_glove"）
+            quats: 16×4 XYZW 四元数（64×float32 展平）
+            valid: 16×bool 有效掩码（展平）
+        """
+        if self._writer is None or not self._recording or not sensor_name:
+            return
+        q = np.asarray(quats, dtype=np.float32).ravel()[:64]
+        v = np.asarray(valid, dtype=np.float32).ravel()[:16]
+        if q.size != 64 or v.size != 16:
+            return
+        with self._glove_imu_lock:
+            self._glove_imu[sensor_name] = (q, v)
+
+    def _pop_glove_imu(self) -> Dict[str, tuple]:
+        """取走并清空本帧窗口内的手套 IMU 快照（写入线程调用）。"""
+        with self._glove_imu_lock:
+            snapshot = dict(self._glove_imu)
+            self._glove_imu.clear()
+        return snapshot
+
+    def write_glove_keypoints(self, sensor_name: str, kpts):
+        """USB 手套骨架关键点快照（主线程 → 写入线程，最新值覆盖）。
+
+        Args:
+            sensor_name: 传感器列名（如 "left_glove"）
+            kpts: 21×3 关节坐标（米，float32，展平 63 维）
+        """
+        if self._writer is None or not self._recording or not sensor_name:
+            return
+        k = np.asarray(kpts, dtype=np.float32).ravel()[:63]
+        if k.size != 63 or not np.isfinite(k).all():
+            return
+        with self._glove_kpts_lock:
+            self._glove_kpts[sensor_name] = k
+
+    def _pop_glove_keypoints(self) -> Dict[str, np.ndarray]:
+        """取走并清空本帧窗口内的手套骨架快照（写入线程调用）。"""
+        with self._glove_kpts_lock:
+            snapshot = dict(self._glove_kpts)
+            self._glove_kpts.clear()
+        return snapshot
 
     @property
     def last_recording_frames(self) -> Dict[str, int]:

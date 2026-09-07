@@ -157,6 +157,7 @@ class EgoDataWriter(QObject):
         # 稀疏列跟踪：只落盘本 episode 实际有数据的列
         self._present_sensors: set = set()
         self._present_imu: bool = False
+        self._present_glove_imu: set = set()   # USB 手套 IMU 稀疏列（按传感器名）
         # 深度多槽位（D435 第 n 台 = d435_depth[_n]；S80M 传统路径兜底
         # settings.CAMERA_DEPTH）：槽位键 → depth image_key
         self._depth_slots: Dict[str, str] = {}
@@ -347,6 +348,7 @@ class EgoDataWriter(QObject):
         self._rows.clear()
         self._present_sensors = set()
         self._present_imu = False
+        self._present_glove_imu = set()
         self._reset_stats()
         self._last_task = task_name
 
@@ -542,7 +544,9 @@ class EgoDataWriter(QObject):
                         sensors: Optional[Dict[str, np.ndarray]] = None,
                         connection_status: Optional[Dict[str, str]] = None,
                         hardware_ns: int = 0,
-                        imu_samples: Optional[List] = None):
+                        imu_samples: Optional[List] = None,
+                        glove_imu: Optional[Dict[str, tuple]] = None,
+                        glove_kpts: Optional[Dict[str, np.ndarray]] = None):
         """写入一行到 data parquet 缓冲区。
 
         Args:
@@ -555,6 +559,12 @@ class EgoDataWriter(QObject):
             imu_samples: 本帧窗口内采集的 IMU 样本列表
                          [(ts_ns, gx, gy, gz, ax, ay, az), ...]
                          仅双目 stereo_left 帧携带（左右目共享同一份样本）
+            glove_imu: {传感器名: (quats 64×f32, valid 16×f32)}
+                       USB 手套 IMU 四元数快照（有数据才写行键，
+                       稀疏列按 self._present_glove_imu 落盘）
+            glove_kpts: {传感器名: 63×f32 骨架关键点（21×3 米）}
+                       USB 手套骨架快照，回填恒写的
+                       observation.{left,right}_hand_pose 占位列
         """
         sensors = sensors or {}
         row = {
@@ -587,10 +597,37 @@ class EgoDataWriter(QObject):
             ]
             self._update_imu_stats(row["observation.imu"])
 
+        # USB 手套 IMU：四元数 (16×4) + 有效掩码 (16)，每传感器两列，
+        # 稀疏契约同触觉列（本 episode 出现过的传感器才建列）
+        for sn, (quats, valid) in (glove_imu or {}).items():
+            if sn not in self._sensor_names:
+                continue
+            row[f"observation.{sn}_imu_quat"] = [
+                float(v) for v in np.asarray(quats, dtype=np.float32
+                                            ).ravel()[:64]]
+            row[f"observation.{sn}_imu_valid"] = [
+                float(v) for v in np.asarray(valid, dtype=np.float32
+                                             ).ravel()[:16]]
+            self._present_glove_imu.add(sn)
+
+        # 恒写的 hand_pose 占位列（无骨架数据时保持全零）
         row[f"observation.{settings.HAND_POSE_LEFT}"] = \
             [0.0] * settings.HAND_POSE_DIM
         row[f"observation.{settings.HAND_POSE_RIGHT}"] = \
             [0.0] * settings.HAND_POSE_DIM
+
+        # 手套骨架关键点（工具包解算）→ 回填上述占位列。
+        # 传感器名 left_glove/right_glove → left/right_hand_pose；
+        # 无骨架快照的帧保持零占位（旧录制读取端统一按全零处理）
+        for sn, kpts in (glove_kpts or {}).items():
+            side = sn.split("_")[0]
+            if side not in ("left", "right"):
+                continue
+            k = np.asarray(kpts, dtype=np.float32).ravel()[:settings.HAND_POSE_DIM]
+            if k.size != settings.HAND_POSE_DIM or not np.isfinite(k).all():
+                continue
+            row[f"observation.{side}_hand_pose"] = [
+                float(v) for v in k]
 
         cs = connection_status or {}
         for did in self._device_ids:
@@ -748,6 +785,16 @@ class EgoDataWriter(QObject):
             cols["observation.imu"] = pa.array(
                 [r.get("observation.imu", []) for r in rows],
                 pa.list_(pa.list_(pa.float32(), 6)))
+        # 稀疏 USB 手套 IMU 列（四元数 64 维 + 有效掩码 16 维，每传感器一对）
+        for sn in sorted(self._present_glove_imu):
+            name_q = f"observation.{sn}_imu_quat"
+            name_v = f"observation.{sn}_imu_valid"
+            cols[name_q] = pa.array(
+                [r.get(name_q, [0.0] * 64) for r in rows],
+                pa.list_(pa.float32(), 64))
+            cols[name_v] = pa.array(
+                [r.get(name_v, [0.0] * 16) for r in rows],
+                pa.list_(pa.float32(), 16))
         # 手部关键点占位列（后处理回填，恒写）
         for pose_name in [settings.HAND_POSE_LEFT, settings.HAND_POSE_RIGHT]:
             name = f"observation.{pose_name}"
@@ -853,6 +900,17 @@ class EgoDataWriter(QObject):
         # 双目 IMU: 每帧窗口内变长样本序列, 每样本 6 轴 (gx,gy,gz,ax,ay,az)
         if self._present_imu:
             features["observation.imu"] = {"dtype": "float32", "shape": [6]}
+        # USB 手套 IMU: 每帧 16×4 XYZW 四元数 + 16 维有效掩码
+        for sn in sorted(self._present_glove_imu):
+            features[f"observation.{sn}_imu_quat"] = {
+                "dtype": "float32", "shape": [16, 4]}
+            features[f"observation.{sn}_imu_valid"] = {
+                "dtype": "float32", "shape": [16]}
+        # 手部骨架关键点（21×3 米，恒写列；无骨架数据时为全零占位）
+        features[f"observation.{settings.HAND_POSE_LEFT}"] = {
+            "dtype": "float32", "shape": [21, 3]}
+        features[f"observation.{settings.HAND_POSE_RIGHT}"] = {
+            "dtype": "float32", "shape": [21, 3]}
         features["action"] = {"dtype": "float32", "shape": [1]}
 
         # devices 紧凑段 + device_names（槽位 → 用户命名）——只加字段，

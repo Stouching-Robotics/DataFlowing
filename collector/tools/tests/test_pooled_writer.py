@@ -203,6 +203,42 @@ def main():
     finally:
         shutil.rmtree(out, ignore_errors=True)
 
+    print("── 6.5 手套骨架回填 hand_pose 列 ──")
+    out_k = tempfile.mkdtemp(prefix="pooled_kpts_")
+    try:
+        wk = EgoDataWriter()
+        ok = wk.start_episode(out_k, {"head_left_rgb": (480, 640)}, 30.0,
+                              sensors=["left_glove"], task_name="PoolTest")
+        check(ok, "骨架回填 episode 启动")
+        kpts = np.arange(63, dtype=np.float32) / 63.0
+        for i in range(2):
+            wk.write_video_frame("head_left_rgb", frame)
+            wk.write_frame_row(
+                i, i / 30.0,
+                sensors={"left_glove": np.ones(256, np.float32)},
+                glove_imu={"left_glove": (np.zeros(64, np.float32),
+                                          np.ones(16, np.float32))},
+                glove_kpts={"left_glove": kpts} if i == 1 else None)
+        wk.end_episode()
+        tbl = pq.read_table(pooled_data_parquet_path(
+            wk.task_dir, wk.episode_index))
+        lp = tbl.column("observation.left_hand_pose").to_pylist()
+        rp = tbl.column("observation.right_hand_pose").to_pylist()
+        check(any(abs(v) > 1e-6 for v in lp[1])
+              and all(v == 0.0 for v in lp[0]),
+              "hand_pose: 有骨架帧非零、无骨架帧零占位")
+        check(all(v == 0.0 for v in rp[0]) and all(v == 0.0 for v in rp[1]),
+              "对侧 hand_pose 恒零占位")
+        info = read_json(pooled_info_path(wk.task_dir))
+        feats = info.get("features", {})
+        check(feats.get("observation.left_hand_pose", {}).get("shape")
+              == [21, 3]
+              and feats.get("observation.right_hand_pose", {}).get("shape")
+              == [21, 3],
+              "features 含 21x3 骨架条目")
+    finally:
+        shutil.rmtree(out_k, ignore_errors=True)
+
     print("── 7. 旧分片回退（多行分片） ──")
     out2 = tempfile.mkdtemp(prefix="pooled_legacy_")
     try:

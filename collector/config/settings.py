@@ -356,10 +356,24 @@ def assign_glove_sensor_role(key: str, prefer: str = "") -> str:
     按 MAC 绑定（重连保持）；prefer 为期望列名（广播名 'L' → left_glove、
     'R' → right_glove），空闲则优先占用，否则按 SENSOR_NAMES 顺序取
     下一个空余名。无空余名时兜底取最后一个。
+
+    USB (Type-C) 手套例外：prefer 来自工具包注册表（按序列号权威），
+    直接占用该列，并释放其它设备在该列上的陈旧绑定（避免右手套被
+    历史 BLE 绑定挤到 left_glove）。
     """
     role = device_sensor_role(key)
     if role:
         return role
+    if prefer and key.startswith("usbglove:"):
+        # 硬件权威侧别：抢占对应列，清掉其它键的旧绑定
+        current = load_device_names()
+        for k, entry in list(current.items()):
+            if k != key and isinstance(entry, dict) \
+                    and entry.get("sensor") == prefer:
+                entry["sensor"] = ""
+        _write_device_names(current)
+        save_device_name(key, device_name(key), sensor=prefer)
+        return prefer
     used = {device_sensor_role(k) for k in load_device_names()}
     candidates = [n for n in ([prefer] + SENSOR_NAMES) if n]
     for name in dict.fromkeys(candidates):   # 去重保持顺序

@@ -35,14 +35,14 @@ from core.camera import list_v4l_devices, _is_sdk_device
 @dataclass
 class DeviceInfo:
     """已连接设备的一条描述（跨线程经信号传回主线程）。"""
-    key: str                          # "uvc:{by-id前缀或索引}" | "d435:{rs serial}" | "s80m:ftdi" | "ble:{MAC}"
-    kind: str                         # "uvc" | "d435" | "s80m" | "data_ble" | "ble"
-    display_name: str                 # 设备内部命名（by-id 解码 / rs 权威名 / 蓝牙广播名）
+    key: str                          # "uvc:{by-id前缀或索引}" | "d435:{rs serial}" | "s80m:ftdi" | "ble:{MAC}" | "usbglove:{serial}"
+    kind: str                         # "uvc" | "d435" | "s80m" | "data_ble" | "ble" | "usb_glove"
+    display_name: str                 # 设备内部命名（by-id 解码 / rs 权威名 / 蓝牙广播名 / USB 手套）
     serial: str = ""                  # 设备序号（无则为空串）
     video_index: int = -1             # UVC 设备的 /dev/videoN 索引（其它为 -1）
     by_id_path: Optional[str] = None  # /dev/v4l/by-id 永久路径（有则填）
     backend: str = ""                 # 打开后端（开关打开后由 CameraWorker 决定，枚举时为空）
-    address: str = ""                 # BLE MAC 地址（大写、冒号分隔；非 BLE 为空串）
+    address: str = ""                 # BLE MAC 地址 / USB 手套串口路径（非 BLE 为空串）
     rssi: int = 0                     # BLE 信号强度（排序用）
     user_name: str = ""               # 用户命名（枚举后由 MainWindow 从 device_names.json 填充）
 
@@ -54,7 +54,7 @@ class DeviceInfo:
     @property
     def group(self) -> str:
         """面板分组: "camera" | "glove" | "other_ble"。"""
-        if self.kind == "data_ble":
+        if self.kind in ("data_ble", "usb_glove"):
             return "glove"
         if self.kind == "ble":
             return "other_ble"
@@ -347,7 +347,7 @@ def _list_ble_devices() -> List[DeviceInfo]:
 
 
 def detect_devices(max_index: int = settings.DEVICE_SCAN_MAX_INDEX) -> List[DeviceInfo]:
-    """四段枚举（UVC + D435 + S80M + BLE），各自容错，整体不崩。"""
+    """五段枚举（UVC + D435 + S80M + BLE + USB 手套），各自容错，整体不崩。"""
     devices: List[DeviceInfo] = []
     try:
         devices += _list_uvc_devices(max_index)
@@ -365,7 +365,96 @@ def detect_devices(max_index: int = settings.DEVICE_SCAN_MAX_INDEX) -> List[Devi
         devices += _list_ble_devices()
     except Exception:
         pass
+    try:
+        devices += _list_usb_glove_devices()
+    except Exception:
+        pass
     return devices
+
+
+# ── USB (Type-C) 手套 ──────────────────────────────────
+
+_GLOVE_USB_VID = 0x0483
+_GLOVE_USB_PID = 0x5740
+_GLOVE_SIDE_NAMES = {"left_glove": "USB 手套·左手",
+                     "right_glove": "USB 手套·右手"}
+_glove_side_cache: Optional[dict] = None
+_glove_side_cache_time = 0.0
+
+
+def _glove_side_by_serial() -> dict:
+    """读工具包 glove_devices.json → {usb_serial小写: "left_glove"/"right_glove"}。
+
+    优先项目根下同级的 stouch_glove_toolkit* 目录，其次项目根自身；
+    文件缺失/解析失败返回 {}（左右手仍可经首连分配后持久化）。
+    除 left/right 的 usb_serial 外，还合并可选的 extra_usb_serials
+    映射（{序列号: "left_glove"/"right_glove"}）——支持同一手侧多只
+    手套（换机/固件序列号变更后旧号仍能认出来）。
+    结果缓存 10s，避免 2s 轮询反复读盘。
+    """
+    global _glove_side_cache, _glove_side_cache_time
+    now = time.monotonic()
+    if _glove_side_cache is not None and now - _glove_side_cache_time < 10.0:
+        return _glove_side_cache
+    result: dict = {}
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidates = [os.path.join(root, "glove_devices.json")]
+    try:
+        candidates += sorted(
+            os.path.join(root, name, "glove_devices.json")
+            for name in os.listdir(root)
+            if name.lower().startswith("stouch_glove_toolkit")
+        )
+    except OSError:
+        pass
+    import json
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        for side, role in (("left", "left_glove"), ("right", "right_glove")):
+            serial = (data.get(side) or {}).get("usb_serial", "")
+            if serial:
+                result[str(serial).strip().lower()] = role
+        for serial, role in (data.get("extra_usb_serials") or {}).items():
+            if role in ("left_glove", "right_glove") and serial:
+                result.setdefault(str(serial).strip().lower(), role)
+        if result:
+            break
+    _glove_side_cache = result
+    _glove_side_cache_time = now
+    return result
+
+
+def usb_glove_prefer_side(serial: str) -> str:
+    """USB 手套序列号 → 期望传感器列名（未知返回空串）。"""
+    return _glove_side_by_serial().get((serial or "").strip().lower(), "")
+
+
+def _list_usb_glove_devices() -> List[DeviceInfo]:
+    """枚举 STM32 USB CDC 手套（0483:5740，串口工具按 VID/PID 过滤）。"""
+    try:
+        import serial.tools.list_ports
+    except ImportError:
+        return []
+    side_map = _glove_side_by_serial()
+    infos: List[DeviceInfo] = []
+    for port in serial.tools.list_ports.comports():
+        if port.vid != _GLOVE_USB_VID or port.pid != _GLOVE_USB_PID:
+            continue
+        serial = (port.serial_number or "").strip()
+        key = f"usbglove:{serial}" if serial else f"usbglove:{port.device}"
+        side = side_map.get(serial.lower(), "")
+        infos.append(DeviceInfo(
+            key=key,
+            kind="usb_glove",
+            display_name=_GLOVE_SIDE_NAMES.get(side, "USB 手套"),
+            serial=serial,
+            address=port.device,
+        ))
+    return infos
 
 
 class DeviceScanner(QObject):

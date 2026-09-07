@@ -72,6 +72,10 @@ def main():
     app = QApplication(sys.argv)
     pip = CameraPipeline(OUT_ROOT)
     pip.register_external_source("stereo_left", (800, 1280), fps=30)
+    # v1.1.3 起外部队列 maxsize 提到 30（深度槽丢帧根治）；本用例专测
+    # "队列满 → 丢帧保 IMU"路径，压回 2 保持既有断言口径
+    import queue as _q
+    pip._external_queues["stereo_left"] = _q.Queue(maxsize=2)
     pip._recording = True   # 绕过 start_recording 的异步启动路径
 
     logs = []

@@ -23,7 +23,7 @@ from config.i18n import tr
 from config.settings import save_device_name
 
 _ICON = {"uvc": "📹", "d435": "🔭", "s80m": "👁",
-         "data_ble": "🧤", "ble": "🎧"}
+         "data_ble": "🧤", "usb_glove": "🧤", "ble": "🎧"}
 _GROUP_ORDER = ["camera", "glove", "other_ble"]
 _GROUP_TITLE = {"camera": "📷 相机", "glove": "🧤 手套",
                 "other_ble": "🎧 其他蓝牙"}

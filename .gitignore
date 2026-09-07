@@ -38,3 +38,6 @@ web/workflow-studio/.vite/
 !processor/examples/**/meta/episodes/**/*.parquet
 !processor/examples/**/videos/
 !processor/examples/**/videos/**/*.mp4
+
+# 本地第三方手套工具包 —— 永远不上传
+stouch_glove_toolkit-Stouch_Glove_Toolkit-beta/

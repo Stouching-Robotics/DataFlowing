@@ -47,3 +47,6 @@ data/tasks.json
 # 真机标定（本地提取产物，跑 tools/hand_3d_d435/tools/extract_d435_color_calib.py 再生）
 tools/hand_3d_d435/calibration/
 pipeline.db
+
+# 手套工具包（第三方 SDK 本地参考，永远不上传）
+stouch_glove_toolkit-Stouch_Glove_Toolkit-beta/

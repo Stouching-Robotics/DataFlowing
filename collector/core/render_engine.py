@@ -360,13 +360,16 @@ HAND_ANCHORS = {
 WRIST_ANCHOR = (640, 600)
 
 # 默认手部配置（16×16 传感器映射到手指区域）
+# 右手实测（2026-09-04 录制逐格核对）：行 = 手指，拇指 1-3 … 小指
+# 13-15（行 0 为空），即旧配置 [0-2…12-14] 整体偏高一行的修正；
+# 列 12-15 = 指骨 [14,12,13,15] 根→尖；掌心行 1-15 x 传感列 [10,9,8,6,4]。
 DEFAULT_HAND = {
-    "thumb_joint": {"rows": [0, 1, 2], "cols": [14, 12, 13, 15], "axis_order": "col_row"},
-    "index_joint": {"rows": [3, 4, 5], "cols": [14, 12, 13, 15], "axis_order": "col_row"},
-    "middle_joint": {"rows": [6, 7, 8], "cols": [14, 12, 13, 15], "axis_order": "col_row"},
-    "ring_joint": {"rows": [9, 10, 11], "cols": [14, 12, 13, 15], "axis_order": "col_row"},
-    "pinky_joint": {"rows": [12, 13, 14], "cols": [14, 12, 13, 15], "axis_order": "col_row"},
-    "palm": {"rows": list(range(15)), "cols": [10, 9, 8, 6, 4], "axis_order": "col_row"},
+    "thumb_joint": {"rows": [1, 2, 3], "cols": [14, 12, 13, 15], "axis_order": "col_row"},
+    "index_joint": {"rows": [4, 5, 6], "cols": [14, 12, 13, 15], "axis_order": "col_row"},
+    "middle_joint": {"rows": [7, 8, 9], "cols": [14, 12, 13, 15], "axis_order": "col_row"},
+    "ring_joint": {"rows": [10, 11, 12], "cols": [14, 12, 13, 15], "axis_order": "col_row"},
+    "pinky_joint": {"rows": [13, 14, 15], "cols": [14, 12, 13, 15], "axis_order": "col_row"},
+    "palm": {"rows": list(range(1, 16)), "cols": [10, 9, 8, 6, 4], "axis_order": "col_row"},
 }
 for k in DEFAULT_HAND:
     if k != "palm":
@@ -624,3 +627,142 @@ def render_deform_mesh(
         "[Drag] Draw Hole | [R] Clear | [U/I] Flip | [O/P] Strength | [M] Config",
     ])
     return frame, new_vmax
+
+
+# ═══════════════════════════════════════════════════════
+#  手部骨架渲染（MANO 21 关键点 → 3/4 视角透视画面）
+#
+#  移植自手套工具包 apps/rendering/replay.py 的 Camera/_grid/
+#  _draw_hand（画布尺寸参数化）。tools/demos/pooled_viewer_demo
+#  另有同口径自包含副本（demo 不导入 core，两边保持同步即可）。
+# ═══════════════════════════════════════════════════════
+
+# MANO 21 关键点骨骼连接 + 分组: 0 拇指 1 食指 2 中指 3 无名指 4 小指 5 掌骨
+SKELETON_BONES = [
+    (0, 1, 0), (1, 2, 0), (2, 3, 0), (3, 4, 0),                # thumb
+    (0, 5, 1), (5, 6, 1), (6, 7, 1), (7, 8, 1),                # index
+    (0, 9, 2), (9, 10, 2), (10, 11, 2), (11, 12, 2),           # middle
+    (0, 13, 3), (13, 14, 3), (14, 15, 3), (15, 16, 3),         # ring
+    (0, 17, 4), (17, 18, 4), (18, 19, 4), (19, 20, 4),         # pinky
+    (5, 9, 5), (9, 13, 5), (13, 17, 5),                        # metacarpal
+]
+# 每根手指分组颜色（BGR）
+SKELETON_FINGER_BGR = [
+    (60, 80, 255),     # 0 拇指 红
+    (60, 255, 255),    # 1 食指 黄
+    (60, 220, 60),     # 2 中指 绿
+    (255, 210, 60),    # 3 无名指 青
+    (255, 120, 255),   # 4 小指 紫
+    (210, 210, 210),   # 5 掌骨 白
+]
+
+_SKELETON_FOV_DEG = 50.0
+
+
+class SkeletonCamera:
+    """球坐标相机 + 透视投影（照工具包 replay.py 的 Camera，画布尺寸参数化）。"""
+
+    def __init__(self, yaw_deg, elev_deg, dist, img_w, img_h, roll_deg=0.0):
+        yaw, elev = np.deg2rad(yaw_deg), np.deg2rad(elev_deg)
+        roll = np.deg2rad(roll_deg)
+        cp = np.array([dist * np.cos(elev) * np.sin(yaw),
+                       dist * np.sin(elev),
+                       dist * np.cos(elev) * np.cos(yaw)])
+        self.pos = cp
+        self.fwd = -cp / np.linalg.norm(cp)
+        self.right = np.cross(self.fwd, [0, 1, 0])
+        self.right /= np.linalg.norm(self.right)
+        self.up = np.cross(self.right, self.fwd)
+        cos_r, sin_r = np.cos(roll), np.sin(roll)
+        r0, u0 = self.right, self.up
+        self.right = r0 * cos_r + u0 * sin_r
+        self.up = -r0 * sin_r + u0 * cos_r
+        self.w, self.h = img_w, img_h
+        self.f = (self.h / 2) / np.tan(np.deg2rad(_SKELETON_FOV_DEG) / 2)
+
+    def project(self, pts3d):
+        """(N,3) → (N,2) 图像坐标 + (N,) 深度（相机前方为正）。"""
+        v = pts3d - self.pos
+        z = v @ self.fwd
+        x = v @ self.right
+        y = v @ self.up
+        u = self.f * x / z + self.w / 2
+        vv = self.h / 2 - self.f * y / z
+        return np.stack([u, vv], -1), z
+
+
+def fit_skeleton_dist(kpts):
+    """按手部空间尺度定相机距离（照工具包 replay.py）。"""
+    v = kpts[np.isfinite(kpts).all(axis=-1)]
+    if len(v) == 0:
+        return 0.5
+    r = float(np.abs(v).max())
+    return max(0.25, r * 2.6 + 0.1)
+
+
+def _skeleton_bg(w, h):
+    img = np.full((h, w, 3), 12, np.uint8)
+    for y in range(h):
+        img[y] = np.full(3, 10 + int(10 * y / h), np.uint8)
+    return img
+
+
+def _skeleton_grid(img, cam, r):
+    """z=0 平面网格 + 三色坐标轴（照工具包 replay.py 的 _grid）。"""
+    x = [(i / 6) * r for i in range(-6, 7)]
+    lines = ([([v, -r, 0.0], [v, r, 0.0]) for v in x]
+             + [([-r, v, 0.0], [r, v, 0.0]) for v in x])
+    for p0, p1 in lines:
+        pts, z = cam.project(np.array([p0, p1], np.float32))
+        if (z > 0).all():
+            cv2.line(img, tuple(pts[0].astype(int)), tuple(pts[1].astype(int)),
+                     (40, 44, 52), 1, cv2.LINE_AA)
+    origin = np.zeros((3,), np.float32)
+    for axis, col in [(np.array([r, 0.0, 0.0]), (40, 60, 255)),    # X 红
+                      (np.array([0.0, r, 0.0]), (40, 255, 60)),    # Y 绿
+                      (np.array([0.0, 0.0, r]), (255, 60, 40))]:   # Z 蓝
+        pts, z = cam.project(np.stack([origin, axis]))
+        if (z > 0).all():
+            cv2.line(img, tuple(pts[0].astype(int)), tuple(pts[1].astype(int)),
+                     col, 2, cv2.LINE_AA)
+
+
+def _draw_skeleton_hand(img, cam, kpts):
+    """深度着色的骨骼连线 + 白色关节点（照工具包 replay.py 的 _draw_hand）。"""
+    pts, z = cam.project(kpts)
+    vis = np.isfinite(kpts).all(axis=1) & (z > 0)
+    # 近亮远暗的深度着色；手指比掌骨略亮
+    zmin, zmax = 0.05, 0.6
+    lum = np.clip((zmax - z) / (zmax - zmin), 0.35, 1.0)
+    for a, b, g in SKELETON_BONES:
+        if vis[a] and vis[b]:
+            k = 0.5 * (lum[a] + lum[b])
+            col = tuple(int(c * k) for c in SKELETON_FINGER_BGR[g])
+            cv2.line(img, tuple(pts[a].astype(int)), tuple(pts[b].astype(int)),
+                     col, 3, cv2.LINE_AA)
+    for p, ok in zip(pts, vis):
+        if ok:
+            cv2.circle(img, tuple(p.astype(int)), 2, (255, 255, 255), -1,
+                       cv2.LINE_AA)
+
+
+def render_skeleton(kpts, w=640, h=420, dist=None, label=""):
+    """单手骨架面板（固定 3/4 视角；dist 传入为帧间防抖后的距离）。
+
+    Args:
+        kpts: (21,3) float 关键点（米）
+        dist: 相机距离（None → 按当前帧 fit_skeleton_dist）
+    Returns:
+        BGR 画布
+    """
+    if dist is None:
+        dist = fit_skeleton_dist(kpts)
+    img = _skeleton_bg(w, h)
+    cam = SkeletonCamera(yaw_deg=-25.0, elev_deg=15.0, dist=dist,
+                         img_w=w, img_h=h)
+    _skeleton_grid(img, cam, fit_skeleton_dist(kpts) * 0.5)
+    _draw_skeleton_hand(img, cam, kpts)
+    if label:
+        cv2.putText(img, label, (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (240, 240, 240), 2, cv2.LINE_AA)
+    return img

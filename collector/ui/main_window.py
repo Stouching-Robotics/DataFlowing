@@ -99,10 +99,11 @@ except ImportError:
 
 # 手套控件是可选模块（依赖 bleak / core.ble_engine 子系统）
 try:
-    from ui.glove_widget import GloveWidget
+    from ui.glove_widget import GloveWidget, GloveDataPump
     _GLOVE_AVAILABLE = True
 except ImportError:
     GloveWidget = None
+    GloveDataPump = None
     _GLOVE_AVAILABLE = False
 
 
@@ -146,9 +147,11 @@ class MainWindow(QMainWindow):
         #    core.device_manager.dispatch_toggle）──
         self._open_fns = {"uvc": self._open_uvc, "d435": self._open_d435,
                           "s80m": self._open_s80m, "data_ble": self._open_glove,
+                          "usb_glove": self._open_usb_glove,
                           "ble": self._open_ble_placeholder}
         self._close_fns = {"uvc": self._close_uvc, "d435": self._close_d435,
                            "s80m": self._close_s80m, "data_ble": self._close_glove,
+                           "usb_glove": self._close_glove,
                            "ble": self._close_ble_placeholder}
 
         # ── 设备检测面板状态 ──────────────────────────
@@ -1277,8 +1280,46 @@ class MainWindow(QMainWindow):
             slot, role, self.grid.camera_widget(slot), self._device_label(dev))
         return True
 
+    def _open_usb_glove(self, dev) -> bool:
+        """面板开关打开 USB (Type-C) 手套 → 仿生手掌 + 骨架画面进主网格。
+
+        USB 手套与 BLE 手套同走 GloveWidget（engine 注入
+        UsbGloveEngine，STM32 CDC 串口）：30ms 轮询 → 触觉渲染
+        （仿生手掌）+ IMU 解算骨架小窗叠加，录制数据经
+        write_sensor（16x16 触觉）/ write_glove_imu（16x4 四元数）
+        / write_glove_keypoints（21x3 关键点）落盘，连接状态回主窗口
+        日志。左右手按序列号预绑定（glove_devices.json）。
+        """
+        if not _GLOVE_AVAILABLE:
+            self._log(tr("[错误] 手套控件不可用（依赖缺失）"))
+            return False
+        if dev.key in self._workers:
+            return True   # 已打开（幂等）
+        try:
+            from core.usb_glove_engine import UsbGloveEngine
+        except ImportError as exc:
+            self._log(tr("[错误] USB 手套依赖缺失（pyserial）: {}", exc))
+            return False
+        from core.device_detector import usb_glove_prefer_side
+        prefer = usb_glove_prefer_side(dev.serial or "")
+        role = settings.assign_glove_sensor_role(dev.key, prefer)
+        self._log(tr("[USB手套] 序列号 {} → 传感器列 {}（{}{}）",
+                     dev.serial or "-", role,
+                     tr("工具包注册 ") if prefer else tr("未注册，"),
+                     prefer or tr("按空闲列分配")))
+        slot = f"sensor:{dev.key}"
+        w = GloveWidget(slot, dev.address, role, self._device_label(dev),
+                        engine=UsbGloveEngine(dev.address), on_log=self._log)
+        self.grid.add_widget(slot, w)
+        w.set_pipeline(self._pipeline)
+        w.start(dev.address)
+        self._pipeline.register_sensor(role)
+        self._workers[dev.key] = self._device_manager.glove_entry(
+            slot, role, w, self._device_label(dev))
+        return True
+
     def _close_glove(self, dev_key: str):
-        """关闭手套：断开 BLE、撤画面、注销传感器列。"""
+        """关闭手套（BLE / USB 通用）：断开连接、撤画面、注销传感器列。"""
         entry = self._workers.pop(dev_key, None)
         if not entry or entry["kind"] != "data_ble":
             return

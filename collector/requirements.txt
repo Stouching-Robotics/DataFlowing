@@ -12,6 +12,7 @@ pygrabber>=0.2          # Windows UVC 设备枚举
 comtypes>=1.4           # pygrabber 依赖
 pyvista>=0.42
 pyvistaqt>=0.11
+pyserial>=3.5           # USB (Type-C) STM32 手套 CDC 串口
 
 # ── 可选依赖（代码内惰性导入，缺失时对应功能不可用）──
 # 一键安装: start.bat extras / start.bat extras-torch

@@ -11,6 +11,7 @@ data/*.db
 *.log
 .venv/
 venv/
+venv_lite/
 *.fifo
 *.h5
 *.mp4
@@ -50,3 +51,7 @@ pipeline.db
 
 # 手套工具包（第三方 SDK 本地参考，永远不上传）
 stouch_glove_toolkit-Stouch_Glove_Toolkit-beta/
+lite_package/*
+!lite_package/start_lite.bat
+!lite_package/start_lite.sh
+!lite_package/使用说明_lite.md

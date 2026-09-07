@@ -1,6 +1,6 @@
 # collector — Multimodal Data Acquisition SDK · 多模态数据采集 SDK
 
-![Version](https://img.shields.io/badge/version-1.1.3-blue)
+![Version](https://img.shields.io/badge/version-1.2.0-blue)
 ![Python](https://img.shields.io/badge/python-3.12-blue)
 ![License](https://img.shields.io/badge/license-TBD-lightgrey)
 
@@ -361,6 +361,20 @@ are documented in [docs/index.md](docs/index.md#开发约定).
 
 ### Changelog
 
+- **v1.2.0** — minimal one-click deployment edition (`start_lite.bat/.sh`
+  + `venv_lite` whitelist env, ~750 MB): connect devices → record → upload
+  only — no login/playback/task page/skeleton solving. Devices: D435
+  (1280×720@30 RGB / 848×480@30 depth), one UVC camera (640×480@30
+  capture; 640×360@15 preview that auto-switches to the device you open),
+  one USB / one BLE glove. Direct x264 (encoder probe skipped).
+  `scripts/pack_lite.py` collects the release folder; import-isolation
+  guard + hardware-free smoke tests included
+- **v1.1.4** — USB Type-C glove support (STM32 CDC serial engine, 60 fps
+  IMU + 16×16 tactile); real-time MANO 21-keypoint solving backfills the
+  `hand_pose` placeholder columns (with skeleton rendering in the main UI);
+  BLE glove dual-serial config update; single-file PyQt5 viewer demo
+  (RGB/depth/tactile/skeleton/IMU panels, live playback, draggable progress
+  bar) with tests
 - **v1.1.3** — dual-directory (`videos/` + `data/`) timeline
   reliability: the S80C/S80M 50→30 decimation now uses wall-clock
   1/30 s buckets with burst backfill (sensor hw-clock jumps no longer
@@ -685,6 +699,16 @@ i18n 文案经 `tr()` 翻译、PyQt5 信号参数用 `object` 封送大整数、
 
 ### 更新记录
 
+- **v1.2.0** — 新增极简一键部署采集版（`start_lite.bat/.sh` + `venv_lite`
+  白名单依赖，约 750MB）：只做连接设备→采集→上传，无登录/回放/任务页/
+  骨架解算。设备：D435（1280×720@30 RGB / 848×480@30 深度）、UVC 摄像头
+  1 台（640×480@30 采集；预览 640×360@15，开哪台自动切哪台）、USB/BLE
+  手套各 1 台。x264 直录（跳过编码器探针）。`scripts/pack_lite.py` 收集
+  发布目录，含导入隔离断言与无硬件冒烟自检
+- **v1.1.4** — 新增 USB Type-C 手套接入（STM32 CDC 串口引擎，60fps IMU +
+  16×16 触觉）；录制时实时解算 MANO 21 关键点回填 hand_pose 占位列（含
+  主界面骨架渲染）；BLE 手套双序列号配置更新；新增单文件 PyQt5 查看器
+  demo（RGB/深度/触觉/骨架/IMU 面板、实时播放与可拖动的进度条）及配套测试
 - **v1.1.3** — 双目录制（`videos/` + `data/` 两树）时间轴可靠性：
   S80C/S80M 50→30 抽帧改 wall 时钟 1/30s 桶 + 突发补录（传感器 hw
   时钟跳变不再造成稳定缺帧）+ 空桶看门狗（健康录制空桶率 ~3%，带

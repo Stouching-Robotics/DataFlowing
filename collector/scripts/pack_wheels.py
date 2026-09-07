@@ -11,6 +11,7 @@ pip download（此时建议直接在一台 Windows 机器上运行本脚本）�
 
 用法:
     python scripts/pack_wheels.py                 # 仅主程序必需依赖
+    python scripts/pack_wheels.py --lite          # 仅极简采集版依赖（requirements-lite.txt）
     python scripts/pack_wheels.py --extras        # + mediapipe / pyrealsense2
     python scripts/pack_wheels.py --torch         # + CPU 版 torch（较大）
     python scripts/pack_wheels.py --out /tmp/wheels   # 自定义输出目录
@@ -123,6 +124,8 @@ def download_python_installer(out: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--lite", action="store_true",
+                        help="仅打包极简采集版依赖（requirements-lite.txt）")
     parser.add_argument("--extras", action="store_true",
                         help="额外打包 mediapipe / pyrealsense2")
     parser.add_argument("--torch", action="store_true",
@@ -134,13 +137,17 @@ def main() -> int:
                         help="跳过 Python 安装包下载")
     args = parser.parse_args()
 
+    if args.lite and (args.extras or args.torch):
+        parser.error("--lite 与 --extras/--torch 互斥（极简版不装可选功能）")
+
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
 
     repo_root = Path(__file__).resolve().parent.parent
-    specs = parse_requirements(repo_root / "requirements.txt")
+    req_file = "requirements-lite.txt" if args.lite else "requirements.txt"
+    specs = parse_requirements(repo_root / req_file)
     if not specs:
-        print("[错误] requirements.txt 为空或不存在", file=sys.stderr)
+        print(f"[错误] {req_file} 为空或不存在", file=sys.stderr)
         return 1
     if args.extras:
         specs = specs + EXTRAS

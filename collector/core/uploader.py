@@ -156,6 +156,19 @@ class UploadManager(QObject):
                 out.append(self.add_task(p, n))
         return out
 
+    def has_task(self, session_path: str, episode_index: int = 0) -> bool:
+        """(task_dir, episode_index) 是否已在队列/执行中。
+
+        上传对话框复用主窗口共享管理器后，跨对话框会话防重靠此判断：
+        上次提交仍在后台进行时，重新打开对话框不会再重复入队。
+        """
+        with QMutexLocker(self._mutex):
+            for t in self._queue + list(self._active_tasks.values()):
+                if (t.session_path == session_path
+                        and t.episode_index == episode_index):
+                    return True
+        return False
+
     def start(self):
         if self._running:
             return

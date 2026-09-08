@@ -297,14 +297,17 @@ class TaskService(QObject):
         threading.Thread(target=self._login_and_poll, daemon=True).start()
 
     def _login_and_poll(self):
-        """登陆 → 拉取任务列表。"""
+        """登陆 → 拉取任务列表。
+
+        连接状态一律以实际响应为准（_do_login 失败置灰、_poll 成功置绿），
+        不在此处凭「无需认证」提前置绿 —— 否则地址填错/后端宕机时，
+        一次刷新也会让界面谎报「后端已连接」。
+        """
         if self._username and self._password:
             ok = self._do_login()
             if not ok:
                 self.connection_status.emit(False)
                 return
-        # 登陆成功（或无需认证），标记已连接
-        self.connection_status.emit(True)
         self._poll()
 
     def _do_login(self) -> bool:
@@ -392,8 +395,10 @@ class TaskService(QObject):
         except requests.RequestException as e:
             if epoch != self._epoch:
                 return
-            # 网络错误不改变连接状态（可能是暂时断网），只记录——
-            # 连续失败只记首条与每 10 条（服务器卡死时 5s 一条会刷屏）
+            # 请求都发不出去 = 后端不可达：如实置灰「后端未连接」，
+            # 恢复后下个成功 tick 再置绿（5s 内自愈）。连续失败只记
+            # 首条与每 10 条（服务器卡死时 5s 一条会刷屏）
+            self.connection_status.emit(False)
             self._poll_fail += 1
             if self._poll_fail == 1 or self._poll_fail % 10 == 0:
                 self.error_occurred.emit(

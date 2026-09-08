@@ -439,22 +439,27 @@ class LiteWindow(QMainWindow):
         # 左列: 设备组（每类 1 台上限）
         left = QVBoxLayout()
         left.setSpacing(6)
+        # kind → [{"combo","btn","attr"}, …]；BLE 手套两行可同开左右手
         self._dev_groups: dict = {}
-        for kind, title, key_attr in (
-                ("d435", tr("D435 深度相机"), "_d435_key"),
-                ("uvc", tr("UVC 摄像头"), "_uvc_key"),
-                ("usb", tr("USB-C 手套"), "_usb_key"),
-                ("ble", tr("BLE 手套"), "_ble_key")):
+        for kind, title, key_attrs in (
+                ("d435", tr("D435 深度相机"), ["_d435_key"]),
+                ("uvc", tr("UVC 摄像头"), ["_uvc_key"]),
+                ("usb", tr("USB-C 手套"), ["_usb_key"]),
+                ("ble", tr("BLE 手套"), ["_ble_key", "_ble_key2"])):
             grp = QGroupBox(title)
             gv = QVBoxLayout(grp)
-            combo = QComboBox()
-            gv.addWidget(combo)
-            btn = QPushButton(tr("开启"))
-            btn.clicked.connect(lambda _=False, k=kind: self._toggle_group(k))
-            gv.addWidget(btn)
+            rows = []
+            for i, attr in enumerate(key_attrs):
+                combo = QComboBox()
+                gv.addWidget(combo)
+                btn = QPushButton(tr("开启"))
+                btn.clicked.connect(
+                    lambda _=False, k=kind, ri=i: self._toggle_group(k, ri))
+                gv.addWidget(btn)
+                rows.append({"combo": combo, "btn": btn, "attr": attr})
+                setattr(self, attr, "")   # 当前已开启设备的 key（空=未开）
             left.addWidget(grp)
-            self._dev_groups[kind] = {"combo": combo, "btn": btn}
-            setattr(self, key_attr, "")   # 当前已开启设备的 key（空=未开）
+            self._dev_groups[kind] = rows
         self._btn_rescan = QPushButton(tr("重新扫描"))
         self._btn_rescan.clicked.connect(self._rescan)
         left.addWidget(self._btn_rescan)
@@ -579,40 +584,39 @@ class LiteWindow(QMainWindow):
     def _on_scan_result(self, d435: List[DeviceInfo],
                         usb: List[DeviceInfo], ble: List[DeviceInfo],
                         uvc: List[DeviceInfo]):
-        """扫描结果回填设备下拉框（保留当前选中项）。"""
+        """扫描结果回填设备下拉框（保留当前选中/已开启项）。"""
         for kind, devs in (("d435", d435), ("usb", usb), ("ble", ble),
                            ("uvc", uvc)):
-            grp = self._dev_groups[kind]
-            combo = grp["combo"]
-            prev_key = combo.currentData().key if combo.currentData() else ""
-            combo.clear()
-            for dev in devs:
-                label = dev.label or dev.display_name
-                if dev.serial:
-                    label = f"{label} ({dev.serial})"
-                combo.addItem(label, dev)
-            if prev_key:
-                for i in range(combo.count()):
-                    if combo.itemData(i).key == prev_key:
-                        combo.setCurrentIndex(i)
-                        break
-            grp["btn"].setText(
-                tr("关闭") if getattr(self, self._open_key_attr(kind))
-                else tr("开启"))
-
-    def _open_key_attr(self, kind: str) -> str:
-        return {"d435": "_d435_key", "uvc": "_uvc_key",
-                "usb": "_usb_key", "ble": "_ble_key"}[kind]
+            for row in self._dev_groups[kind]:
+                combo = row["combo"]
+                open_key = getattr(self, row["attr"]) or ""
+                # 已开启的保持选中；已被其它行开启的设备不再列出（防重复连接）
+                prev_key = open_key or (
+                    combo.currentData().key if combo.currentData() else "")
+                combo.clear()
+                for dev in devs:
+                    if dev.key in self._workers and dev.key != open_key:
+                        continue
+                    label = dev.label or dev.display_name
+                    if dev.serial:
+                        label = f"{label} ({dev.serial})"
+                    combo.addItem(label, dev)
+                if prev_key:
+                    for i in range(combo.count()):
+                        if combo.itemData(i).key == prev_key:
+                            combo.setCurrentIndex(i)
+                            break
+                row["btn"].setText(tr("关闭") if open_key else tr("开启"))
 
     # ── 设备开关 ──────────────────────────────────────
 
-    def _toggle_group(self, kind: str):
-        attr = self._open_key_attr(kind)
+    def _toggle_group(self, kind: str, row_idx: int = 0):
+        row = self._dev_groups[kind][row_idx]
+        attr = row["attr"]
         if getattr(self, attr):
-            self._close_device(kind)
+            self._close_device(kind, row_idx)
             return
-        grp = self._dev_groups[kind]
-        dev = grp["combo"].currentData()
+        dev = row["combo"].currentData()
         if not dev:
             QMessageBox.information(self, tr("提示"),
                                     tr("列表中没有设备。请检查连接后点「重新扫描」。"))
@@ -621,20 +625,22 @@ class LiteWindow(QMainWindow):
             QMessageBox.warning(self, tr("无法操作"),
                                 tr("录制中不能开关设备。"))
             return
-        ok = {"d435": self._open_d435,
-              "uvc": self._open_uvc,
-              "usb": self._open_usb_glove,
-              "ble": self._open_ble_glove}[kind](dev)
-        if ok:
-            grp["btn"].setText(tr("关闭"))
+        openers = {"d435": self._open_d435,
+                   "uvc": self._open_uvc,
+                   "usb": self._open_usb_glove,
+                   "ble": lambda d: self._open_ble_glove(d, attr)}
+        if openers[kind](dev):
+            row["btn"].setText(tr("关闭"))
             self._log(tr("[设备] 已开启 {}", dev.label))
 
-    def _close_device(self, kind: str):
-        attr = self._open_key_attr(kind)
+    def _close_device(self, kind: str, row_idx: int = 0):
+        row = self._dev_groups[kind][row_idx]
+        attr = row["attr"]
         key = getattr(self, attr)
         entry = self._workers.get(key)
         if not entry:
             setattr(self, attr, "")
+            row["btn"].setText(tr("开启"))
             return
         if kind == "d435":
             self._d435_manager.close(entry)
@@ -662,10 +668,15 @@ class LiteWindow(QMainWindow):
                 pass
             self._pipeline.unregister_sensor(entry["role"])
             if kind == "ble":
-                set_ble_scan_suppressed(False)
+                # 只有没有其它 BLE 手套在线时才恢复主动扫描
+                others_open = any(
+                    k != key and v.get("kind") == "ble_glove"
+                    for k, v in self._workers.items())
+                if not others_open:
+                    set_ble_scan_suppressed(False)
         self._workers.pop(key, None)
         setattr(self, attr, "")
-        self._dev_groups[kind]["btn"].setText(tr("开启"))
+        row["btn"].setText(tr("开启"))
         self._log(tr("[设备] 已关闭 {}", entry.get("label") or key))
 
     # ── D435 ──────────────────────────────────────────
@@ -782,11 +793,12 @@ class LiteWindow(QMainWindow):
 
     # ── 手套 ──────────────────────────────────────────
 
-    def _open_ble_glove(self, dev: DeviceInfo) -> bool:
+    def _open_ble_glove(self, dev: DeviceInfo, attr: str = "_ble_key") -> bool:
         """开启 BLE 手套 → 分配传感器列 + 注册 + 数据泵。
-        成功即记 _ble_key（与 _toggle_group 口径一致）。"""
+        成功即记 attr 指定槽位（两行 BLE 组对应 _ble_key/_ble_key2，
+        与 _toggle_group 口径一致）。"""
         if dev.key in self._workers:
-            self._ble_key = dev.key
+            setattr(self, attr, dev.key)
             return True
         prefer = {"l": "left_glove", "r": "right_glove"}.get(
             (dev.display_name or "").strip().lower(), "")
@@ -799,7 +811,7 @@ class LiteWindow(QMainWindow):
         set_ble_scan_suppressed(True)   # 手套连接中防扫描挤占数据吞吐
         self._workers[dev.key] = {"kind": "ble_glove", "label": dev.label,
                                   "pump": pump, "engine": engine, "role": role}
-        self._ble_key = dev.key
+        setattr(self, attr, dev.key)
         self._log(tr("[手套] BLE {} → 传感器列 {}", dev.label, role))
         return True
 
@@ -923,8 +935,9 @@ class LiteWindow(QMainWindow):
         self._rec_status.setText(tr("⏺ 录制中 {}", format_duration(seconds)))
 
     def _set_device_buttons_enabled(self, on: bool):
-        for grp in self._dev_groups.values():
-            grp["btn"].setEnabled(on)
+        for rows in self._dev_groups.values():
+            for row in rows:
+                row["btn"].setEnabled(on)
         self._btn_rescan.setEnabled(on)
 
     # ── 服务器 / 上传 ─────────────────────────────────
@@ -1041,12 +1054,12 @@ class LiteWindow(QMainWindow):
     def closeEvent(self, event):
         self._scan_timer.stop()
         for kind in ("d435", "uvc", "usb", "ble"):
-            attr = self._open_key_attr(kind)
-            if getattr(self, attr):
-                try:
-                    self._close_device(kind)
-                except Exception:
-                    pass
+            for i, row in enumerate(self._dev_groups[kind]):
+                if getattr(self, row["attr"]):
+                    try:
+                        self._close_device(kind, i)
+                    except Exception:
+                        pass
         try:
             self._upload_manager.stop()
         except Exception:

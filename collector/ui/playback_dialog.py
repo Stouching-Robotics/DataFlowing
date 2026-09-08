@@ -15,7 +15,8 @@ import time
 import shutil
 import numpy as np
 import cv2
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QPointF, QRectF
+from PyQt5.QtGui import QIcon, QPainter, QPixmap, QColor, QPen
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTreeWidget, QTreeWidgetItem, QSlider, QSplitter, QFileDialog,
@@ -51,6 +52,47 @@ except ImportError:
 
 # 旧名兼容（tests/test_playback_multifps.py 等仍按旧名引用）
 _get_effective_fps = get_effective_fps
+
+
+def _status_icon(status: str) -> QIcon:
+    """episode 上传状态图标（QPainter 绘制，任意平台/字体下都能显示）。
+
+    completed → 绿底白勾；failed → 红底白叉；其余（pending 等）→ 灰空心方框。
+    """
+    pm = QPixmap(16, 16)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    if status == "completed":
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(settings.COLOR_STOPPED))          # 绿
+        p.drawEllipse(QRectF(0, 0, 16, 16))
+        pen = QPen(QColor("white"))
+        pen.setWidthF(2.0)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawPolyline(
+            QPointF(3.5, 8.5), QPointF(6.5, 11.5), QPointF(12.5, 4.5))
+    elif status == "failed":
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(settings.COLOR_BTN_STOP))         # 红
+        p.drawEllipse(QRectF(0, 0, 16, 16))
+        pen = QPen(QColor("white"))
+        pen.setWidthF(2.0)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        p.drawLine(QPointF(4.5, 4.5), QPointF(11.5, 11.5))
+        p.drawLine(QPointF(11.5, 4.5), QPointF(4.5, 11.5))
+    else:   # pending / 未知状态 → 空心方框（对应 ⬜）
+        pen = QPen(QColor(settings.COLOR_TEXT_SECONDARY))   # 灰
+        pen.setWidthF(1.6)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(QRectF(1.5, 1.5, 13, 13), 2, 2)
+    p.end()
+    return QIcon(pm)
 
 
 class _SeekSlider(QSlider):
@@ -440,7 +482,8 @@ class PlaybackDialog(QDialog):
 
     def _refresh_list(self):
         """扫描录制根目录，两级树展示：顶层 = 任务目录名，子项 =
-        episode-xxx（仅显示 episode 文件名，不再重复长任务名）。"""
+        episode-xxx（仅显示 episode 文件名，不再重复长任务名）；
+        每段带上传状态图标（程序绘制，不依赖系统 emoji 字体）。"""
         self._stop()
         self._list.clear()
         from core.uploader import UploadManager
@@ -456,11 +499,10 @@ class PlaybackDialog(QDialog):
                             reverse=True):
                 n = s.get("episode_index", 0)
                 status = UploadManager.get_upload_status(s["path"], n)
-                icon = {"completed": "✅", "failed": "❌",
-                        "pending": "⬜"}.get(status, "⬜")
                 child = QTreeWidgetItem(
-                    [f"{icon} episode-{episode_file_suffix(n):03d}"])
+                    [f"episode-{episode_file_suffix(n):03d}"])
                 child.setFlags(child.flags() | Qt.ItemIsUserCheckable)
+                child.setIcon(0, _status_icon(status))
                 child.setData(0, Qt.UserRole, s)
                 child.setData(0, Qt.UserRole + 1, status)  # 存上传状态
                 child.setCheckState(0, Qt.Unchecked)

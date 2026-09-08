@@ -16,10 +16,63 @@ import time
 from typing import Optional, Callable
 
 import requests
+import urllib3
+from urllib3.util import Timeout as _Urllib3Timeout
+from requests.adapters import HTTPAdapter
 
 
 CONNECT_TIMEOUT = 10
 READ_TIMEOUT = 1800        # 大会话（数 GB）上传 + 服务器解包入库可能耗时数分钟，设 30 分钟
+
+
+class _PatientSendConnection(urllib3.connection.HTTPConnection):
+    """连接子类：请求体发送阶段用读超时窗口，而不是连接超时。
+
+    urllib3 的 connectionpool 在发请求体前把 conn.timeout 设为
+    connect_timeout（本工程 10s），request() 顶层随即用该值对 socket
+    做 settimeout —— 即发送大请求体时 socket 超时实际是"连接超时"。
+    服务器收到大 zip 后一边入库一边慢读（导入队列繁忙时单次 sendall
+    可停顿数秒~数分钟），停顿一超 10s 上传就被误杀为
+    ConnectionError(('Connection aborted.', TimeoutError('timed out')))。
+    这里把发送阶段的 socket 超时换成读超时窗口，发送完即恢复原值。
+    """
+
+    def request(self, method, url, body=None, headers=None, *args, **kwargs):
+        saved = self.timeout
+        # conn.timeout 此时是 urlopen 写入的 connect_timeout（数值）。
+        # 非数值（如 Timeout 对象）说明不是这个路径，交给基类处理。
+        if saved is not None and not isinstance(saved, _Urllib3Timeout):
+            self.timeout = READ_TIMEOUT
+        try:
+            return super().request(method, url, body=body, headers=headers,
+                                   *args, **kwargs)
+        finally:
+            self.timeout = saved
+
+
+class _PatientSendHTTPSConnection(_PatientSendConnection,
+                                  urllib3.connection.HTTPSConnection):
+    pass
+
+
+class _PatientSendHTTPConnectionPool(urllib3.HTTPConnectionPool):
+    ConnectionCls = _PatientSendConnection
+
+
+class _PatientSendHTTPSConnectionPool(urllib3.HTTPSConnectionPool):
+    ConnectionCls = _PatientSendHTTPSConnection
+
+
+class _PatientSendAdapter(HTTPAdapter):
+    """把发送超时加长的连接池装入 session。"""
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+        # PoolManager 默认指向模块级 dict（多实例共享），须整体替换实例属性
+        self.poolmanager.pool_classes_by_scheme = {
+            "http": _PatientSendHTTPConnectionPool,
+            "https": _PatientSendHTTPSConnectionPool,
+        }
 
 
 class APIClient:
@@ -33,6 +86,10 @@ class APIClient:
         self._own_session = session is None
         self._session = session if session is not None else requests.Session()
         self._session.headers.update({"User-Agent": "DAQ-SDK/1.0"})
+        # 大请求体上传时发送阶段的 socket 超时改为读超时窗口，
+        # 否则服务器慢读停顿 >10s 会误杀上传（见 _PatientSendConnection）。
+        self._session.mount("http://", _PatientSendAdapter())
+        self._session.mount("https://", _PatientSendAdapter())
 
     def close(self):
         if self._own_session:

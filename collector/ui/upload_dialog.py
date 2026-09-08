@@ -46,8 +46,9 @@ class UploadDialog(QDialog):
         self._data_dir = data_dir or settings.RECORDING_DIR
         self._shared_session = session  # 复用已认证的 requests.Session
 
-        # 上传管理器（延迟初始化）
+        # 上传管理器（延迟初始化；有主窗口父级时复用其共享管理器）
         self._manager: Optional[UploadManager] = None
+        self._owns_manager = True   # _init_manager 里按父级是否提供管理器修正
         self._total_tasks = 0
         self._done_tasks = 0
         self._task_path_map: dict = {}   # task_id → session_path（删除用）
@@ -63,7 +64,18 @@ class UploadDialog(QDialog):
 
     def _init_manager(self):
         url = self._url_edit.text().strip()
-        self._manager = UploadManager(url, session=self._shared_session)
+        # 优先复用主窗口的上传管理器：手动上传与自动上传同一队列，
+        # 关闭本对话框后任务在后台继续完成（完成后的标记/删除/日志
+        # 由主窗口统一处理）。无主窗口父级时自建管理器（原行为）。
+        parent_mgr = getattr(self.parent(), "_upload_manager", None)
+        if parent_mgr is not None:
+            self._manager = parent_mgr
+            self._owns_manager = False
+        else:
+            self._manager = UploadManager(url, session=self._shared_session)
+            self._owns_manager = True
+        if url:
+            self._manager.server_url = url
         self._manager.task_status.connect(self._on_status)
         self._manager.task_progress.connect(self._on_progress)
         self._manager.task_completed.connect(self._on_task_done)
@@ -369,17 +381,36 @@ class UploadDialog(QDialog):
         # 入队并记录 task_id → (session_path, episode_index)
         # （上传成功且自动删除开关开启时删除本地 episode 文件组）
         valid = [(p, n) for (p, n) in selected if os.path.isdir(p)]
-        self._task_path_map.update(
-            dict(zip(self._manager.add_tasks(valid), valid)))
+        # 已在队列/执行中的条目不再重复提交（共享主窗口管理器时，
+        # 上次提交仍在后台进行 → 重新打开对话框不会重复入队）
+        fresh = [(p, n) for (p, n) in valid if not self._manager.has_task(p, n)]
+        if not fresh:
+            self._status_label.setText(tr("所选内容已在上传队列中，无需重复提交"))
+            return
+
+        ids = self._manager.add_tasks(fresh)
+        self._task_path_map.update(dict(zip(ids, fresh)))
+        # 共享管理器：主窗口的完成回调靠 _upload_task_map 拿到会话路径
+        # 做标记「已上传」/「上传后删除」与日志（本对话框只负责显示）
+        if not self._owns_manager:
+            mw_map = getattr(self.parent(), "_upload_task_map", None)
+            if mw_map is not None:
+                mw_map.update(dict(zip(ids, fresh)))
         self._manager.start()
-        self._total_tasks = len(selected)
+        self._total_tasks = len(fresh)
         self._done_tasks = 0
         self._upload_btn.setEnabled(False)
-        self._status_label.setText(tr("已入队 {} 个任务，开始处理…", len(selected)))
+        msg = tr("已入队 {} 个任务，开始处理…", len(fresh))
+        if len(valid) > len(fresh):
+            msg += tr("（{} 条已在队列中，跳过）", len(valid) - len(fresh))
+        self._status_label.setText(msg)
         self._progress_bar.setValue(0)
 
     def _on_status(self, task_id: str, msg: str):
         """串行处理时状态栏显示：第几条 + 会话名 + 当前正在打包/上传什么。"""
+        # 共享管理器也会广播自动上传等非本对话框任务的状态——不显示
+        if task_id not in self._task_path_map:
+            return
         pair = self._task_path_map.get(task_id, ("", 0))
         name = self._pair_name(pair)
         if self._total_tasks > 1:
@@ -401,15 +432,22 @@ class UploadDialog(QDialog):
         return f"{name}/episode-{episode_file_suffix(n):03d}" if n > 0 else name
 
     def _on_progress(self, task_id: str, ratio: float):
+        if task_id not in self._task_path_map:
+            return
         if self._total_tasks > 0:
             overall = int((self._done_tasks + ratio) / self._total_tasks * 100)
             self._progress_bar.setValue(min(overall, 100))
 
     def _on_task_done(self, task_id: str):
+        # 共享管理器也会广播自动上传等非本对话框任务的完成——仅刷新列表
+        if task_id not in self._task_path_map:
+            self._refresh_list()
+            return
         self._done_tasks += 1
         self._refresh_list()
         # 手动上传同样遵循"上传后自动删除"开关（与主窗口自动上传一致）；
-        # 不删除时把录制行标为「已上传」（本地保留），历史面板可见
+        # 不删除时把录制行标为「已上传」（本地保留），历史面板可见。
+        # 共享主窗口管理器时这些收尾由主窗口统一处理，这里只负责显示。
         pair = self._task_path_map.pop(task_id, ("", 0))
         path, n = pair
         name = self._pair_name(pair) or task_id
@@ -419,6 +457,8 @@ class UploadDialog(QDialog):
                    self._total_tasks, name))
         else:
             self._status_label.setText(tr("✅ 上传完成: {}", name))
+        if not self._owns_manager:
+            return
         if path and settings.UPLOAD_DELETE_AFTER:
             self._delete_after_upload(path, n)
         else:
@@ -463,9 +503,14 @@ class UploadDialog(QDialog):
             log(msg)
 
     def _on_task_failed(self, task_id: str, error: str):
+        if task_id not in self._task_path_map:
+            self._refresh_list()
+            return
         name = self._pair_name(self._task_path_map.get(task_id, ("", 0))) or task_id
         self._status_label.setText(tr("❌ 上传失败: {}", f"{name}（{error}）"))
-        self._parent_log(tr("[上传失败] {}: {}", name, error))
+        # 共享管理器时失败日志由主窗口统一记录
+        if self._owns_manager:
+            self._parent_log(tr("[上传失败] {}: {}", name, error))
         self._refresh_list()
 
     def _on_all_done(self):
@@ -475,6 +520,12 @@ class UploadDialog(QDialog):
         self._refresh_list()
 
     def closeEvent(self, event):
-        if self._manager:
-            self._manager.stop()
+        # 复用主窗口共享管理器时：关闭对话框只是收起界面，任务继续在
+        # 后台完成（进度/结果见主窗口日志）；自有管理器（无主窗口父级
+        # 的独立使用）保持原行为：关闭即停止。
+        if self._owns_manager:
+            if self._manager:
+                self._manager.stop()
+        elif self._manager and not self._manager.all_done():
+            self._parent_log(tr("☁ 上传继续在后台进行（可在主窗口日志查看进度）"))
         event.accept()

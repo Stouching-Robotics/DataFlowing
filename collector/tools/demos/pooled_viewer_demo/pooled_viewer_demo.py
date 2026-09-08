@@ -943,9 +943,9 @@ def _fit_dist(kpts):
 
 
 def _skel_bg(w, h):
-    img = np.full((h, w, 3), 12, np.uint8)
-    for y in range(h):
-        img[y] = np.full(3, 10 + int(10 * y / h), np.uint8)
+    img = np.empty((h, w, 3), np.uint8)
+    ramp = (10 + (10 * np.arange(h) // h)).astype(np.uint8)
+    img[:] = ramp[:, None, None]
     return img
 
 
@@ -1140,6 +1140,7 @@ class DemoWindow(QMainWindow):
             lambda _c: self.data is not None and self.render_frame(self.idx))
 
         self.timer = QTimer(self)
+        self.timer.setTimerType(Qt.PreciseTimer)   # 节奏计时器要精确节拍
         self.timer.setInterval(33)   # 30fps；加载后按数据 fps 重设
         self.timer.timeout.connect(self.next_frame)
 
@@ -1287,18 +1288,24 @@ class DemoWindow(QMainWindow):
         # 实时节奏：目标帧 = 起点 + 已过时间×fps（取模循环，与原行为
         # 一致）。渲染慢时直接跳到目标帧——掉帧保速，而不是像旧的自
         # 适应写法那样把播放时钟拉慢（5 分钟数据播 6 分钟的根因）。
+        # keep_clock=True：追赶 tick 不得重设节奏起点，否则每次 tick
+        # 都把时钟锚到当前帧，绝对时钟追赶失效——快机器上 33ms 定时器
+        # 对 33.3ms 帧间隔 int(0.99)=0 每两拍才进 1 帧（≈2 倍慢），
+        # 渲染慢的机器上每拍只进 1 帧（播放速度 = 每帧渲染耗时，即
+        # 一秒视频播一点几秒的根因）。
         target = int((time.perf_counter() - self._play_t0)
                      * self.play_fps) % self.n
         if target != self.idx:
-            self.seek(target)
+            self.seek(target, keep_clock=True)
 
-    def seek(self, i):
+    def seek(self, i, keep_clock=False):
         if self.data is None:
             return
         self.idx = max(0, min(self.n - 1, int(i)))
-        # 播放中跳转（拖进度条/键盘/按钮）→ 重设节奏起点，从新位置继续
-        # 播放；不重设的话 next_frame 会按旧起点把画面弹回原播放处
-        if self.playing:
+        # 播放中由用户主动跳转（拖进度条/键盘/按钮）→ 重设节奏起点，
+        # 从新位置继续播放；不重设的话 next_frame 会按旧起点把画面
+        # 弹回原播放处。自动播放追赶（keep_clock=True）不重设。
+        if self.playing and not keep_clock:
             self._play_t0 = time.perf_counter() - self.idx / self.play_fps
         self.render_frame(self.idx)
 
@@ -1472,7 +1479,7 @@ class DemoWindow(QMainWindow):
 
         # 4) IMU 姿态面板（每传感器一个面板，竖排；有骨架时默认隐藏）
         imu_sensors = sorted(self.data.imu_quats)
-        if self.has_imu and imu_sensors:
+        if self.has_imu and imu_sensors and self.lbl_imu.isVisible():
             w = self.lbl_imu.width() or 880
             h = self.lbl_imu.height() or 240
             panels = []

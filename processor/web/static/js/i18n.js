@@ -2,7 +2,7 @@
 
 const I18N = {
     zh: {
-        app_title: 'Data Acquisition',
+        app_title: 'processor',
         video_review: '视频审核',
         trash: '回收站',
         all_status: '全部状态',
@@ -12,6 +12,8 @@ const I18N = {
         search: '搜索...',
         loading: '加载中...',
         processing: '处理中...',
+        ai_annotating: 'AI 标注处理中...',
+        ai_annotating_hint: 'AI 标注完成后自动载入本批次数据',
         no_data: '暂无数据',
         load_failed: '加载失败',
         select_episode: '选择一个视频开始审核 →',
@@ -227,7 +229,7 @@ const I18N = {
         slice_delete_failed: '删除失败: ',
     },
     en: {
-        app_title: 'Data Acquisition',
+        app_title: 'processor',
         video_review: 'Video Review',
         trash: 'Trash',
         all_status: 'All Status',
@@ -237,6 +239,8 @@ const I18N = {
         search: 'Search...',
         loading: 'Loading...',
         processing: 'Processing...',
+        ai_annotating: 'AI annotation running...',
+        ai_annotating_hint: 'This batch becomes viewable once AI annotation finishes',
         no_data: 'No data',
         load_failed: 'Load failed',
         select_episode: 'Select an episode to review →',

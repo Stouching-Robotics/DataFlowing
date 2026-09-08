@@ -113,6 +113,48 @@ def depth_to_heatmap_bgr(depth_mm):
     return codes_to_heatmap_bgr(quantize_depth(depth_mm))
 
 
+# Turbo colormap (Google) polynomial coefficients — matches Rerun's default
+# depth visualization (blue → cyan → green → yellow → red continuous ramp).
+_TURBO_POLY = {
+    "r": [0.13572138, 4.61539260, -42.66032258, 132.13108234,
+          -152.94239396, 59.28637943],
+    "g": [0.09140261, 2.19418839, 4.84296658, -14.18503333,
+          4.27729857, 2.82956604],
+    "b": [0.10667330, 12.64194608, -60.58204836, 110.36276771,
+          -89.90310912, 27.34824973],
+}
+_TURBO_LUT: list[list[int]] | None = None
+
+
+def turbo_lut(size: int = 256) -> list[list[int]]:
+    """N-entry Google Turbo colormap (RGB), generated once per process.
+
+    The frontend uses 256 entries; the preview transcode uses a 4096-entry
+    cube so the range mapping keeps 12-bit precision (a 256-entry LUT in the
+    8-bit domain caused visible banding on smooth depth gradients).
+    """
+    global _TURBO_LUT
+    if size == 256 and _TURBO_LUT is not None:
+        return _TURBO_LUT
+    lut = []
+    for i in range(size):
+        x = i / max(1, size - 1)
+        rgb = []
+        for channel in ("r", "g", "b"):
+            c = _TURBO_POLY[channel]
+            v = c[0] + x * (c[1] + x * (c[2] + x * (c[3] + x * (c[4] + x * c[5]))))
+            rgb.append(int(max(0, min(255, round(v * 255)))))
+        lut.append(rgb)
+    if size == 256:
+        _TURBO_LUT = lut
+    return lut
+
+
+def turbo_lut_256() -> list[list[int]]:
+    """256-entry Google Turbo colormap (RGB), generated once per process."""
+    return turbo_lut(256)
+
+
 def _depth_video_info_from_path(path: Path) -> dict[str, Any]:
     """Read depth metadata beside a canonical video when available."""
     path = Path(path)
@@ -677,6 +719,7 @@ class DepthVideoReader:
             raise RuntimeError(f"Metric depth video has invalid dimensions: {self.path}")
         self.frame_count = int(probe.get("frames") or 0)
         self.fps = float(probe.get("fps") or 30.0)
+        self.pix_fmt = pix_fmt
         self.video_info = _depth_video_info_from_path(self.path)
         self.mode = _depth_video_mode(self.video_info)
         self._frame_bytes = self.width * self.height * 2
@@ -755,12 +798,19 @@ class DepthVideoReader:
     def close(self) -> None:
         process = self._process
         if process.poll() is None:
+            # The decoder usually sits blocked on a full stdout pipe once the
+            # caller stops reading.  SIGTERM makes FFmpeg try a graceful
+            # flush that never completes in that state (measured 5s timeouts
+            # per close), so give it a very short grace window and then kill.
             process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
+            try:
+                process.wait(timeout=0.3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
         if process.stdout:
             process.stdout.close()
         if process.stderr:
@@ -771,6 +821,91 @@ class DepthVideoReader:
 
     def __exit__(self, _exc_type, _exc, _tb):
         self.close()
+
+
+class DepthCodeSeekReader:
+    """Sequential code reader positioned at an exact frame via FFmpeg seek.
+
+    The canonical depth contract encodes keyint=2 (an IDR every two frames),
+    so input seeking lands one frame before the target at most.  FFmpeg's
+    accurate seek drops the lead-in frames itself (verified: ``-ss`` at an
+    exact frame timestamp yields that frame as the first output), which turns
+    a scrub jump from an O(N) sequential decode into a constant-time seek.
+
+    The pooled window path replaces its sequential reader with one of these
+    after a jump, so forward playback continues from the new position without
+    re-seeking per window.
+    """
+
+    def __init__(self, path: Path, start_frame: int, fps: float = 30.0,
+                 pix_fmt: str = "gray12le"):
+        import numpy as np
+
+        self.path = Path(path)
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError("ffmpeg is required to seek depth video")
+        probe = _probe_video(self.path)
+        self.width = int(probe.get("width") or 0)
+        self.height = int(probe.get("height") or 0)
+        if self.width <= 0 or self.height <= 0:
+            raise RuntimeError(f"Depth video has invalid dimensions: {self.path}")
+        self._frame_bytes = self.width * self.height * 2
+        # Keep the stream identity so a later scrub jump on the same pool
+        # entry re-derives the seek timestamp from the real fps/pix_fmt
+        # instead of falling back to defaults (wrong seek → frame desync).
+        self.fps = float(fps or 30.0)
+        self.pix_fmt = pix_fmt
+        seek_time = max(0, int(start_frame)) / self.fps
+        # Truncate to milliseconds (never round up): ffmpeg's accurate seek
+        # returns the first frame with ts >= seek_time, so a rounded-up value
+        # such as 36.6667 lands one frame PAST the target (36.66667 -> frame
+        # 1101 instead of 1100).  A 1ms truncation is always below the
+        # target frame ts and at least ~32ms above the previous frame's.
+        seek_time = math.floor(seek_time * 1000) / 1000
+        self._process = subprocess.Popen(
+            [ffmpeg, "-v", "error",
+             "-ss", f"{seek_time:.3f}", "-i", str(self.path),
+             "-f", "rawvideo", "-pix_fmt", pix_fmt, "pipe:1"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+    def read_codes(self):
+        """Read one stored little-endian uint16 frame without colorization."""
+        import numpy as np
+
+        if self._process.stdout is None:
+            return None
+        chunks: list[bytes] = []
+        remaining = self._frame_bytes
+        while remaining:
+            data = self._process.stdout.read(remaining)
+            if not data:
+                return None
+            chunks.append(data)
+            remaining -= len(data)
+        return np.frombuffer(b"".join(chunks), dtype="<u2").reshape(
+            self.height, self.width,
+        ).copy()
+
+    def close(self) -> None:
+        process = self._process
+        if process.poll() is None:
+            # Same blocked-pipe situation as DepthVideoReader.close(); a
+            # graceful SIGTERM flush hangs for seconds on a full stdout pipe.
+            process.terminate()
+            try:
+                process.wait(timeout=0.3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+        if process.stdout:
+            process.stdout.close()
+        if process.stderr:
+            process.stderr.close()
 
 
 def _to_mp4(source: Path, destination: Path) -> Path:

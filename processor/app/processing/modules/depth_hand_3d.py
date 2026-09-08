@@ -960,7 +960,7 @@ def _run_rgb_estimated_pair(pair: dict, video_path: Path, config: dict,
     import pandas as pd
 
     # Imported lazily to keep the depth helper independent during normal
-    # module discovery.  Both modules are inside Data Acquisition; this is
+    # module discovery.  Both modules are inside processor; this is
     # not a dependency on the legacy Python project.
     from app.processing.modules.stereo_triangulate import (
         _detect_hands, _rgb_frame_rows,

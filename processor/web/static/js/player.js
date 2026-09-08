@@ -238,7 +238,10 @@ function _depthCodesUrl(source, frame) {
 // remote FFmpeg read to finish before the playhead reaches the boundary.
 const DEPTH_WINDOW_SIZE = 120;
 const DEPTH_PREFETCH_MARGIN = 20;
-const DEPTH_INITIAL_BUFFER_FRAMES = 120;
+// Frames buffered before depth playback may start.  With 2x-transported
+// codes one frame is ~200KB, so 10 frames (~2MB) paints quickly while the
+// full stream keeps preloading in the background.
+const DEPTH_INITIAL_BUFFER_FRAMES = 10;
 // At 848x480 uint16, 600 frames are about 465 MiB. Below this boundary it is
 // safer to keep the complete decoded window set resident and guarantee zero
 // mid-play disk/cache reads; above it use the bounded three-window runway.
@@ -248,11 +251,12 @@ const DEPTH_VERY_LONG_INITIAL_WINDOWS = 3;
 // very long clips wait for three windows (~12s at 30 FPS), then continue in
 // the background without allowing the playhead to cross an empty window.
 const DEPTH_FULL_PRELOAD = true;
-// A 848x480 stream costs about 0.78 MiB per raw frame. Keeping a 1180-frame
-// episode as one Uint16Array would consume ~920 MiB in the browser and can
-// trigger GC pauses or tab eviction. Short clips still get the one-shot cache;
-// long clips use the sequential window path below.
-const DEPTH_FULL_PRELOAD_MAX_FRAMES = 240;
+// A 848x480 stream costs about 0.78 MiB per raw frame at native scale. With
+// the 2x-downsampled transport one frame is ~0.19 MiB, so 2000 frames fit
+// ~400 MiB — the budget that previously limited full preload to short clips
+// now covers every episode recorded so far.  Clips beyond this fall back to
+// the strict all-windows preload barrier instead.
+const DEPTH_FULL_PRELOAD_MAX_FRAMES = 2000;
 
 let _depthPlaybackStall = null;
 
@@ -295,11 +299,17 @@ function _depthCodesWindowUrl(source, start, end) {
     if (!template && source && source.source_key && currentEpisodeId) {
         template = `/api/v1/video/${encodeURIComponent(currentEpisodeId)}` +
             `/depth-codes-window/${encodeURIComponent(source.source_key)}` +
-            '?start_frame={start}&end_frame={end}';
+            '?start_frame={start}&end_frame={end}&scale=2';
     }
     if (template) {
-        const url = template.replace('{start}', Math.max(0, start))
+        let url = template.replace('{start}', Math.max(0, start))
             .replace('{end}', Math.max(start, end));
+        // Server-provided templates may be cached by media-groups without
+        // the downsampled transport; force it so windows stay ~23MB instead
+        // of ~95MB (a stale cache must never regress playback).
+        if (!url.includes('scale=')) {
+            url += `${url.includes('?') ? '&' : '?'}scale=2`;
+        }
         const revision = source && source.depth_cache_key;
         return revision
             ? `${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(revision)}`
@@ -312,9 +322,15 @@ function _depthCodesFullUrl(source) {
     let template = source && source.depth_codes_full_url;
     if (!template && source && source.source_key && currentEpisodeId) {
         template = `/api/v1/video/${encodeURIComponent(currentEpisodeId)}` +
-            `/depth-codes-full/${encodeURIComponent(source.source_key)}`;
+            `/depth-codes-full/${encodeURIComponent(source.source_key)}` +
+            '?scale=2';
     }
     if (!template) return '';
+    // Same guard as the window URL: a cached media-groups payload must not
+    // drop the downsampled transport.
+    if (!template.includes('scale=')) {
+        template += `${template.includes('?') ? '&' : '?'}scale=2`;
+    }
     const revision = source && source.depth_cache_key;
     return revision
         ? `${template}${template.includes('?') ? '&' : '?'}v=${encodeURIComponent(revision)}`
@@ -569,11 +585,12 @@ async function _fetchDepthCodes(entry, frame) {
     if (entry.windowInflight != null) return;
     const target = entry.pendingFrame;
     entry.pendingFrame = null;
-    const start = Math.floor(target / DEPTH_WINDOW_SIZE) * DEPTH_WINDOW_SIZE;
+    const sourceFrameCount = Number(entry.source.frame_count) || 0;
     // Once the source metadata is known, never ask the backend for a window
     // beyond the actual clip. Besides avoiding noisy 404s, this prevents a
     // failed tail request from looking like a playback stall on short clips.
-    const sourceFrameCount = Number(entry.source.frame_count) || 0;
+    if (sourceFrameCount && target >= sourceFrameCount) return;
+    const start = Math.floor(target / DEPTH_WINDOW_SIZE) * DEPTH_WINDOW_SIZE;
     if (sourceFrameCount && start >= sourceFrameCount) return;
     const end = sourceFrameCount
         ? Math.min(start + DEPTH_WINDOW_SIZE - 1, sourceFrameCount - 1)
@@ -650,7 +667,11 @@ async function _fetchDepthCodes(entry, frame) {
 }
 
 function _queueDepthWindow(entry, frame) {
-    if (!entry || entry.fullReady || entry.keepAllFrames || frame < 0) return;
+    // keepAllFrames only controls eviction (RAM residency), NOT fetching:
+    // with the 2x-downsampled transport, long clips now qualify as
+    // keepAllFrames and must still be prefetched by this queue — otherwise
+    // every 120-frame boundary stalls.
+    if (!entry || entry.fullReady || frame < 0) return;
     const start = Math.floor(frame / DEPTH_WINDOW_SIZE) * DEPTH_WINDOW_SIZE;
     const count = Number(entry.source?.frame_count) || 0;
     if (count && start >= count) return;
@@ -907,6 +928,20 @@ async function fetchHand3DWindow(center, sourceKey) {
     const cache = _hand3dCacheFor(source);
     if (cache.fullReady) return true;
     if (cache.inflight) return cache.inflightPromise || false;
+    // 该源没有任何有效手部帧(如深度抬升全空的批次)→ 不发起
+    // 20s+ 的空拉取;标记 fullReady 后后续窗口请求全部短路。
+    // 仅当后端确实统计过(counted=true)且为 0 才跳过 —— 统计失败的
+    // 默认 0 不能误杀有数据的批次。
+    const handData = hand3dDataBySource[source] || hand3dData;
+    const handOption = handData && Array.isArray(handData.available_sources)
+        ? handData.available_sources.find(
+            item => (item.source_key || 'default') === source) : null;
+    const handMeta = handOption || handData;
+    if (handMeta && handMeta.counted === true
+            && Number(handMeta.valid_hand_frames ?? -1) === 0) {
+        cache.fullReady = true;
+        return false;
+    }
     const insideWindow = center >= cache.start && center <= cache.end;
     const insidePrefetchRange = center >= cache.start + HAND3D_PREFETCH_MARGIN
         && center <= cache.end - HAND3D_PREFETCH_MARGIN;
@@ -1376,77 +1411,22 @@ async function mountGroupedSource(source, tile) {
         renderHand3DTile(entry, 0);
         return;
     }
-    if (source.kind === 'depth' && (source.depth_codes_url || source.depth_preview_url)) {
-        // The source video remains raw gray12le. Only the received uint16
-        // codes are colorized in this browser canvas; no JET image is stored.
+    if (source.kind === 'depth' && source.depth_video_url) {
+        // Depth previews are browser-decodable 8-bit Turbo MP4s generated
+        // once per source from the canonical 12-bit stream (identical
+        // clamp/scale/colormap math as the former canvas renderer).  Play
+        // them as native videos: instant open, native seek, and frame sync
+        // through the same master-drift loop as every other camera.
         const holder = document.createElement('div');
         holder.id = `player-container-${groupedSourceDomId(source)}`;
         holder.className = 'bg-black rounded overflow-hidden w-full h-full min-h-0 relative';
         tile.appendChild(holder);
-        const canvas = document.createElement('canvas');
-        canvas.className = 'w-full h-full object-contain bg-black block';
-        canvas.setAttribute('aria-label', source.label || 'Depth preview');
-        holder.appendChild(canvas);
-        const entry = { canvas, source, frames: new Map(),
-                        windowInflight: null, pendingFrame: null,
-                        fullCodes: null, fullInflight: null, fullReady: false,
-                        allPreloadInflight: null, allPreloaded: false,
-                        initialPreloadInflight: null, initialBufferReady: false,
-                        keepAllFrames: false,
-                        windowQueue: [], windowPump: false,
-                        preloadProgress: 0,
-                        initialReady: false,
-                        fullError: null,
-                        width: 0, height: 0, pixelCount: 0,
-                        frameBytes: 0, frameCount: 0 };
-        currentDepthPreviewTiles.push(entry);
-        if (window.DepthRenderer) {
-            return DepthRenderer.loadJetLut().then(async () => {
-                const sourceFrameCount = Number(source.frame_count) || 0;
-                const allowFullPreload = DEPTH_FULL_PRELOAD &&
-                    sourceFrameCount > 0 &&
-                    sourceFrameCount <= DEPTH_FULL_PRELOAD_MAX_FRAMES;
-                if (allowFullPreload) {
-                    try {
-                        const loaded = await _preloadDepthCodes(entry);
-                        if (!loaded) {
-                            await _fetchDepthCodes(entry,
-                                typeof currentFrameTarget === 'number'
-                                    ? currentFrameTarget : 0);
-                        }
-                        return;
-                    } catch (error) {
-                        // Keep a bounded-window fallback for old servers or a
-                        // transient full-stream failure; the normal path is
-                        // still the complete raw-code preload above.
-                        console.warn('[player] full depth preload failed:', error);
-                    }
-                }
-                const veryLong = sourceFrameCount > DEPTH_VERY_LONG_FRAMES;
-                if (veryLong) {
-                    // Very long clips open after three depth windows (~12s at
-                    // 30 FPS), then the playback queue fills future windows
-                    // without evicting frames the playhead is still using.
-                    const initialLoaded = await _preloadDepthInitialWindows(entry);
-                    if (initialLoaded) {
-                        return;
-                    }
-                } else {
-                    // Normal/medium clips still use the strict all-loaded
-                    // barrier, with only a few decoded windows in RAM.
-                    const allLoaded = await _preloadDepthWindows(entry);
-                    if (allLoaded) return;
-                }
-                await _fetchDepthCodes(entry,
-                    typeof currentFrameTarget === 'number' ? currentFrameTarget : 0);
-            }).catch(error => {
-                console.warn('[player] depth mount failed:', error);
-            });
-        }
+        const player = initPlayer(holder.id, source.depth_video_url);
+        if (player) players[groupedSourceKey(source)] = player;
         return;
     }
     if (source.kind === 'glove' || source.kind === 'depth' || source.kind === 'hand') {
-        const img = source.kind === 'hand'
+        const img = (source.kind === 'hand' || source.kind === 'glove')
             ? document.createElement('canvas') : document.createElement('img');
         // Hand-pressure panels are generated on a wide 800x220 canvas. Keep
         // that native ratio instead of stretching the heatmap vertically.
@@ -1471,6 +1451,12 @@ async function mountGroupedSource(source, tile) {
             // Hand-pressure tile: use the full frames-data payload and draw
             // locally; this avoids one PNG request per video frame.
             if (typeof registerHandTile === 'function') registerHandTile(img, source.hand);
+        } else if (source.kind === 'glove') {
+            // Glove heatmap tile: draw locally from the preloaded
+            // frames-data payload too (no per-frame PNG requests).
+            if (typeof registerGloveTile === 'function') {
+                registerGloveTile(img, source.source_key);
+            }
         } else if (source.kind === 'depth') {
             // Depth streams are mounted by the Canvas/code path above.
         } else {
@@ -1517,10 +1503,12 @@ function _refreshImageTilesAt(frame) {
     _lastImageTileFrame = frame;
     currentImageTiles.forEach((entry) => {
         const { img, source } = entry;
-        // Hand-pressure tiles are driven by heatmap.js (frame URLs); only
-        // template-based non-depth tiles are refreshed here.
+        // Hand/glove tiles are driven by heatmap.js from the preloaded
+        // frames-data payload; only template-based non-depth tiles are
+        // refreshed here.
         let url;
-        if (source.kind === 'depth' || source.kind === 'hand') {
+        if (source.kind === 'depth' || source.kind === 'hand'
+                || source.kind === 'glove') {
             return;
         } else {
             url = source.heatmap_url || source.depth_preview_url || source.depth_url;
@@ -1998,12 +1986,18 @@ function renderGroupedWorkspace() {
         // 看到黑色深度窗，RGB 已经开始跑，随后每到深度边界就暂停。
         // 短批次在这里等待整段 raw code preload，长批次等待首个 120
         // 帧窗口，后续窗口由播放时钟提前预取。
+        // 全量加载契约:深度帧全部驻留才放开播放控件(手套/仿生手掌
+        // 数据随 loadFrameData 已在上面 await 完成并本地渲染,播放中
+        // 两类 tile 均无逐帧网络请求)。
         const depthReady = await _awaitDepthInitialReady(renderEpoch);
         if (!isCurrentPlaybackSession(renderEpoch, renderToken)) return;
         if (!depthReady) {
-            console.warn('[player] depth initial frame not ready; keep playback gated');
+            console.warn('[player] depth data not ready; keep playback gated');
             return;
         }
+        // 全量流解码时已顺带算出真实 q01/q99(服务端缓存),重拉一次
+        // 让 Turbo 色带从兜底全范围切到自适应范围。
+        _refreshDepthRanges();
         // 全部就绪才放开控件/揭遮罩:消除「第二个视频晚 ready → 开头不同步」
         // 与「帧数据返回前用旧 fps 交互 → 帧不对齐」两个竞态窗口
         await _awaitPlayersReady();
@@ -2242,6 +2236,7 @@ function _defaultWorkspaceFromGroups() {
 
 async function loadGroupedEpisodeVideo(episodeId, cameras, options = {}) {
     _cancelEpisodeMediaLoad(true);
+    _episodeLoadInFlight = true;
     const loadToken = _playbackSessionToken;
     _episodeMediaLoadController = new AbortController();
     const mediaSignal = _episodeMediaLoadController.signal;
@@ -2297,9 +2292,15 @@ async function loadGroupedEpisodeVideo(episodeId, cameras, options = {}) {
     // 自愈保险:加载链任何一环卡住,10 秒后强制启用控件并揭开遮罩 ——
     // 控件宁可可用,不可锁死("点了没反应"必须被兜底修掉)。
     // 若此时还没有任何活跃播放器(挂载失败/被冲掉),重渲染工作区一次。
+    // 加载请求仍在进行中(如 hand-3d 元数据冷读 20s+)时不判定为故障,
+    // 重新武装 watchdog 下一轮再查,避免误报"无活跃播放器"。
     clearTimeout(_loadWatchdog);
-    _loadWatchdog = setTimeout(() => {
+    const watchdogTick = () => {
         if (!isCurrentPlaybackSession(episodeId, loadToken)) return;
+        if (_episodeLoadInFlight) {
+            _loadWatchdog = setTimeout(watchdogTick, 10000);
+            return;
+        }
         const depthStillBuffering = currentDepthPreviewTiles.some(entry =>
             (entry.fullInflight && !entry.fullReady) ||
             (entry.allPreloadInflight && !entry.allPreloaded));
@@ -2315,7 +2316,8 @@ async function loadGroupedEpisodeVideo(episodeId, cameras, options = {}) {
                 console.error('[player] 自愈重渲染失败:', e);
             }
         }
-    }, 10000);
+    };
+    _loadWatchdog = setTimeout(watchdogTick, 10000);
     // Fetch 3D metadata in parallel with media-groups, but await both before
     // building the workspace. The 3D tile itself then awaits its first data
     // window together with each RGB overlay's first keypoint window.
@@ -2347,6 +2349,7 @@ async function loadGroupedEpisodeVideo(episodeId, cameras, options = {}) {
                 ensureHand3dWorldTile();
             }
             renderGroupedWorkspace();
+            _episodeLoadInFlight = false;
             renderPreviewVideoSources();
             // 3D 世界窗口兜底:开关开且有产物 → 确保已挂载
             if (typeof ensureHand3dWorldTile === 'function'
@@ -2378,10 +2381,12 @@ async function loadGroupedEpisodeVideo(episodeId, cameras, options = {}) {
     if (!currentCameras.length) {
         grid.innerHTML = '<div class="flex items-center justify-center h-64 text-gray-600">' + t('no_video') + '</div>';
         hideVideoLoading();
+        _episodeLoadInFlight = false;
         return;
     }
     workspaceSources = currentCameras.slice(0, 2).map(camera => groupedSource('video', camera, { label: camera }));
     renderGroupedWorkspace();
+    _episodeLoadInFlight = false;
     renderPreviewVideoSources();
     updateInfoBar();
     if (typeof updatePreviewMenuData === 'function') updatePreviewMenuData();
@@ -2600,7 +2605,14 @@ function playAll() {
         }
     }
     Object.values(players).forEach(p => {
-        try { p.play(); } catch(e) {}
+        // play() 是异步 promise:中断(如被 pause 打断)产生的 AbortError
+        // 拒绝必须吞掉,否则控制台报红且可能破坏后续播放状态。
+        try {
+            const result = p.play();
+            if (result && typeof result.catch === 'function') {
+                result.catch(() => {});
+            }
+        } catch (e) {}
     });
     // play() enters the native media state asynchronously. Arm the
     // presentation clock on the next task so the first displayed RGB frame
@@ -2971,12 +2983,24 @@ function consumeSeekTarget() {
 
 function seekToFrame(frameIndex) {
     frameIndex = _clampFrameIndex(frameIndex);
-    _pendingSeekFrame = frameIndex;  // remember exact target for seeked handler
     currentFrameTarget = frameIndex;
     // 不提前返回:播放器尚未挂载时目标帧已记录在 currentFrameTarget,
     // 新播放器挂载(_setPlayerToCurrentFrame)或就绪后会自动补 seek,
     // 避免"刚切换视频时点切片静默失败"。
     const time = frameIndex / (episodeFps || 30);
+    // Only remember a pending exact-frame target when some player will
+    // actually seek.  A mount-time seekToFrame(0) on a fresh video never
+    // fires 'seeked', leaving a stale 0 that the pause handler consumed and
+    // reset the frame display to 0 after the first play.
+    let willSeek = false;
+    Object.values(players).forEach(player => {
+        try {
+            if (Math.abs((player.currentTime || 0) - time) > 0.001) {
+                willSeek = true;
+            }
+        } catch (e) { /* ignore */ }
+    });
+    if (willSeek) _pendingSeekFrame = frameIndex;
     Object.values(players).forEach(player => {
         try { player.currentTime = Math.max(0, time); } catch (e) {}
     });
@@ -3199,6 +3223,7 @@ let playerReady = false;
 let frameDataReady = false;  // fps/总帧数已就绪;未就绪时禁止 seek/播放(旧 fps 是脏值)
 let _controlsEnabled = false;  // 控件当前是否已启用(自愈看门狗用)
 let _loadWatchdog = null;
+let _episodeLoadInFlight = false;  // 加载链(媒体组+hand3d)进行中;watchdog 不误判
 let _watchdogRetried = false;  // 自愈重渲染只试一次,防循环
 
 function onPlayerReady() {
@@ -3269,20 +3294,33 @@ function hideVideoLoading() {
     if (ov) ov.classList.add('hidden');
 }
 
-function _awaitPlayersReady(timeoutMs = 4000) {
-    /* 等待当前全部播放器 ready(元数据可 seek)。已 ready 的立即放行,
-       未 ready 等事件;单播放器与整体都有超时兜底,防止遮罩卡死。 */
+function _awaitPlayersReady(timeoutMs = 45000) {
+    /* 等待当前全部播放器 ready(元数据可 seek)且 canplay(首帧可画)。
+       只等 ready 会让深度预览在控制解锁时还没画出第一帧(黑窗)——
+       canplay 保证点播放时每个 tile 立即出画面。单播放器与整体都有
+       超时兜底,防止遮罩卡死。深度预览首次生成需要服务端转码
+       (约 4-10s),所以超时给足;纯 RGB 批次仍会在 1-2 秒内放行。 */
     const list = Object.values(players);
     if (!list.length) return Promise.resolve();
     const checks = list.map(player => new Promise(resolve => {
         let done = false;
         const finish = () => { if (!done) { done = true; resolve(); } };
-        if (player.ready) { finish(); return; }
+        const tryFinish = () => {
+            if (!player.ready) return false;
+            try {
+                const media = player.media;
+                if (media && media.readyState >= 3) { finish(); return true; }
+            } catch (e) { /* fall through to event wait */ }
+            return false;
+        };
+        if (tryFinish()) return;
         try {
-            if (typeof player.once === 'function') player.once('ready', finish);
-            else if (typeof player.on === 'function') player.on('ready', finish);
+            const on = typeof player.once === 'function'
+                ? player.once.bind(player) : player.on.bind(player);
+            on('ready', () => tryFinish());
+            on('canplay', () => tryFinish());
         } catch (e) { finish(); }
-        setTimeout(finish, 2000);
+        setTimeout(finish, 30000);
     }));
     return Promise.race([
         Promise.all(checks),
@@ -3290,28 +3328,49 @@ function _awaitPlayersReady(timeoutMs = 4000) {
     ]);
 }
 
-async function _awaitDepthInitialReady(episodeId, timeoutMs = 20000) {
+function _refreshDepthRanges() {
+    // Fetch the adaptive q01/q99 range for every mounted depth tile.
+    // Called at mount (fallback range arrives instantly) and again after
+    // the all-loaded barrier (real bounds cached by the full-stream pass).
+    if (!currentEpisodeId) return;
+    const episodeAtRequest = currentEpisodeId;
+    currentDepthPreviewTiles.forEach(entry => {
+        if (!entry.source || !entry.canvas) return;
+        fetch(`/api/v1/video/${encodeURIComponent(currentEpisodeId)}` +
+              `/depth-stats/${encodeURIComponent(entry.source.source_key || '')}`)
+            .then(response => (response.ok ? response.json() : null))
+            .then(stats => {
+                if (stats && currentEpisodeId === episodeAtRequest &&
+                    Number.isFinite(Number(stats.q01)) &&
+                    Number.isFinite(Number(stats.q99)) &&
+                    Number(stats.q99) > Number(stats.q01)) {
+                    entry.canvas._depthRange = {
+                        q01: Number(stats.q01),
+                        q99: Number(stats.q99),
+                    };
+                }
+            })
+            .catch(() => { /* 统计失败 → 渲染器回退固定 0-4095 */ });
+    });
+}
+
+async function _awaitDepthInitialReady(episodeId, timeoutMs = 60000) {
     const entries = currentDepthPreviewTiles.slice();
     if (!entries.length) return true;
+    // Strict barrier: playback may start only after EVERY depth frame is
+    // resident (full stream buffered, or every aligned window preloaded).
+    // The progressive early-release branches were removed on purpose —
+    // releasing early caused boundary stalls that read as stutter.
+    const isReady = (entry) =>
+        (entry.fullReady && entry.frameCount > 0) ||
+        (entry.allPreloaded && entry.frameCount > 0) ||
+        (Number(entry.source?.frame_count) <= 0 && entry.frames.has(0));
     const deadline = performance.now() + timeoutMs;
     while (currentEpisodeId === episodeId && performance.now() < deadline) {
-        const ready = entries.every(entry =>
-            (Number(entry.source?.frame_count) > DEPTH_VERY_LONG_FRAMES
-                ? (entry.initialBufferReady && entry.frameCount > 0)
-                : (entry.allPreloaded && entry.frameCount > 0)) ||
-            (entry.fullReady && entry.frameCount > 0) ||
-            (Number(entry.source?.frame_count) <= 0 && entry.frames.has(0)) ||
-            (entry.fullCodes && entry.frameCount > 0));
-        if (ready) return true;
+        if (entries.every(isReady)) return true;
         await new Promise(resolve => setTimeout(resolve, 50));
     }
-    return currentEpisodeId === episodeId && entries.every(entry =>
-        (Number(entry.source?.frame_count) > DEPTH_VERY_LONG_FRAMES
-            ? (entry.initialBufferReady && entry.frameCount > 0)
-            : (entry.allPreloaded && entry.frameCount > 0)) ||
-        (entry.fullReady && entry.frameCount > 0) ||
-        (Number(entry.source?.frame_count) <= 0 && entry.frames.has(0)) ||
-        (entry.fullCodes && entry.frameCount > 0));
+    return currentEpisodeId === episodeId && entries.every(isReady);
 }
 
 /* ══ 手部骨骼 3D 视图 ══════════════════════════════════

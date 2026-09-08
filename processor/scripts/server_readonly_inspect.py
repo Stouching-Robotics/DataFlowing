@@ -24,7 +24,7 @@ def main() -> None:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(
-        os.environ.get("EGODATA_SSH_HOST", ""),
+        "192.168.110.41",
         port=22,
         username="Stouch",
         password=password,

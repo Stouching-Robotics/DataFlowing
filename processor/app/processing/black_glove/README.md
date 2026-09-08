@@ -24,7 +24,7 @@ Before publishing a public repository, verify the redistribution terms for the
 bundled model files. If the model terms do not allow redistribution, keep the
 code layout and replace the files with a documented download step.
 
-The Python dependencies are declared in the parent `Data Acquisition`
+The Python dependencies are declared in the parent `processor`
 `requirements.txt`. RTMPose model assets may be downloaded by `rtmlib` on
 first use and cached by the Python environment; this is a package/runtime
 dependency, not a dependency on another repository directory.

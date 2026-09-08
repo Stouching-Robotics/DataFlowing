@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2495" height="1332" viewBox="0 0 2495 1332">
+  <defs>
+    <marker id="arrow" markerUnits="userSpaceOnUse" markerWidth="24" markerHeight="24" refX="22" refY="12" orient="auto">
+      <path d="M0,0 L24,12 L0,24 Z" fill="#ff5a4f"/>
+    </marker>
+    <style>
+      .arrow{stroke:#ff5a4f;stroke-width:6;fill:none;marker-end:url(#arrow)}
+      .mark{fill:#2f80ed;stroke:#fff;stroke-width:3}
+      .num{font:700 29px 'Noto Sans CJK SC',sans-serif;fill:#fff;text-anchor:middle;dominant-baseline:central}
+    </style>
+  </defs>
+  
+    <line class="arrow" x1="500" y1="460" x2="500" y2="535"/>
+    <circle class="mark" cx="500" cy="460" r="27"/>
+    <text class="num" x="500" y="460">1</text>
+    <line class="arrow" x1="500" y1="920" x2="500" y2="760"/>
+    <circle class="mark" cx="500" cy="920" r="27"/>
+    <text class="num" x="500" y="920">2</text>
+    <line class="arrow" x1="1050" y1="920" x2="1050" y2="710"/>
+    <circle class="mark" cx="1050" cy="920" r="27"/>
+    <text class="num" x="1050" y="920">3</text>
+    <line class="arrow" x1="1500" y1="920" x2="1500" y2="710"/>
+    <circle class="mark" cx="1500" cy="920" r="27"/>
+    <text class="num" x="1500" y="920">4</text>
+    <line class="arrow" x1="2000" y1="850" x2="2000" y2="650"/>
+    <circle class="mark" cx="2000" cy="850" r="27"/>
+    <text class="num" x="2000" y="850">5</text>
+    <line class="arrow" x1="2415" y1="75" x2="2418" y2="20"/>
+    <circle class="mark" cx="2415" cy="75" r="27"/>
+    <text class="num" x="2415" y="75">6</text>
+</svg>

@@ -1,12 +1,14 @@
-# Data Acquisition
+# processor
 
 [English](README.md) | [中文](README.zh-CN.md)
 
-> Documentation: 2026-09-03  ·  Backend: `1.6.8`  ·  Web frontend: `1.5.6`
+> Documentation: 2026-09-02  ·  Backend: `1.6.8`  ·  Web frontend: `1.5.6`
 
-Data Acquisition is EgoData's service for data capture, processing, review, and export. It is
+processor is EgoData's service for data capture, processing, review, and export. It is
 designed for embodied AI and robot manipulation data. The system consists of a FastAPI backend,
 an asynchronous Worker, Web review pages, and Workflow Studio.
+
+> Beginners: start with the [illustrated user guide](docs/en/README.md).
 
 ```text
 Capture upload → Project matching → Workflow processing → AI/Human review → LeRobot/HDF5 export
@@ -16,7 +18,7 @@ Capture upload → Project matching → Workflow processing → AI/Human review 
 
 - [System overview](#1-system-overview)
 - [Installation and startup](#7-installation-and-startup)
-- [Code layout and repository tree](#2-code-layout-and-repository-tree)
+- [Code layout](#2-code-layout)
 - [Project data structure](#3-project-data-structure)
 - [Video data specification](#4-video-data-specification)
 - [Workflow modules](#5-workflow-modules)
@@ -54,66 +56,30 @@ Web review pages
 LeRobot v2.1 / v3.0 or HDF5
 ```
 
-## 2. Code layout and repository tree
+The local `processor/` directory is the only source of frontend and backend code. The
+remote server provides data storage or SFTP access only; its deprecated frontend and backend
+code must not be used as the project source.
+
+## 2. Code layout
 
 <details>
-<summary>Click to expand: source tree and runtime directories</summary>
-
-The current maintained source tree is shown below. Runtime data, caches, virtual environments,
-local backups, test exports, and downloaded model weights are intentionally omitted.
+<summary>Click to expand: code layout</summary>
 
 ```text
-Data Acquisition/
-├── app/
-│   ├── api/                          # Project, workflow, user, and Worker APIs
-│   ├── processing/
-│   │   ├── black_glove/              # Black-glove detection, tracking, and pose backend
-│   │   └── modules/                  # RGB, RGB-D, stereo, hand, glove, review, and export nodes
-│   ├── prompts/                      # AI annotation prompts and vocabularies
-│   ├── routes/                       # Page, session, video, annotation, and export routes
-│   ├── ai_annotation.py              # Local/API VLM annotation pipeline
-│   ├── browser_preview.py             # Browser preview metadata and media preparation
-│   ├── export_engine.py               # Export job orchestration
-│   ├── hdf5_export.py                 # HDF5 dataset writer
-│   ├── lerobot_export.py              # LeRobot v3.0 exporter and metadata writer
-│   ├── lerobot_v21.py                 # LeRobot v2.1 normalization support
-│   ├── project_dataset.py              # Canonical project and Episode operations
-│   ├── storage.py / remote_storage.py # Local and SFTP-backed storage
-│   ├── workflow_*.py                  # Workflow schema, binding, and dispatch
-│   ├── models.py / database.py         # Runtime state models and persistence
-│   └── main.py                         # FastAPI application entry point
-├── worker/
-│   ├── runner.py                      # Job claim, heartbeat, execution, and callback loop
-│   ├── client.py                      # Backend Worker API client
-│   └── README.md                      # Worker-specific notes
+processor/
+├── app/                    # FastAPI, storage, workflows, processing, and export logic
+├── worker/                 # Asynchronous processing Worker
+├── scripts/                # Deployment, startup, checks, and maintenance scripts
 ├── web/
-│   ├── templates/                     # Server-rendered application pages
-│   ├── static/
-│   │   ├── js/                        # Player, depth preview, overlays, review, and UI JS
-│   │   └── workflow-studio/            # Built Workflow Studio assets served by FastAPI
-│   └── workflow-studio/
-│       └── src/
-│           ├── api/                   # Frontend API clients
-│           ├── components/             # Canvas, nodes, palette, drawer, and settings UI
-│           ├── store/                  # Workflow and UI state stores
-│           └── App.tsx                 # Workflow Studio application root
-├── scripts/                           # Setup, startup, migration, and maintenance scripts
-│   ├── run_backend_linux.sh           # Linux FastAPI startup
-│   ├── run_worker_linux.sh            # Linux Worker startup
-│   ├── hot_reload_backend.py          # Development backend reload supervisor
-│   ├── hot_reload_worker.py           # Development Worker reload supervisor
-│   ├── migrate_*.py / repack_*.py      # Dataset migration and repair tools
-│   └── systemd/                       # Linux service templates
-├── tests/
-│   └── test_depth_codec.py             # 12-bit depth codec tests
-├── requirements*.txt                  # Python dependency manifests
-├── deploy.py                          # Cross-platform deployment entry point
-├── deploy.sh / deploy.bat             # Linux and Windows deployment entry points
-├── Dockerfile / .dockerignore         # Container build files
-├── .env.example                       # Safe configuration template
-├── .gitignore                         # Runtime data, secrets, models, and cache exclusions
-├── README.md                          # English documentation
-└── README.zh-CN.md                    # Chinese documentation
+│   ├── templates/          # Web page templates
+│   ├── static/             # CSS, JavaScript, and frontend build artifacts
+│   └── workflow-studio/    # React + Vite workflow editor source
+├── tests/                  # Automated tests
+├── requirements*.txt       # Python dependency manifests
+├── deploy.py               # Cross-platform deployment entry point
+├── deploy.sh               # Linux deployment entry point
+├── deploy.bat              # Windows deployment entry point
+└── .env.example            # Configuration template
 ```
 
 Runtime data is stored under `STORAGE_DIR` by default:
@@ -122,9 +88,7 @@ Runtime data is stored under `STORAGE_DIR` by default:
 data/
 ├── sessions/               # Project datasets
 ├── state/                  # System state, queues, run records, and export jobs
-├── logs/                   # Runtime and archive-sync logs
-├── .meta-history/          # Metadata migration rollback snapshots
-└── tmp/                    # Upload, AI, and Worker temporary files
+└── tmp/                    # Upload and Worker temporary files
 ```
 
 Runtime data, model weights, archives, credentials, and virtual environments must not be
@@ -132,7 +96,6 @@ committed to Git. Dependency manifests such as `requirements*.txt` and `package.
 kept in the repository.
 
 </details>
-
 ## 3. Project data structure
 
 <details>
@@ -211,7 +174,7 @@ RGB and is never duplicated alongside the RGB stream.
 New metric-depth videos use:
 
 ```text
-HEVC (H.265) in MP4
+HEVC (H.265) in MP4 / hvc1 / gray12le / qp=6 / range=full
 ```
 
 The depth video stores 12-bit logarithmic depth codes, not pseudo-color images:
@@ -223,11 +186,6 @@ The depth video stores 12-bit logarithmic depth codes, not pseudo-color images:
 The corresponding feature in `meta/info.json` is marked with `video.is_depth_map=true` and the
 depth encoding parameters. Readers dequantize the codes back to millimeters. The original depth
 video is preserved during processing and export.
-
-Depth is never exported as a JET/RGB pseudo-color video. Exported depth remains a single-channel
-`gray12le` video containing the original 12-bit logarithmic codes. The frontend must use the
-`codes_to_heatmap_bgr()` rule for decoded depth codes; it must not quantize decoded codes a second
-time as if they were millimeter values.
 
 ### Frontend depth preview
 
@@ -388,17 +346,6 @@ RGB video in the browser; a second skeleton video is not saved. System-level run
 under `data/state/runs/`, and temporary export products under `data/state/exports/`; neither is
 part of the project dataset directory.
 
-Glove tactile data is kept as fixed-size numeric arrays in the Parquet data, for example
-`observation.tactile.left` and `observation.tactile.right` with shape `[256]`. The current
-LeRobot training export does not generate or retain tactile MP4 files. Tactile visualization is a
-frontend preview concern; it is not required as a video feature by the LeRobot export.
-
-The export module supports LeRobot v2.1 and v3.0. A v3.0 export is directly readable by the
-current official LeRobot reader. A v2.1 export follows the official v2.1 layout and must be
-converted with the official `convert_dataset_v21_to_v30` tool before using a v3.0 reader.
-Batch export creates one dataset directory per selected Episode or project selection; each output
-contains only the canonical `data/`, `meta/`, and `videos/` directories.
-
 The upload archive lifecycle is: receive → extract → normalize → write to project → validate →
 update status. Temporary upload files and extraction directories are cleaned only after extraction,
 atomic commit, and validation all succeed. On failure, staging content is retained for retry and
@@ -411,7 +358,7 @@ diagnosis.
 ### Linux
 
 ```bash
-cd "Data Acquisition"
+cd "processor"
 cp .env.example .env
 # Edit .env and set API_KEY, WORKER_API_KEY, JWT_SECRET, and storage settings.
 chmod +x deploy.sh
@@ -432,14 +379,14 @@ model, and endpoint in the `AI Annotation` settings in Workflow Studio.
 ### Windows
 
 ```bat
-cd /d "Data Acquisition"
+cd /d "processor"
 copy .env.example .env && deploy.bat
 ```
 
 ### Start the backend manually
 
 ```bash
-cd "Data Acquisition"
+cd "processor"
 source .venv-linux/bin/activate
 export PYTHONPATH="$PWD"
 ./scripts/run_backend_linux.sh
@@ -454,7 +401,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ### Start the Worker
 
 ```bash
-cd "Data Acquisition"
+cd "processor"
 export EGODATA_SERVER_URL=http://127.0.0.1:8000
 export EGODATA_WORKER_API_KEY='same Worker API key as the server'
 ./scripts/run_worker_linux.sh
@@ -466,7 +413,7 @@ independent and must not be copied between operating systems.
 ### Workflow Studio
 
 ```bash
-cd "Data Acquisition/web/workflow-studio"
+cd "processor/web/workflow-studio"
 npm ci
 npm run dev
 ```
@@ -484,7 +431,7 @@ The build output is written to `web/static/workflow-studio/` and served by FastA
 <details>
 <summary>Click to expand: environment variables and security configuration</summary>
 
-Configuration is stored in `Data Acquisition/.env` or environment variables and must not be
+Configuration is stored in `processor/.env` or environment variables and must not be
 committed:
 
 | Setting | Purpose |
@@ -504,22 +451,6 @@ random secrets and restrict `.env` permissions. Never put passwords, tokens, API
 credentials in logs, workflow JSON, frontend code, or documentation.
 
 </details>
-
-### GitHub publication checklist
-
-Before publishing this directory:
-
-```bash
-git status --short --ignored
-git check-ignore -v .env data .backups .venv-linux models
-git ls-files | rg -i '(^|/)(\.env|.*secret.*|.*token.*|.*credential.*|.*password.*|.*\.pem|.*\.key)$'
-```
-
-The repository excludes runtime datasets, temporary files, local state, backups, virtual
-environments, archives, and secrets through `.gitignore`. Keep `.env` local and commit only
-`.env.example`. Do not use `git add -f` for `data/`, `.backups/`, model weights, or generated
-exports. If a real credential was ever placed in a tracked file, rotate it before publishing;
-removing it from the working tree alone does not remove it from Git history.
 
 ## 9. API
 
@@ -559,7 +490,7 @@ The running FastAPI OpenAPI document is the authoritative API contract.
 Backend and Worker checks:
 
 ```bash
-cd "Data Acquisition"
+cd "processor"
 python -m compileall app worker
 python deploy.py --check-only
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q tests/test_depth_codec.py
@@ -568,7 +499,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q tests/test_depth_codec.py
 Frontend check:
 
 ```bash
-cd "Data Acquisition/web/workflow-studio"
+cd "processor/web/workflow-studio"
 npm run build
 ```
 

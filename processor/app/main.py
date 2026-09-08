@@ -53,7 +53,7 @@ async def lifespan(app: FastAPI):
     ).start()
     from app import upload_queue
     upload_queue.start()
-    print(f"[Startup] Data Acquisition Service on port {settings.PORT}")
+    print(f"[Startup] processor Service on port {settings.PORT}")
     print(f"[Startup] Storage: {settings.STORAGE_DIR} ({settings.STORAGE_BACKEND})")
     try:
         yield
@@ -63,7 +63,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Data Acquisition Service",
+    title="processor Service",
     version="0.1.0",
     lifespan=lifespan,
 )
@@ -73,6 +73,24 @@ app.add_middleware(GZipMiddleware, minimum_size=500)
 
 # Auth middleware — protect routes (after gzip, before everything else)
 app.add_middleware(AuthMiddleware)
+
+# 媒体/压缩文件下载不走 gzip:zip/mp4/parquet/hdf5 本身已是压缩格式,
+# 再压一遍只是烧 CPU(zlib level 9 压缩 180MB ≈ 10s),而且流式压缩会
+# 删掉 Content-Length —— 浏览器下载进度显示"未知大小",大文件看起来
+# 像卡死。这些路径直接透传原始字节(去掉 accept-encoding 头即可)。
+_NO_COMPRESS_PATH_HINTS = (
+    "download", "stream", "depth-codes", "depth-preview", "skeleton", "hdf5",
+)
+
+
+@app.middleware("http")
+async def no_compress_media(request, call_next):
+    if any(hint in request.url.path for hint in _NO_COMPRESS_PATH_HINTS):
+        request.scope["headers"] = [
+            (key, value) for key, value in request.scope["headers"]
+            if key.lower() != b"accept-encoding"
+        ]
+    return await call_next(request)
 
 # Static JS/CSS is versioned (workflow assets use content hashes; the legacy
 # page scripts use a ``?v=...`` query).  Tell the browser to retain these

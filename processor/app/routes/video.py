@@ -3,6 +3,7 @@
 import os
 import re
 import asyncio
+import shutil
 import threading
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -32,6 +33,9 @@ _DEPTH_READER_POOL_LOCK = threading.Lock()
 _DEPTH_READER_POOL_MAX = 8
 _DEPTH_FRAME_CACHE: dict[tuple[str, int], object] = {}
 _DEPTH_FRAME_CACHE_MAX = 48
+# Sequential decode is cheap, but decoding through more than this many
+# frames to reach a scrub target is not; jump via a seek reader instead.
+_DEPTH_WINDOW_SEEK_GAP = 6
 
 
 def _read_canonical_depth_codes(path: Path, frame_index: int):
@@ -89,6 +93,39 @@ def _read_canonical_depth_codes(path: Path, frame_index: int):
         return result
 
 
+def _depth_local_source(depth_video: Path) -> Path:
+    """Decode from a local mirror of the NAS depth file when one is ready.
+
+    The mirror is a bit-identical disposable cache (see
+    ``browser_preview.ensure_local_mirror``); a missing/cold mirror falls
+    back to the authoritative path for this request.
+    """
+    try:
+        from app.browser_preview import ensure_local_mirror
+
+        return ensure_local_mirror(depth_video)
+    except Exception:
+        return depth_video
+
+
+def _downscale_depth_codes(codes, scale: int):
+    """Optionally area-downsample raw depth codes for display transport.
+
+    The browser canvas usually renders the depth tile far below the native
+    resolution, so a 2x/4x downsample cuts the payload by 4x/16x without
+    visible loss.  Codes stay in the canonical uint16 domain so the
+    frontend colormap/range pipeline is untouched.
+    """
+    if not scale or int(scale) <= 1:
+        return codes
+    import cv2
+
+    s = int(scale)
+    h, w = codes.shape
+    return cv2.resize(codes, (max(1, w // s), max(1, h // s)),
+                      interpolation=cv2.INTER_AREA)
+
+
 def _read_canonical_depth_code_window(path: Path, start_frame: int,
                                       end_frame: int):
     """Read a contiguous raw-code window from one sequential decoder.
@@ -122,10 +159,20 @@ def _read_canonical_depth_code_window(path: Path, start_frame: int,
                     pass
 
     with state["lock"]:
-        if start_frame < state["next_frame"]:
+        gap = start_frame - state["next_frame"]
+        if gap < 0 or gap > _DEPTH_WINDOW_SEEK_GAP:
+            # Backward or far-forward jump: position a seek reader at the
+            # exact target frame instead of decoding from frame 0 (or from a
+            # stale pool position).  The keyint=2 depth contract keeps the
+            # seek cost constant regardless of the jump distance.
+            from app.lerobot_v21 import DepthCodeSeekReader
+
+            fps = float(getattr(state["reader"], "fps", 0) or 30.0)
+            pix_fmt = str(getattr(state["reader"], "pix_fmt", "") or "gray12le")
             state["reader"].close()
-            state["reader"] = DepthVideoReader(path)
-            state["next_frame"] = 0
+            state["reader"] = DepthCodeSeekReader(
+                path, start_frame, fps, pix_fmt)
+            state["next_frame"] = start_frame
         frames = []
         while state["next_frame"] <= end_frame:
             codes = state["reader"].read_codes()
@@ -1152,6 +1199,7 @@ def _hand3d_meta(path: Path, source_key: str | None = None) -> dict:
     metric_3d_available = True
     valid_hand_frames = 0
     valid_landmark_points = 0
+    counted = False  # 计数是否真实执行过(前端据此区分"全空"与"统计失败")
     try:
         columns = set(_pd.read_parquet(path, engine="pyarrow").columns)
         field_map = _hand3d_column_map(columns, source_key)
@@ -1181,14 +1229,16 @@ def _hand3d_meta(path: Path, source_key: str | None = None) -> dict:
 
         # Count real finite landmarks for source selection.  This is only
         # metadata for the review UI; it never changes the stored data.
+        # 采样统计:均匀散布读 1/3 的 row group(NAS 上全量读这些列
+        # 实测 ~20s),计数按采样率放大保持量级;采样失败回退全量读。
         count_raw = [field_map.get(name) for name in (
             "hand_0_present", "hand_1_present",
             "hand_0_landmarks_3d", "hand_1_landmarks_3d",
         ) if field_map.get(name)]
-        if count_raw:
-            count_df = _pd.read_parquet(path, columns=list(dict.fromkeys(count_raw)),
-                                        engine="pyarrow")
-            for _, count_row in count_df.iterrows():
+
+        def _count_rows(rows_iter) -> None:
+            nonlocal valid_hand_frames, valid_landmark_points
+            for _, count_row in rows_iter:
                 row_has_hand = False
                 for hk in ("hand_0", "hand_1"):
                     present_name = field_map.get(f"{hk}_present")
@@ -1209,6 +1259,35 @@ def _hand3d_meta(path: Path, source_key: str | None = None) -> dict:
                     row_has_hand = row_has_hand or bool(finite.any())
                 if row_has_hand:
                     valid_hand_frames += 1
+
+        if count_raw:
+            count_columns = list(dict.fromkeys(count_raw))
+            counted = False
+            try:
+                import pyarrow.parquet as _pq
+
+                parquet = _pq.ParquetFile(path)
+                total_rows = int(parquet.metadata.num_rows)
+                groups = list(range(0, parquet.num_row_groups, 3)) or [0]
+                sampled_rows = sum(
+                    int(parquet.metadata.row_group(i).num_rows) for i in groups)
+                sample_factor = (total_rows / max(1, sampled_rows))
+                before_frames = valid_hand_frames
+                before_points = valid_landmark_points
+                for group_index in groups:
+                    count_df = parquet.read_row_group(
+                        group_index, columns=count_columns).to_pandas()
+                    _count_rows(count_df.iterrows())
+                valid_hand_frames = before_frames + int(
+                    (valid_hand_frames - before_frames) * sample_factor)
+                valid_landmark_points = before_points + int(
+                    (valid_landmark_points - before_points) * sample_factor)
+                counted = True
+            except Exception:
+                count_df = _pd.read_parquet(path, columns=count_columns,
+                                            engine="pyarrow")
+                _count_rows(count_df.iterrows())
+                counted = True
     except Exception:
         # Metadata failure must not prevent the frame endpoint from working.
         pass
@@ -1231,6 +1310,7 @@ def _hand3d_meta(path: Path, source_key: str | None = None) -> dict:
         "render_video": "",
         "valid_hand_frames": int(valid_hand_frames),
         "valid_landmark_points": int(valid_landmark_points),
+        "counted": bool(counted),
         "meta_schema_version": 2,
     }
 def _parse_range(range_header: str, file_size: int) -> tuple[int, int]:
@@ -1281,7 +1361,8 @@ async def get_depth_codes(
         raise HTTPException(status_code=404, detail=f"Depth source not found: {name}")
     try:
         codes = await asyncio.to_thread(
-            _read_canonical_depth_codes, depth_video, frame_index)
+            _read_canonical_depth_codes, _depth_local_source(depth_video),
+            frame_index)
     except IndexError:
         raise HTTPException(
             status_code=404,
@@ -1325,6 +1406,124 @@ async def get_depth_jet_lut():
                          "values": lut.tolist()})
 
 
+@router.get("/depth-color-lut")
+async def get_depth_color_lut():
+    """Return the 256-entry Google Turbo LUT (bgr order, Rerun-style depth
+    colormap) for frontend-only depth colorization."""
+    from app.lerobot_v21 import turbo_lut_256
+
+    values = [[b, g, r] for (r, g, b) in turbo_lut_256()]
+    return JSONResponse({"name": "google_turbo", "order": "bgr",
+                         "values": values})
+
+
+_DEPTH_STATS_CACHE: dict[str, dict] = {}
+_DEPTH_STATS_CACHE_LOCK = threading.Lock()
+
+
+def _depth_stats_for(source: Path) -> dict | None:
+    """q01/q99 bounds for a depth source: memory cache → disk persistence.
+
+    The disk copy is written once by preview generation (fingerprint-keyed)
+    and survives restarts, so the stats endpoint and the preview stream can
+    answer instantly without a second full-stream decode.
+    """
+    try:
+        stats_key = f"{source.resolve()}@{source.stat().st_mtime_ns}"
+    except OSError:
+        return None
+    with _DEPTH_STATS_CACHE_LOCK:
+        cached = _DEPTH_STATS_CACHE.get(stats_key)
+    if cached is not None:
+        return cached
+    try:
+        from app.browser_preview import read_depth_stats
+
+        disk = read_depth_stats(source)
+        if disk is not None:
+            with _DEPTH_STATS_CACHE_LOCK:
+                _DEPTH_STATS_CACHE[stats_key] = disk
+            return disk
+    except Exception:
+        pass
+    return None
+
+
+def _compute_depth_stats(source: Path) -> dict | None:
+    """Sample-decode the stored depth video and return q01/q99 code bounds.
+
+    One ffmpeg pass keeps ~32 spread frames; the sampled domain is the
+    canonical uint16 gray12le codes, so the percentiles map directly onto the
+    frontend color range (Rerun-style adaptive depth scaling).
+    """
+    import subprocess
+
+    import numpy as np
+    from app.lerobot_v21 import DEPTH_QMAX
+
+    ffprobe = shutil.which("ffprobe")
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffprobe or not ffmpeg:
+        return None
+    probe = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0",
+         "-count_packets", "-show_entries", "stream=nb_read_packets",
+         "-of", "csv=p=0", str(source)],
+        check=False, capture_output=True, text=True, timeout=30)
+    total = 0
+    try:
+        total = int(float(str(probe.stdout).strip().split(",")[0]))
+    except (ValueError, IndexError):
+        total = 0
+    step = max(1, (total or 900) // 32)
+    proc = subprocess.run(
+        [ffmpeg, "-v", "error", "-i", str(source), "-map", "0:v:0",
+         "-vf", f"select=not(mod(n\\,{step}))",
+         "-f", "rawvideo", "-pix_fmt", "gray12le", "-"],
+        check=False, capture_output=True, timeout=600)
+    data = np.frombuffer(proc.stdout, dtype="<u2")
+    if data.size < 2:
+        return None
+    # Keep the same 12-bit code domain as the raw frames served to the
+    # browser.  Sampling with gray16le made ffmpeg bit-shift every value
+    # (~x16) to fill the wider format, so q01/q99 came out ~16x too large
+    # and the frontend Turbo ramp collapsed into its darkest segment.
+    data = np.clip(data, 0, DEPTH_QMAX)
+    return {
+        "q01": float(np.percentile(data, 1)),
+        "q99": float(np.percentile(data, 99)),
+        "total_frames": total,
+    }
+
+
+@router.get("/depth-stats/{episode_id}/{name}")
+async def get_depth_stats(episode_id: str, name: str):
+    """q01/q99 depth-code bounds for adaptive frontend colorization."""
+    ep = get_episode(episode_id)
+    if ep is None:
+        raise HTTPException(status_code=404, detail="Episode not found")
+    session_dir = Path(ep["path"])
+    safe_name = str(name).replace("/", "_").replace("\\", "_").replace("..", "_")
+    source = find_depth_video(session_dir, safe_name, str(ep.get("id") or ""))
+    if source is None:
+        raise HTTPException(status_code=404, detail=f"Depth source not found: {name}")
+    cached = _depth_stats_for(source)
+    if cached is not None:
+        return JSONResponse(
+            cached,
+            headers={"Cache-Control": "public, max-age=3600"})
+    # No whole-video decode on a cache miss: preview generation computes and
+    # persists these bounds during its own decode, so the frontend receives
+    # the neutral full-range fallback now and re-fetches after the load.
+    from app.lerobot_v21 import DEPTH_QMAX
+
+    return JSONResponse(
+        {"q01": 0.0, "q99": float(DEPTH_QMAX), "total_frames": 0,
+         "pending": True},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @router.get("/{episode_id}/depth-preview/{name}/{frame_index}")
 async def get_depth_preview(
     episode_id: str,
@@ -1341,12 +1540,15 @@ async def get_depth_codes_window(
     name: str,
     start_frame: int = Query(0, ge=0),
     end_frame: int | None = Query(None, ge=0),
+    scale: int = Query(1, ge=1, le=8),
 ):
     """Return a short contiguous window of canonical uint16 depth codes.
 
-    This is a transport optimization for the browser-only JET renderer. The
-    response is still the exact stored code domain (little-endian uint16),
-    never a heatmap or a persisted colorized frame.
+    This is a transport optimization for the browser-only colorized renderer.
+    The response is still the exact stored code domain (little-endian
+    uint16), never a heatmap or a persisted colorized frame.  ``scale``
+    downsamples each frame by an integer factor (INTER_AREA) to cut the
+    payload; the frontend colormap pipeline is unaffected.
     """
     ep = get_episode(episode_id)
     if ep is None:
@@ -1367,7 +1569,7 @@ async def get_depth_codes_window(
     try:
         frames = await asyncio.to_thread(
             _read_canonical_depth_code_window,
-            depth_video, start_frame, requested_end,
+            _depth_local_source(depth_video), start_frame, requested_end,
         )
     except IndexError:
         raise HTTPException(
@@ -1380,6 +1582,9 @@ async def get_depth_codes_window(
             detail=f"Unable to decode depth codes: {exc}",
         ) from exc
     first = frames[0]
+    if int(scale) > 1:
+        frames = [_downscale_depth_codes(frame, scale) for frame in frames]
+        first = frames[0]
     payload = b"".join(frame.tobytes(order="C") for frame in frames)
     actual_end = start_frame + len(frames) - 1
     return Response(
@@ -1395,6 +1600,7 @@ async def get_depth_codes_window(
             "X-Depth-End": str(actual_end),
             "X-Depth-Frames": str(len(frames)),
             "X-Depth-Frame-Bytes": str(first.nbytes),
+            "X-Depth-Scale": str(scale),
             "X-Depth-Qmax": "4095",
         },
     )
@@ -1420,12 +1626,14 @@ def _open_depth_code_stream(path: Path):
 
 
 @router.get("/{episode_id}/depth-codes-full/{name}")
-async def get_depth_codes_full(episode_id: str, name: str):
+async def get_depth_codes_full(episode_id: str, name: str,
+                               scale: int = Query(1, ge=1, le=8)):
     """Stream the complete stored depth-code sequence in frame order.
 
     This is a transport-only optimization for the frontend renderer.  The
     payload is raw little-endian uint16 gray12le code data; it is never JET,
-    RGB, millimetres, or a persisted preview image.
+    RGB, millimetres, or a persisted preview image.  ``scale`` downsamples
+    each frame by an integer factor (INTER_AREA) before streaming.
     """
     ep = get_episode(episode_id)
     if ep is None:
@@ -1439,7 +1647,7 @@ async def get_depth_codes_full(episode_id: str, name: str):
     try:
         import numpy as np
         reader, first = await asyncio.to_thread(
-            _open_depth_code_stream, depth_video)
+            _open_depth_code_stream, _depth_local_source(depth_video))
     except IndexError:
         raise HTTPException(status_code=404, detail=f"Empty depth source: {name}")
     except (OSError, RuntimeError, ValueError) as exc:
@@ -1448,6 +1656,8 @@ async def get_depth_codes_full(episode_id: str, name: str):
             detail=f"Unable to decode depth codes: {exc}",
         ) from exc
 
+    if int(scale) > 1:
+        first = _downscale_depth_codes(first, scale)
     width, height = int(first.shape[1]), int(first.shape[0])
     frame_bytes = int(first.nbytes)
     expected_frames = int(reader.frame_count or 0)
@@ -1471,6 +1681,7 @@ async def get_depth_codes_full(episode_id: str, name: str):
         "X-Depth-Frame-Bytes": str(frame_bytes),
         "X-Depth-Start": "0",
         "X-Depth-End": str(max(0, expected_frames - 1)),
+        "X-Depth-Scale": str(scale),
         "X-Depth-Qmax": "4095",
         "X-Depth-Transport": "full-sequential-raw-codes",
     }
@@ -1482,16 +1693,45 @@ async def get_depth_codes_full(episode_id: str, name: str):
     def iterator():
         count = 0
         current = first
+        histogram = np.zeros(4096, dtype=np.int64)
+        stats_cache_key = None
         try:
             while current is not None:
+                histogram += np.bincount(
+                    current.reshape(-1).astype(np.int64),
+                    minlength=4096)[:4096]
                 yield current.tobytes(order="C")
                 count += 1
                 current = reader.read_codes()
                 if current is not None:
                     current = np.ascontiguousarray(
                         current, dtype="<u2")
+                    if int(scale) > 1:
+                        current = _downscale_depth_codes(current, scale)
         finally:
             reader.close()
+            # Piggyback the q01/q99 display stats on the full-stream pass:
+            # the depth-stats endpoint then needs no second whole-video
+            # decode (which competed with this one and doubled open time).
+            try:
+                stats_cache_key = (
+                    f"{depth_video.resolve()}"
+                    f"@{depth_video.stat().st_mtime_ns}")
+                cumulative = np.cumsum(histogram)
+                total_pixels = int(cumulative[-1])
+                if total_pixels > 0:
+                    q01 = float(np.searchsorted(
+                        cumulative, total_pixels * 0.01, side="right"))
+                    q99 = float(np.searchsorted(
+                        cumulative, total_pixels * 0.99, side="right"))
+                    with _DEPTH_STATS_CACHE_LOCK:
+                        _DEPTH_STATS_CACHE[stats_cache_key] = {
+                            "q01": q01,
+                            "q99": q99,
+                            "total_frames": int(reader.frame_count or count),
+                        }
+            except Exception:
+                pass
 
     return StreamingResponse(
         iterator(),
@@ -1705,9 +1945,37 @@ async def _h264_preview_path(source: Path) -> Path:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+def _depth_h264_preview_path(source: Path, q01: float, q99: float) -> Path:
+    from app.browser_preview import ensure_depth_h264_preview
+
+    try:
+        return ensure_depth_h264_preview(source, q01=q01, q99=q99)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 def _video_response(file_path: Path, range_header: str | None):
-    """Serve an MP4 with byte ranges required by HTML5/Plyr."""
+    """Serve an MP4 with byte ranges required by HTML5/Plyr.
+
+    Cacheable by the browser (ETag = size+mtime): repeat opens of RGB and
+    depth preview streams are served from the browser cache, so the video
+    element paints its first frame without waiting on a re-download.
+    """
+    file_path = Path(file_path)
     file_size = file_path.stat().st_size
+    try:
+        stat = file_path.stat()
+        etag = f'W/"{stat.st_size:x}-{stat.st_mtime_ns:x}"'
+    except OSError:
+        etag = None
+    common_headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "public, max-age=3600",
+    }
+    if etag:
+        common_headers["ETag"] = etag
 
     def _stream_full():
         with open(file_path, "rb") as f:
@@ -1717,7 +1985,7 @@ def _video_response(file_path: Path, range_header: str | None):
     if not range_header:
         return StreamingResponse(
             _stream_full(), media_type="video/mp4",
-            headers={"Content-Length": str(file_size), "Accept-Ranges": "bytes"},
+            headers={**common_headers, "Content-Length": str(file_size)},
         )
 
     start, end = _parse_range(range_header, file_size)
@@ -1736,9 +2004,9 @@ def _video_response(file_path: Path, range_header: str | None):
 
     return StreamingResponse(
         _stream_range(), status_code=206, media_type="video/mp4",
-        headers={"Content-Range": f"bytes {start}-{end}/{file_size}",
-                 "Content-Length": str(content_length),
-                 "Accept-Ranges": "bytes"},
+        headers={**common_headers,
+                 "Content-Range": f"bytes {start}-{end}/{file_size}",
+                 "Content-Length": str(content_length)},
     )
 
 
@@ -1894,14 +2162,27 @@ async def stream_browser_depth_preview(
     camera: str,
     range_header: str | None = Header(None, alias="Range"),
 ):
-    """Serve a browser-compatible depth stream; colorization stays in Canvas."""
+    """Serve an 8-bit Turbo H.264 preview of the depth stream.
+
+    Generated once per source into the local disposable preview cache
+    (identical clamp/scale/colormap math as the browser renderer used to
+    apply), so the review page plays it through a native <video> element.
+    The canonical 12-bit stream remains the authoritative dataset asset.
+    """
     ep = get_episode(episode_id)
     if ep is None:
         raise HTTPException(status_code=404, detail="Episode not found")
     source = find_depth_video(Path(ep["path"]), camera, str(ep.get("id") or ""))
     if source is None:
         raise HTTPException(status_code=404, detail="Depth video not found")
-    preview = await _h264_preview_path(source)
+    # Prefer the q01/q99 bounds from the in-memory cache or the disk copy
+    # persisted by preview generation; a neutral full-range mapping is used
+    # when the stats have not been computed yet.
+    stats = _depth_stats_for(source) or {}
+    preview = await asyncio.to_thread(
+        _depth_h264_preview_path, source,
+        float(stats.get("q01") or 0.0), float(stats.get("q99") or 4095.0),
+    )
     return _video_response(preview, range_header)
 
 

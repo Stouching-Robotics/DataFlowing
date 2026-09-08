@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import shutil
 import tempfile
 import zipfile
 import re
@@ -17,6 +19,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
+from app.config import settings
 from app.localstore import (
     STATE_ROOT, scan_sessions, get_episode, list_deleted_episodes, list_runs,
     get_workflow, list_projects, _read_json, _write_json, _remove_json,
@@ -34,6 +37,9 @@ router = APIRouter(prefix="/api/v1/export", tags=["export"])
 
 EXPORTS_DIR = STATE_ROOT / "exports"
 EXPORT_TASKS_DIR = STATE_ROOT / "export_tasks"
+# 导出页/批量导出的构建目录与 zip 放本地盘:同一份视频数据不再在
+# NAS(SSHFS ~28MB/s)上读写三遍,只保留一次源文件读取。
+LOCAL_EXPORTS_DIR = settings.upload_staging_root / "exports"
 
 
 def _utcnow() -> str:
@@ -83,6 +89,12 @@ def _zip_directory(root: Path, dest: Path) -> None:
                               compress_type=zipfile.ZIP_STORED if path.suffix.lower() in {".mp4", ".parquet"} else zipfile.ZIP_DEFLATED)
 
 
+# 旧版本导出代码遗留的非标准边车文件:标注已在 parquet 列里
+# (annotation/annotation_index/annotation_scope),设备信息在 info.json
+# (robot_type)。打包时剥离,不随 zip 分发。
+_SIDECAR_EXCLUDE = {"meta/annotations.jsonl", "meta/devices.json"}
+
+
 def _zip_lerobot(root: Path, dest: Path) -> None:
     """打包 LeRobot 标准结构(data/ + meta/ + videos/),不携带处理副产品
     (hand_3d/skeleton/calibration 等)。连接驱动导出带视频 feature 的
@@ -94,9 +106,12 @@ def _zip_lerobot(root: Path, dest: Path) -> None:
             if not sub_dir.is_dir():
                 continue
             for path in sub_dir.rglob("*"):
-                if path.is_file():
-                    archive.write(path, str(path.relative_to(root)),
-                                  compress_type=zipfile.ZIP_STORED if path.suffix.lower() in {".mp4", ".parquet"} else zipfile.ZIP_DEFLATED)
+                if not path.is_file():
+                    continue
+                if str(path.relative_to(root)) in _SIDECAR_EXCLUDE:
+                    continue
+                archive.write(path, str(path.relative_to(root)),
+                              compress_type=zipfile.ZIP_STORED if path.suffix.lower() in {".mp4", ".parquet"} else zipfile.ZIP_DEFLATED)
 
 
 def _cleanup_later(path: str) -> None:
@@ -272,8 +287,25 @@ def _episode_export_target(episode_id: str) -> dict | None:
                             return {"kind": "hdf5", "version": None,
                                     "product": candidate, "root": candidate.parent}
                     elif (candidate / "meta" / "info.json").is_file():
+                        # 版本以产物自身的 codebase_version 为准(实际
+                        # 构建版本),不能信任工作流配置 —— 旧产物可能是
+                        # v2.1 代码按配置 v3.0 构建前的遗留,文件名/徽标
+                        # 会与实际布局不符。
+                        product_version = str(cfg.get("version") or "v3.0")
+                        try:
+                            import json as _json
+                            info = _json.loads(
+                                (candidate / "meta" / "info.json")
+                                .read_text(encoding="utf-8"))
+                            built = str(info.get("codebase_version") or "")
+                            if built.lower().startswith("v2"):
+                                product_version = "v2.1"
+                            elif built.lower().startswith("v3"):
+                                product_version = "v3.0"
+                        except (OSError, ValueError):
+                            pass
                         return {"kind": "lerobot",
-                                "version": str(cfg.get("version") or "v3.0"),
+                                "version": product_version,
                                 "product": candidate, "root": candidate}
 
     return None
@@ -364,9 +396,11 @@ async def download_single_episode(episode_id: str):
                                           delete=False)
         tmp.close()
         _zip_lerobot(target["root"], Path(tmp.name))
-        return FileResponse(tmp.name, media_type="application/zip",
-                            filename=f"{project_name}.zip",
-                            background=BackgroundTask(_cleanup_later, tmp.name))
+        version = target["version"] or "v3.0"
+        return FileResponse(
+            tmp.name, media_type="application/zip",
+            filename=f"{project_name}-{version}.zip",
+            background=BackgroundTask(_cleanup_later, tmp.name))
     return _build_episode_zip([episode_id], f"egodata-{episode_id}-", f"{project_name}.zip")
 
 
@@ -415,8 +449,73 @@ def _list_tasks() -> list[dict]:
     return [t for t in (_read_json(f, {}) for f in sorted(EXPORT_TASKS_DIR.glob("*.json"))) if t]
 
 
+# running 任务超过该时长仍未结束 → 线程大概率已异常死亡,标记 failed
+# (正常 3 批次导出实测 ~3 分钟;30 分钟是宽裕兜底)
+_EXPORT_RUNNING_TIMEOUT_SECONDS = 30 * 60
+
+
+def _mark_stale_running_failed(task: dict) -> bool:
+    """把卡死在 running 的超时任务标记为 failed(返回是否发生了修改)。"""
+    if task.get("status") != "running":
+        return False
+    try:
+        created = datetime.fromisoformat(
+            str(task.get("created_at") or "").replace("Z", "+00:00"))
+        elapsed = (datetime.now(timezone.utc) - created).total_seconds()
+        if elapsed > _EXPORT_RUNNING_TIMEOUT_SECONDS:
+            task["status"] = "failed"
+            task["error"] = ("Export timed out (running for over "
+                             "30 minutes without finishing)")
+            task["finished_at"] = _utcnow()
+            _save_task(task)
+            return True
+    except (ValueError, TypeError):
+        pass
+    return False
+
+
+def _episode_set_fingerprint(episode_ids: list[str]) -> str:
+    """所选批次源文件的指纹(size+mtime):数据变过才需要重新构建。"""
+    digest = hashlib.sha256()
+    for episode_id in episode_ids:
+        ep = get_episode(str(episode_id))
+        if ep is None:
+            continue
+        root = Path(ep["path"])
+        if not is_project_dataset(root):
+            continue
+        try:
+            row = episode_row(root, str(episode_id))
+        except Exception:
+            continue
+        if row is None:
+            continue
+        index = int(row.get("episode_index"))
+        files = episode_files(root, index)
+        candidates = [*files.get("data", []),
+                      *(path for _, path in files.get("videos", []))]
+        for path in candidates:
+            try:
+                st = Path(path).stat()
+                digest.update(
+                    f"{Path(path).name}|{st.st_size}|{st.st_mtime_ns}"
+                    .encode("utf-8"))
+            except OSError:
+                continue
+    return digest.hexdigest()
+
+
 def _run_export_task(job_id: str, episode_ids: list[str], export_format: str,
                      dataset_name: str, split_ratio: float) -> None:
+    def _set_progress(progress: float, **extra) -> None:
+        """后台任务阶段进度(前端按钮实时显示,不再静默等待)。"""
+        task = _load_task(job_id)
+        if not task:
+            return
+        task["progress"] = max(0.0, min(1.0, float(progress)))
+        task.update(extra)
+        _save_task(task)
+
     try:
         blocked = [
             str(episode_id) for episode_id in episode_ids
@@ -425,20 +524,34 @@ def _run_export_task(job_id: str, episode_ids: list[str], export_format: str,
         ]
         if blocked:
             raise RuntimeError("Some episodes are still in Reviewing")
-        dest = EXPORTS_DIR / f"{job_id}.zip"
+        # 构建与 zip 都在本地盘进行(NAS 只读一次源文件);zip 是最终
+        # 产物,构建目录打包完成后即删除以节省本地空间。
+        dest = LOCAL_EXPORTS_DIR / f"{job_id}.zip"
         dest.parent.mkdir(parents=True, exist_ok=True)
+        export_root = LOCAL_EXPORTS_DIR / f"{dataset_name}-{job_id[:8]}"
         if export_format in {"lerobot_v2", "lerobot_v3"}:
             from app.lerobot_export import build_lerobot_dataset
-            export_root = EXPORTS_DIR / f"{dataset_name}-{job_id[:8]}"
             version = "v2.1" if export_format == "lerobot_v2" else "v3.0"
+
+            def _on_episode(done: int, total_episodes: int) -> None:
+                _set_progress(0.05 + 0.65 * (done / max(1, total_episodes)))
+
+            _set_progress(0.05)
             build_lerobot_dataset(dataset_name, episode_ids, export_root,
-                                  split_ratio, version=version)
+                                  split_ratio, version=version,
+                                  progress_callback=_on_episode)
+            _set_progress(0.75)
             _zip_directory(export_root, dest)
+            _set_progress(0.95)
         else:
+            _set_progress(0.2)
             _zip_episode_selection([str(e) for e in episode_ids], dest)
+            _set_progress(0.95)
+        shutil.rmtree(export_root, ignore_errors=True)
         task = _load_task(job_id)
         if task:
             task["status"] = "completed"
+            task["progress"] = 1.0
             task["output_dir"] = str(dest)
             task["finished_at"] = _utcnow()
             _save_task(task)
@@ -510,6 +623,32 @@ async def export_start(body: dict, background_tasks: BackgroundTasks,
     if export_format not in {"lerobot_v2", "lerobot_v3"}:
         raise HTTPException(status_code=400,
                             detail="Unsupported export format")
+    # 防重复提交:同一批次集合已有 running 任务时直接拒绝,避免并行
+    # 任务互相抢 NAS 带宽(此前实测两次点击各跑一遍,时间翻倍)。
+    requested = set(episode_ids)
+    for existing in _list_tasks():
+        if existing.get("status") != "running":
+            continue
+        if set(existing.get("episode_ids") or []) == requested:
+            raise HTTPException(
+                status_code=409,
+                detail="An export for the same episodes is already running",
+            )
+    # 复用已完成结果:同批次(顺序一致)+ 同格式 + 源文件未变 → 直接
+    # 返回既有任务,前端轮询立即 completed 并触发下载(秒级)。
+    fingerprint = _episode_set_fingerprint(episode_ids)
+    for existing in _list_tasks():
+        if existing.get("status") != "completed":
+            continue
+        if (existing.get("episode_ids") or []) != episode_ids:
+            continue
+        if existing.get("export_format") != export_format:
+            continue
+        if existing.get("source_fingerprint") != fingerprint:
+            continue
+        output = Path(str(existing.get("output_dir") or ""))
+        if output.is_file():
+            return existing
     job = {
         "id": str(uuid4()),
         "dataset_name": dataset_name,
@@ -520,6 +659,7 @@ async def export_start(body: dict, background_tasks: BackgroundTasks,
         "export_format": export_format,
         "error": None,
         "output_dir": None,
+        "source_fingerprint": fingerprint,
         "created_at": _utcnow(),
         "finished_at": None,
     }
@@ -538,6 +678,8 @@ async def export_start(body: dict, background_tasks: BackgroundTasks,
 @router.get("/list")
 async def export_list(limit: int = Query(20, ge=1, le=100), offset: int = 0):
     tasks = sorted(_list_tasks(), key=lambda t: t.get("created_at") or "", reverse=True)
+    for task in tasks:
+        _mark_stale_running_failed(task)
     return tasks[offset:offset + limit]
 
 
@@ -546,6 +688,7 @@ async def export_status(job_id: str):
     task = _load_task(job_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Export job not found")
+    _mark_stale_running_failed(task)
     return task
 
 
@@ -554,20 +697,31 @@ async def download_export_job(job_id: str):
     task = _load_task(job_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Export job not found")
-    dest = EXPORTS_DIR / f"{job_id}.zip"
-    if not dest.exists():
+    # 新任务 zip 在本地盘(output_dir);历史任务回退 NAS 路径。
+    dest = Path(str(task.get("output_dir") or ""))
+    if not dest.is_file():
+        dest = EXPORTS_DIR / f"{job_id}.zip"
+    if not dest.is_file():
         raise HTTPException(status_code=404, detail="Export output not ready")
-    return FileResponse(dest, media_type="application/zip",
-                        filename=f"{task.get('dataset_name', 'dataset')}.zip")
+    # 文件名带格式版本后缀,下载后一眼可辨 v2.1 / v3.0
+    export_format = str(task.get("export_format") or "")
+    suffix = ("-v2.1" if export_format == "lerobot_v2"
+              else "-v3.0" if export_format == "lerobot_v3" else "")
+    return FileResponse(
+        dest, media_type="application/zip",
+        filename=f"{task.get('dataset_name', 'dataset')}{suffix}.zip")
 
 
 @router.delete("/{job_id}")
 async def delete_export_job(job_id: str, _: str = Depends(verify_api_key)):
+    task = _load_task(job_id)
     _remove_json(EXPORT_TASKS_DIR / f"{job_id}.json")
-    try:
-        (EXPORTS_DIR / f"{job_id}.zip").unlink(missing_ok=True)
-    except Exception:
-        pass
+    for path in (Path(str((task or {}).get("output_dir") or "")),
+                 EXPORTS_DIR / f"{job_id}.zip"):
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
     return {"message": "Export job deleted"}
 
 

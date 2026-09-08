@@ -468,7 +468,7 @@
         <!-- Batch action bar -->
         <div id="batch-bar" class="px-3 py-2 border-t border-gray-800 flex items-center justify-between hidden bg-gray-800">
             <span id="batch-count" class="text-xs text-gray-300">0 selected</span>
-            <button onclick="batchDownload()"
+            <button onclick="batchDownload(this)"
                     class="bg-blue-600 hover:bg-blue-500 text-white text-xs px-3 py-1.5 rounded font-medium">
                 <iconify-icon icon="ant-design:download-outlined" class="icon-sm"></iconify-icon> <span data-i18n="batch_download">Batch Download</span>
             </button>
@@ -562,14 +562,14 @@
     </div>
 </aside>
 
-<script src="/static/js/media-cache.js?v=202609031715"></script>
-<script src="/static/js/depth-renderer.js?v=202609031715"></script>
-    <script src="/static/js/player.js?v=202609032000"></script>
-    <script src="/static/js/hand-overlay.js?v=202609031900"></script>
-<script src="/static/js/heatmap.js?v=202609031900"></script>
-    <script src="/static/js/annotations.js?v=202609032000"></script>
-<script src="/static/js/slice-preview.js?v=202609022015"></script>
-    <script src="/static/js/app.js?v=202609032200"></script>
+<script src="/static/js/media-cache.js?v=202609081200"></script>
+<script src="/static/js/depth-renderer.js?v=202609081200"></script>
+    <script src="/static/js/player.js?v=202609081200"></script>
+    <script src="/static/js/hand-overlay.js?v=202609081200"></script>
+<script src="/static/js/heatmap.js?v=202609081200"></script>
+    <script src="/static/js/annotations.js?v=202609081200"></script>
+<script src="/static/js/slice-preview.js?v=202609081200"></script>
+    <script src="/static/js/app.js?v=202609081200"></script>
 <script>
     window.EGODATA_PAGE_MODE = {{ page_mode|tojson }};
 </script>

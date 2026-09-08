@@ -21,7 +21,7 @@ import time
 _lock = threading.Lock()
 _MEDIA_GROUPS: dict[str, tuple[float, dict]] = {}
 _HAND3D_META: dict[str, tuple[float, dict]] = {}
-_TTL = 600.0  # 兜底自愈;正常路径由 invalidate_episode 显式失效
+_TTL = 3600.0  # 兜底自愈;正常路径由 invalidate_episode 显式失效(hand-3d meta 冷计算 ~20s,10min 太短)
 
 
 def _fresh(entry: tuple[float, dict] | None, now: float) -> bool:

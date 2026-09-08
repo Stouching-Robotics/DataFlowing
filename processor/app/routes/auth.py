@@ -18,9 +18,9 @@ router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 USERS_FILE = STATE_ROOT / "users.json"
 
 # Bootstrap account for a new legacy file store. Existing users.json is kept.
-_BOOTSTRAP_USERNAME = (os.environ.get("EGODATA_BOOTSTRAP_USERNAME", "demo-admin").strip()
-                       or "demo-admin")
-_BOOTSTRAP_PASSWORD = os.environ.get("EGODATA_BOOTSTRAP_PASSWORD", "change-me")
+_BOOTSTRAP_USERNAME = (os.environ.get("EGODATA_BOOTSTRAP_USERNAME", "Root").strip()
+                       or "Root")
+_BOOTSTRAP_PASSWORD = os.environ.get("EGODATA_BOOTSTRAP_PASSWORD", "Root")
 _BOOTSTRAP_EMAIL = (os.environ.get("EGODATA_BOOTSTRAP_EMAIL", "").strip()
                     or f"{_BOOTSTRAP_USERNAME.lower()}@egodata.local")
 

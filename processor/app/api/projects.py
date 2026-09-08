@@ -576,6 +576,15 @@ def get_hierarchy(
                 if s in n["project"]["name"].lower()
                 or any(s in e["name"].lower() or s in e["id"].lower() for e in n["episodes"])]
 
+    # 预热深度预览:列表可见批次在用户点开前后台生成(尽力而为)
+    try:
+        from app.routes.ingestion import _trigger_depth_prewarm
+
+        _trigger_depth_prewarm(
+            [e["id"] for node in tree for e in node.get("episodes", [])])
+    except Exception:
+        pass
+
     return {"projects": tree, "total": sum(len(n["episodes"]) for n in tree)}
 
 

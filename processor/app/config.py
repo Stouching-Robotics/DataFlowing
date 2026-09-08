@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     # Database. In local mode this normally points to the server through an
     # SSH tunnel (for example 127.0.0.1:15432).
-    DATABASE_URL: str = "postgresql+asyncpg://user:password@localhost:5432/data_acq"
+    DATABASE_URL: str = "postgresql+asyncpg://odoo:myodoo@172.19.0.2:5432/data_acq"
     DB_CONNECT_TIMEOUT: float = 5.0
     DB_COMMAND_TIMEOUT: float = 10.0
     DB_POOL_TIMEOUT: float = 5.0
@@ -16,12 +16,12 @@ class Settings(BaseSettings):
     # SFTP_ROOT on the storage server.
     STORAGE_DIR: str = "data"
     STORAGE_BACKEND: str = "local"  # local | sftp
-    SFTP_HOST: str = "localhost"
+    SFTP_HOST: str = "192.168.110.41"
     SFTP_PORT: int = 22
-    SFTP_USERNAME: str = ""
+    SFTP_USERNAME: str = "Stouch"
     SFTP_PASSWORD: str = ""
     SFTP_KEY_FILE: str = ""
-    SFTP_ROOT: str = ""
+    SFTP_ROOT: str = "/vol1/docker/odoo-dev/Data Acquisition/data"
     SFTP_KNOWN_HOSTS: str = ""
     SFTP_STRICT_HOST_KEY: bool = False
     SFTP_CONNECT_TIMEOUT: int = 15
@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     # Local server
     HOST: str = "0.0.0.0"
     PORT: int = 8000
-    PUBLIC_BASE_URL: str = "http://127.0.0.1:8000"
+    PUBLIC_BASE_URL: str = "http://192.168.110.41:2586"
     LOG_LEVEL: str = "info"
 
     # Cleaning

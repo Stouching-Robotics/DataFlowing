@@ -178,7 +178,7 @@ async def get_session() -> AsyncSession:
 async def _seed_default_users():
     """Insert the configurable bootstrap administrator if the table is empty.
 
-    The public template uses a configurable demo account for a first local demo only. Existing
+    The public template uses Root/Root for a first local demo only. Existing
     databases are never modified because seeding stops when any user exists.
     Production deployments should set both bootstrap environment variables to
     private values before the first startup.
@@ -193,9 +193,9 @@ async def _seed_default_users():
         if cnt > 0:
             return  # Already seeded
 
-        username = (os.environ.get("EGODATA_BOOTSTRAP_USERNAME", "demo-admin").strip()
-                    or "demo-admin")
-        password = os.environ.get("EGODATA_BOOTSTRAP_PASSWORD", "change-me")
+        username = (os.environ.get("EGODATA_BOOTSTRAP_USERNAME", "Root").strip()
+                    or "Root")
+        password = os.environ.get("EGODATA_BOOTSTRAP_PASSWORD", "Root")
         email = (os.environ.get("EGODATA_BOOTSTRAP_EMAIL", "").strip()
                  or f"{username.lower()}@egodata.local")
         defaults = [User(

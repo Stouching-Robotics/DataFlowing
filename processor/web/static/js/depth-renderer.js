@@ -1,7 +1,8 @@
 /* Frontend-only canonical depth renderer.
  *
  * The server sends uint16 little-endian depth codes. This module performs
- * only the display conversion: code -> 8-bit code -> OpenCV JET LUT -> RGBA.
+ * only the display conversion: code -> q01/q99-clamped 8-bit index -> Turbo
+ * LUT -> RGBA (Google Turbo = Rerun's default depth colormap, blue→red ramp).
  * No colorized depth frame is uploaded, persisted, or returned by the API.
  */
 (function () {
@@ -23,12 +24,17 @@
         in vec2 v_uv;
         uniform usampler2D u_depth;
         uniform sampler2D u_lut;
+        uniform float u_q01;
+        uniform float u_q99;
         out vec4 out_color;
         void main() {
             // Typed-array texture rows start at the top for this presentation
             // path; flip only the texture lookup, never the stored samples.
             uint code = texture(u_depth, vec2(v_uv.x, 1.0 - v_uv.y)).r;
-            uint c8 = min(code, 4095u) * 255u / 4095u;
+            // Rerun-style adaptive range: clamp to [q01, q99] then map to LUT.
+            float span = max(u_q99 - u_q01, 1.0);
+            float clamped = clamp(float(code), u_q01, u_q99);
+            uint c8 = uint((clamped - u_q01) * 255.0 / span + 0.5);
             out_color = texelFetch(u_lut, ivec2(int(c8), 0), 0);
         }
     `;
@@ -68,7 +74,9 @@
         const lutTexture = gl.createTexture();
         const position = gl.getAttribLocation(program, 'a_position');
         const state = { gl, program, buffer, depthTexture, lutTexture,
-            position, depthWidth: 0, depthHeight: 0, depthAllocated: false };
+            position, depthWidth: 0, depthHeight: 0, depthAllocated: false,
+            q01Loc: gl.getUniformLocation(program, 'u_q01'),
+            q99Loc: gl.getUniformLocation(program, 'u_q99') };
 
         gl.useProgram(program);
         gl.uniform1i(gl.getUniformLocation(program, 'u_depth'), 0);
@@ -144,39 +152,37 @@
         }
         gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height,
             gl.RED_INTEGER, gl.UNSIGNED_SHORT, codes);
+        const range = _rangeFor(canvas);
+        gl.uniform1f(state.q01Loc, range.q01);
+        gl.uniform1f(state.q99Loc, range.q99);
         gl.activeTexture(gl.TEXTURE1);
         gl.bindTexture(gl.TEXTURE_2D, state.lutTexture);
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
         return true;
     }
 
-    function buildCpuLut() {
-        const values = new Uint32Array(DEPTH_QMAX + 1);
-        const littleEndian = new Uint8Array(
-            new Uint32Array([0x01020304]).buffer)[0] === 0x04;
-        for (let code = 0; code <= DEPTH_QMAX; code++) {
-            const bgr = lut[Math.floor(code * 255 / DEPTH_QMAX)];
-            const r = bgr[2], g = bgr[1], b = bgr[0];
-            values[code] = littleEndian
-                ? (r | (g << 8) | (b << 16) | 0xff000000)
-                : 0;
+    function _rangeFor(canvas) {
+        const range = canvas._depthRange;
+        if (range && Number.isFinite(range.q01) && Number.isFinite(range.q99)
+            && range.q99 > range.q01) {
+            return range;
         }
-        return { values, littleEndian };
+        return { q01: 0, q99: DEPTH_QMAX };
     }
 
     function loadJetLut() {
         if (lut) return Promise.resolve(lut);
         if (lutPromise) return lutPromise;
-        lutPromise = fetch('/api/v1/video/depth-jet-lut')
+        lutPromise = fetch('/api/v1/video/depth-color-lut')
             .then(response => {
-                if (!response.ok) throw new Error('JET LUT request failed');
+                if (!response.ok) throw new Error('Depth color LUT request failed');
                 return response.json();
             })
             .then(data => {
-                if (!data || data.name !== 'opencv_colormap_jet' ||
+                if (!data || data.name !== 'google_turbo' ||
                     data.order !== 'bgr' || !Array.isArray(data.values) ||
                     data.values.length !== 256) {
-                    throw new Error('Invalid OpenCV JET LUT');
+                    throw new Error('Invalid Turbo depth LUT');
                 }
                 lut = data.values;
                 return lut;
@@ -203,26 +209,19 @@
         if (!image || image.width !== width || image.height !== height) {
             image = canvas._depthImageData = ctx.createImageData(width, height);
         }
-        const cpuLut = canvas._depthCpuLut ||
-            (canvas._depthCpuLut = buildCpuLut());
-        if (cpuLut.littleEndian) {
-            const pixels = new Uint32Array(image.data.buffer);
-            for (let src = 0; src < codes.length; src++) {
-                const code = Math.max(0, Math.min(DEPTH_QMAX, codes[src]));
-                pixels[src] = cpuLut.values[code];
-            }
-        } else {
-            // Extremely unusual host fallback; browsers in production are
-            // little-endian, but keep the renderer correct everywhere.
-            const pixels = image.data;
-            for (let src = 0, dst = 0; src < codes.length; src++, dst += 4) {
-                const code = Math.max(0, Math.min(DEPTH_QMAX, codes[src]));
-                const bgr = lut[Math.floor(code * 255 / DEPTH_QMAX)];
-                pixels[dst] = bgr[2];
-                pixels[dst + 1] = bgr[1];
-                pixels[dst + 2] = bgr[0];
-                pixels[dst + 3] = 255;
-            }
+        const range = _rangeFor(canvas);
+        const span = Math.max(1, range.q99 - range.q01);
+        // CPU fallback: per-pixel adaptive mapping (q01/q99) through Turbo LUT.
+        const pixels = image.data;
+        for (let src = 0, dst = 0; src < codes.length; src++, dst += 4) {
+            const code = Math.max(0, Math.min(DEPTH_QMAX, codes[src]));
+            const clamped = Math.max(range.q01, Math.min(range.q99, code));
+            const c8 = Math.round((clamped - range.q01) * 255 / span);
+            const bgr = lut[Math.max(0, Math.min(255, c8))];
+            pixels[dst] = bgr[2];
+            pixels[dst + 1] = bgr[1];
+            pixels[dst + 2] = bgr[0];
+            pixels[dst + 3] = 255;
         }
         ctx.putImageData(image, 0, 0);
         return true;

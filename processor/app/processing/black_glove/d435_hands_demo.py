@@ -92,11 +92,11 @@ BAND_HALF_M = 0.12          # 手深带半宽（米）
 BAND_MIN_VALID = 4
 GATE_M = 0.15               # 时序一致性门（米/帧）
 
-# 内嵌出厂标定（示例回退值；生产环境应使用录制会话中的标定文件）
+# 内嵌出厂标定（开发机 D435，serial 213622075531，设备提取 + 录制期
 # head_stereo.json 交叉核对零警告）。仅供无 --calib、无脚本旁 JSON 时
 # 回退；深度内参权威来源是录制会话的 head_stereo.json。
 _EMBEDDED_CALIB = {
-    "serial": "sample-d435",
+    "serial": "213622075531",
     "color_intrinsics": {
         "width": 1280, "height": 720,
         "fx": 912.2550048828125, "fy": 910.3241577148438,

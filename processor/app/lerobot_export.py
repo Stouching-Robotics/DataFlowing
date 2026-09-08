@@ -492,6 +492,65 @@ def _probe_video(path: Path) -> tuple[int, float, int, int]:
         return 0, 0.0, 0, 0
 
 
+def _probe_depth_video(path: Path) -> dict:
+    """Probe a depth stream with ffprobe first, OpenCV as fallback.
+
+    OpenCV builds without 12-bit HEVC support silently report zeros for
+    gray12le streams.  ffprobe returns the true pixel format and dimensions;
+    the container duration estimates the frame count when ``nb_frames`` is
+    absent from the stream entry (common for HEVC).
+    """
+    import json
+    import subprocess
+
+    result = {"frames": 0, "fps": 0.0, "width": 0, "height": 0, "pix_fmt": ""}
+    try:
+        completed = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries",
+             "stream=codec_name,pix_fmt,width,height,r_frame_rate,nb_frames:"
+             "format=duration",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        payload = json.loads(completed.stdout or "{}")
+        streams = payload.get("streams") or []
+        if streams:
+            stream = streams[0]
+            result["pix_fmt"] = str(stream.get("pix_fmt") or "")
+            for name in ("width", "height"):
+                try:
+                    result[name] = int(stream.get(name) or 0)
+                except (TypeError, ValueError):
+                    pass
+            try:
+                result["frames"] = int(stream.get("nb_frames") or 0)
+            except (TypeError, ValueError):
+                pass
+            rate = str(stream.get("r_frame_rate") or "").split("/")
+            try:
+                if len(rate) == 2 and float(rate[1]) > 0:
+                    result["fps"] = float(rate[0]) / float(rate[1])
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+        if not result["frames"] and result["fps"] > 0:
+            try:
+                duration = float((payload.get("format") or {}).get("duration") or 0)
+            except (TypeError, ValueError):
+                duration = 0.0
+            if duration > 0:
+                result["frames"] = int(round(duration * result["fps"]))
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError,
+            json.JSONDecodeError):
+        pass
+    count, fps, width, height = _probe_video(path)  # OpenCV fallback
+    result["frames"] = result["frames"] or count
+    result["fps"] = result["fps"] or float(fps or 0.0)
+    result["width"] = result["width"] or int(width or 0)
+    result["height"] = result["height"] or int(height or 0)
+    return result
+
+
 def _copy_depth_video_canonical(source: Path, destination: Path) -> None:
     """Copy a depth stream and normalize HEVC's MP4 sample entry.
 
@@ -1602,7 +1661,8 @@ def build_lerobot_dataset(dataset_name: str, episode_ids: list[str], output_dir:
                           hand_3d_paths: list[str] | None = None,
                           hand_3d_right_paths: list[str] | None = None,
                           version: str = "v3.0",
-                          hand_3d_unit: str | None = None) -> Path:
+                          hand_3d_unit: str | None = None,
+                          progress_callback=None) -> Path:
     """Build a LeRobot dataset (``version`` = "v2.1" | "v3.0").
 
     Depth sources are exported as their preview video (``is_depth_map``)
@@ -1837,19 +1897,31 @@ def build_lerobot_dataset(dataset_name: str, episode_ids: list[str], output_dir:
             destination.mkdir(parents=True, exist_ok=True)
             _copy_depth_video_canonical(depth_path, output_video)
             total_videos += 1
-            _depth_count, depth_fps, depth_width, depth_height = _probe_video(depth_path)
+            depth_probe = _probe_depth_video(depth_path)
+            _depth_count = int(depth_probe.get("frames") or 0)
+            depth_fps = float(depth_probe.get("fps") or fps)
+            depth_width = int(depth_probe.get("width") or 0)
+            depth_height = int(depth_probe.get("height") or 0)
+            # The canonical stream is a single-plane gray12le.  Declare the
+            # channels from the actual pixel format instead of the RGB-loop
+            # default of 3 so the intermediate feature is truthful before
+            # _canonicalize_video_features runs downstream.
+            depth_channels = (
+                1 if depth_probe.get("pix_fmt") in {"gray12le", "gray16le", "gray10le"}
+                else 3
+            )
             episode_video_meta[f"observation.images.{depth_source}"] = (
                 _depth_count, depth_fps or fps)
             has_metric = depth_source in generated_depth
             video_features[f"observation.images.{depth_source}"] = {
                 "dtype": "video",
-                "shape": [depth_height or 0, depth_width or 0, 3],
+                "shape": [depth_height or 0, depth_width or 0, depth_channels],
                 "names": ["height", "width", "channel"],
                 "video_info": {
                     "video.fps": depth_fps or fps,
                     "video.height": depth_height or 0,
                     "video.width": depth_width or 0,
-                    "video.channels": 1,
+                    "video.channels": depth_channels,
                     # 有 metric 流时主键是纯可视化;无 metric(老批次/
                     # 编码失败)才把主键当深度流兜底
                     "video.is_depth_map": not has_metric,
@@ -1946,6 +2018,12 @@ def build_lerobot_dataset(dataset_name: str, episode_ids: list[str], output_dir:
         episode_row_ranges.append((out_episode_index, task_id, frame_count,
                                    len(rows) - frame_count, len(rows)))
         episode_video_meta_records.append(episode_video_meta)
+        if progress_callback is not None:
+            try:
+                progress_callback(done=out_episode_index + 1,
+                                  total_episodes=len(episodes))
+            except Exception:
+                pass  # 进度回调失败不影响导出本身
 
     # 变长异步传感器列固定长度化:官方加载器不支持变长列(实测
     # list<int64> 对声明 int64[1] 直接 cast 失败)。取全数据集最大

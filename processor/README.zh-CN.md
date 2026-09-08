@@ -1,11 +1,13 @@
-# Data Acquisition
+# processor
 
 [中文](README.zh-CN.md) | [English](README.md)
 
 > 文档版本：2026-09-02  ·  后端版本：`1.6.8`  ·  WEB 前端版本：`1.5.6`
 
-Data Acquisition 是 EgoData 的数据采集、处理、审核和导出服务，面向具身智能与机器人
+processor 是 EgoData 的数据采集、处理、审核和导出服务，面向具身智能与机器人
 操作数据。系统由 FastAPI 后端、异步 Worker、Web 审核页面和 Workflow Studio 组成。
+
+> 项目文档：[项目文档介绍](docs/README.md)。
 
 ```text
 采集端上传 → 项目匹配 → 工作流处理 → AI/人工审核 → LeRobot/HDF5 导出
@@ -53,13 +55,16 @@ Web 审核页面
 LeRobot v2.1 / v3.0 或 HDF5
 ```
 
+本机 `processor/` 目录是前端和后端代码的唯一来源。远端服务器只提供数据目录
+或 SFTP 存储，不作为本项目的前端、后端代码来源；服务器中的旧代码已废弃。
+
 ## 2. 代码目录
 
 <details>
 <summary>点击展开：代码目录</summary>
 
 ```text
-Data Acquisition/
+processor/
 ├── app/                    # FastAPI、存储、工作流、处理和导出逻辑
 ├── worker/                 # 异步处理 Worker
 ├── scripts/                # 部署、启动、检查和数据维护脚本
@@ -88,7 +93,6 @@ data/
 `package.json` 等依赖清单应保留在仓库中。
 
 </details>
-
 ## 3. 项目数据结构
 
 <details>
@@ -165,7 +169,7 @@ RGB 和 Depth 始终作为独立数据流保存。纯 Depth 流不会被当作 R
 新的真实深度视频统一使用：
 
 ```text
-HEVC (H.265) in MP4
+HEVC (H.265) in MP4 / hvc1 / gray12le / qp=6 / range=full
 ```
 
 深度视频保存的是 12-bit 对数深度码，不是伪彩色图像：
@@ -342,7 +346,7 @@ meta/episodes/chunk-000/episode_000000.parquet
 ### Linux
 
 ```bash
-cd "Data Acquisition"
+cd "processor"
 cp .env.example .env
 # 编辑 .env，设置 API_KEY、WORKER_API_KEY、JWT_SECRET 和存储配置。
 chmod +x deploy.sh
@@ -363,14 +367,14 @@ python deploy.py --no-services      # 前台运行，不安装自启动服务。
 ### Windows
 
 ```bat
-cd /d "Data Acquisition"
+cd /d "processor"
 copy .env.example .env && deploy.bat
 ```
 
 ### 手动启动后端
 
 ```bash
-cd "Data Acquisition"
+cd "processor"
 source .venv-linux/bin/activate
 export PYTHONPATH="$PWD"
 ./scripts/run_backend_linux.sh
@@ -385,7 +389,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ### 启动 Worker
 
 ```bash
-cd "Data Acquisition"
+cd "processor"
 export EGODATA_SERVER_URL=http://127.0.0.1:8000
 export EGODATA_WORKER_API_KEY='与服务端一致的 Worker API Key'
 ./scripts/run_worker_linux.sh
@@ -397,7 +401,7 @@ Windows 使用 `scripts/run_worker_windows.ps1`。Linux 和 Windows 的虚拟环
 ### Workflow Studio
 
 ```bash
-cd "Data Acquisition/web/workflow-studio"
+cd "processor/web/workflow-studio"
 npm ci
 npm run dev
 ```
@@ -415,7 +419,7 @@ npm run build
 <details>
 <summary>点击展开：环境变量和安全配置</summary>
 
-配置写入 `Data Acquisition/.env` 或环境变量，不提交到仓库：
+配置写入 `processor/.env` 或环境变量，不提交到仓库：
 
 | 配置 | 作用 |
 | --- | --- |
@@ -472,7 +476,7 @@ GET /openapi.json
 后端和 Worker 基础检查：
 
 ```bash
-cd "Data Acquisition"
+cd "processor"
 python -m compileall app worker
 python deploy.py --check-only
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q tests/test_depth_codec.py
@@ -481,7 +485,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q tests/test_depth_codec.py
 前端检查：
 
 ```bash
-cd "Data Acquisition/web/workflow-studio"
+cd "processor/web/workflow-studio"
 npm run build
 ```
 

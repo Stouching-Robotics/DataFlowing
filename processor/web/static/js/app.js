@@ -462,13 +462,16 @@ function episodeCardHtml(ep, taskName) {
     const activeClass = currentEpisodeId === ep.id ? 'active' : '';
     // 前端入队标记(点击后立即显示)或后端真实状态(静默刷新后保持显示)
     const isWorkflowQueued = ep._uiWorkflowState === 'queued' || ep.status === 'processing';
-    const cardClass = isWorkflowQueued
+    // AI 标注运行中:整批数据等标注完成后才允许查看
+    const isAiAnnotating = !isWorkflowQueued && ep.ai_quality_status === 'running';
+    const cardClass = (isWorkflowQueued || isAiAnnotating)
         ? 'cursor-default opacity-80'
         : 'cursor-pointer';
-    const cardClick = isWorkflowQueued ? '' : `onclick="selectEpisode('${ep.id}')"`;
+    const cardClick = (isWorkflowQueued || isAiAnnotating)
+        ? '' : `onclick="selectEpisode('${ep.id}')"`;
     const isReviewed = ep.status === 'reviewed' || ep.status === 'approved';
     const isFailed = ep.status === 'failed';
-    const statusDot = isWorkflowQueued
+    const statusDot = (isWorkflowQueued || isAiAnnotating)
         ? '<span class="inline-block w-2 h-2 rounded-full bg-blue-400 mr-1"></span>'
         : (isFailed
         ? '<span class="inline-block w-2 h-2 rounded-full bg-red-400 mr-1"></span>'
@@ -476,8 +479,9 @@ function episodeCardHtml(ep, taskName) {
             ? '<span class="inline-block w-2 h-2 rounded-full bg-green-400 mr-1"></span>'
             : '<span class="inline-block w-2 h-2 rounded-full bg-yellow-400 mr-1"></span>'));
     const statusText = isWorkflowQueued ? t('processing')
-        : (isFailed ? t('stat_failed') : (isReviewed ? t('reviewed') : t('reviewing')));
-    const statusColor = isWorkflowQueued ? 'text-blue-400'
+        : (isAiAnnotating ? t('ai_annotating')
+        : (isFailed ? t('stat_failed') : (isReviewed ? t('reviewed') : t('reviewing'))));
+    const statusColor = (isWorkflowQueued || isAiAnnotating) ? 'text-blue-400'
         : (isFailed ? 'text-red-400' : (isReviewed ? 'text-green-400' : 'text-yellow-400'));
     const cameraCount = (ep.camera_names || []).length;
     const timestamp = ep.timestamp || '';
@@ -719,15 +723,16 @@ function updateBatchUI(filteredEpisodes) {
 }
 
 
-async function batchDownload() {
+async function batchDownload(button = null) {
     if (selectedEpisodes.size === 0) return;
     const ids = Array.from(selectedEpisodes);
-    const done = await startReviewExport(ids, null, null);
+    const done = await startReviewExport(ids, null, null, button);
     if (done && selectMode) toggleSelectMode();
 }
 
 
 function waitForExportJob(jobId, button) {
+    const originalHtml = button ? button.innerHTML : null;
     return new Promise(resolve => {
         const poll = async () => {
             try {
@@ -742,6 +747,11 @@ function waitForExportJob(jobId, button) {
                     resolve(false);
                     return;
                 }
+                if (button) {
+                    // 导出期间按钮直接显示百分比进度,不再静默等待
+                    const pct = Math.round((Number(job.progress) || 0) * 100);
+                    button.textContent = 'Exporting… ' + pct + '%';
+                }
             } catch (err) {
                 alert('Export status failed: ' + err.message);
                 resolve(false);
@@ -752,6 +762,7 @@ function waitForExportJob(jobId, button) {
         poll();
     }).finally(() => {
         if (button) {
+            if (originalHtml !== null) button.innerHTML = originalHtml;
             button.disabled = false;
             button.dataset.exporting = '';
             button.classList.remove('opacity-60', 'cursor-wait');
@@ -812,6 +823,63 @@ async function startReviewExport(ids, format, datasetName, button = null) {
 
 // ── Select / Info Panel ──────────────────────────────
 
+function showAiPendingGate(episodeId) {
+    // 全屏等待遮罩:AI 标注未完成时批次数据不可查看。每 4 秒轮询层级
+    // 接口,标注结束(非 running)后自动移除遮罩并重新进入批次。
+    const listSection = document.getElementById('episode-list-section');
+    const detail = document.getElementById('episode-detail');
+    if (listSection) listSection.classList.add('hidden');
+    if (detail) detail.classList.remove('hidden');
+    let overlay = document.getElementById('ai-pending-overlay');
+    if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.id = 'ai-pending-overlay';
+        overlay.className = 'fixed inset-0 z-[999] flex flex-col items-center justify-center gap-3 bg-black/85';
+        document.body.appendChild(overlay);
+    }
+    overlay.innerHTML = `
+        <iconify-icon icon="ant-design:loading-3-quarters-outlined" class="text-blue-400 text-4xl animate-spin"></iconify-icon>
+        <div class="text-gray-200 text-sm">${t('ai_annotating')}</div>
+        <div class="text-gray-500 text-xs">${t('ai_annotating_hint')}</div>`;
+    if (overlay.dataset.polling === '1') return;
+    overlay.dataset.polling = '1';
+    (async function poll() {
+        for (let i = 0; i < 300; i++) {  // 最多约 20 分钟
+            await new Promise(resolve => setTimeout(resolve, 4000));
+            try {
+                const res = await fetch('/api/v1/projects/hierarchy');
+                if (!res.ok) continue;
+                const data = await res.json();
+                const projects = Array.isArray(data)
+                    ? data : (data && data.projects) || [];
+                let done = false;
+                for (const projectNode of projects) {
+                    const hit = (projectNode.episodes || [])
+                        .find(e => e.id === episodeId);
+                    if (!hit) continue;
+                    if (hit.ai_quality_status !== 'running') {
+                        done = true;  // passed / failed / null → 可查看
+                    } else if (hit.status === 'processing') {
+                        done = true;  // 回到 processing,由现有门禁接管
+                    }
+                    break;
+                }
+                if (done) {
+                    overlay.dataset.polling = '';
+                    overlay.remove();
+                    if (typeof selectEpisode === 'function') {
+                        selectEpisode(episodeId);
+                    }
+                    return;
+                }
+            } catch (_) { /* 网络抖动,继续轮询 */ }
+        }
+        overlay.dataset.polling = '';
+        overlay.remove();
+        if (typeof backToList === 'function') backToList();
+    })();
+}
+
 function selectEpisode(episodeId) {
     const ep = allEpisodes.find(e => e.id === episodeId);
     if (!ep) return;
@@ -820,6 +888,12 @@ function selectEpisode(episodeId) {
     // worker is replacing the processed output.
     if (ep.status === 'processing' || ep._uiWorkflowState === 'queued') {
         backToList();
+        return;
+    }
+    // AI 标注运行中:整批数据等标注完成后才显示(全屏等待遮罩 + 轮询,
+    // 完成后自动载入)。
+    if (ep.ai_quality_status === 'running') {
+        showAiPendingGate(episodeId);
         return;
     }
 

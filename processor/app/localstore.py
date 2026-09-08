@@ -306,6 +306,9 @@ def _scan_project_dir(project_dir: Path, project: str) -> list[dict]:
             "episode_index": episode_index,
             "project": project_name,
             "status": state.get("status", "completed"),
+            # AI 标注运行中(running)时前端禁止查看批次;passed/failed
+            # 或未配置 AI 节点(null)均正常放行。
+            "ai_quality_status": state.get("ai_quality_status"),
             "fps": state_fps or declared_fps,
             "frame_count": frame_count,
             "camera_names": sorted(cameras),

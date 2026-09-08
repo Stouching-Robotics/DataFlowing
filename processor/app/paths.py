@@ -13,3 +13,4 @@ WEB_ROOT = PROJECT_ROOT / "web"
 TEMPLATES_DIR = WEB_ROOT / "templates"
 STATIC_DIR = WEB_ROOT / "static"
 WORKFLOW_STUDIO_DIR = WEB_ROOT / "workflow-studio"
+

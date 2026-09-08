@@ -116,3 +116,4 @@ class AlphaBetaHandSlots:
 
     def close(self) -> None:
         self.slots = [self._new_slot(), self._new_slot()]
+

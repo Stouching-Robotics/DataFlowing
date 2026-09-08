@@ -1,6 +1,6 @@
 # EgoData Worker
 
-Worker 是 Data Acquisition 的异步处理进程。它从 FastAPI 服务领取工作流任务，读取当前
+Worker 是 processor 的异步处理进程。它从 FastAPI 服务领取工作流任务，读取当前
 episode 的 canonical 数据，执行手部关键点、深度 3D、AI 标注和质量审核模块，再把结果
 合并回对应项目的 `data/` 和 `meta/episodes/`。
 
@@ -17,7 +17,7 @@ Worker 不提供前端页面，也不直接修改原始 RGB/Depth 视频。手�
 ## Linux
 
 ```bash
-cd "/path/to/Data Acquisition"
+cd "/path/to/processor"
 bash scripts/setup_linux.sh
 
 export EGODATA_SERVER_URL=http://127.0.0.1:8000
@@ -38,7 +38,7 @@ EGODATA_POLL_SECONDS=2
 ## Windows
 
 ```powershell
-cd "E:\Company-File\Date-V\Data Acquisition"
+cd "E:\Company-File\Date-V\processor"
 .\scripts\setup_windows.ps1
 $env:EGODATA_SERVER_URL = 'http://127.0.0.1:8000'
 $env:EGODATA_WORKER_API_KEY = '服务器配置的 Worker API Key'

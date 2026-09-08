@@ -7,11 +7,11 @@
 # 失败自动重试一次;结果写 data/logs/archive.log。并发互斥(flock)。
 set -u
 
-NAS_USER="${EGODATA_NAS_USER:-}"
-NAS_HOST="${EGODATA_NAS_HOST:-}"
-NAS_ROOT="${EGODATA_NAS_ROOT:-/srv/egodata/sessions}"
-SRC_ROOT="${EGODATA_SRC_ROOT:-data/sessions}"
-LOG_DIR="${EGODATA_LOG_DIR:-data/logs}"
+NAS_USER="Stouch"
+NAS_HOST="192.168.110.41"
+NAS_ROOT="/vol2/egodata/sessions"
+SRC_ROOT="/home/stouching/Desktop/Date-V/processor/data/sessions"
+LOG_DIR="/home/stouching/Desktop/Date-V/processor/data/logs"
 LOG_FILE="$LOG_DIR/archive.log"
 SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15"
 

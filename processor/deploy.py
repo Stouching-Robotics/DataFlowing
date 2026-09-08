@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""EgoData Data Acquisition 一键部署脚本.
+"""EgoData processor 一键部署脚本.
 
 跨平台 (Linux / Windows)，纯标准库实现：
 
@@ -558,7 +558,7 @@ def phase_env(ip: str) -> dict:
             replace_if=("", "change-me-worker-key"))
     # 缺失或等于示例默认值(过期的 IP/端口)时, 补为当前局域网地址
     fix("PUBLIC_BASE_URL", f"http://{ip}:{DEFAULT_BACKEND_PORT}",
-        replace_if=("", "http://127.0.0.1:8000"))
+        replace_if=("", "http://192.168.110.41:2586"))
     if values.get("STORAGE_BACKEND") == "sftp":
         warn(".env 使用 STORAGE_BACKEND=sftp, 本脚本不配置 SSH 隧道/SFTP, 请自行确保可用")
 
@@ -1173,7 +1173,7 @@ def phase_report(rep: dict, ports: dict, vllm_enabled: bool, args) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="EgoData Data Acquisition 一键部署 (跨平台)")
+        description="EgoData processor 一键部署 (跨平台)")
     p.add_argument("--check-only", action="store_true",
                    help="只做硬件能力体检, 零副作用")
     p.add_argument("--download-model", action="store_true",
@@ -1200,7 +1200,7 @@ def main() -> None:
         except (OSError, ValueError):
             pass
     say("═" * 62)
-    say(f"  EgoData Data Acquisition 一键部署")
+    say(f"  EgoData processor 一键部署")
     say(f"  项目目录: {PROJECT_ROOT}")
     say(f"  系统: {platform.system()} {platform.release()}  "
         f"Python: {sys.version.split()[0]}")

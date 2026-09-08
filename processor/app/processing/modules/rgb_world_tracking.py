@@ -1,7 +1,7 @@
 """RGB-only hand-to-camera tracking used by the Hand Skeleton module.
 
 This module is deliberately self-contained.  It does not import the legacy
-``Python`` project or any code outside ``Data Acquisition``.
+``Python`` project or any code outside ``processor``.
 
 MediaPipe gives us two useful pieces of information from an RGB frame:
 

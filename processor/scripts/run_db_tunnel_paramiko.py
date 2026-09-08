@@ -10,13 +10,13 @@ import threading
 import paramiko
 
 
-SSH_HOST = os.getenv("EGODATA_SSH_HOST", "")
+SSH_HOST = os.getenv("EGODATA_SSH_HOST", "192.168.110.41")
 SSH_PORT = int(os.getenv("EGODATA_SSH_PORT", "22"))
-SSH_USER = os.getenv("EGODATA_SSH_USER", "")
+SSH_USER = os.getenv("EGODATA_SSH_USER", "Stouch")
 SSH_PASSWORD = os.environ.get("EGODATA_SSH_PASSWORD", "")
 LOCAL_HOST = os.getenv("EGODATA_DB_LOCAL_HOST", "127.0.0.1")
 LOCAL_PORT = int(os.getenv("EGODATA_DB_LOCAL_PORT", "15432"))
-REMOTE_HOST = os.getenv("EGODATA_DB_REMOTE_HOST", "")
+REMOTE_HOST = os.getenv("EGODATA_DB_REMOTE_HOST", "172.19.0.2")
 REMOTE_PORT = int(os.getenv("EGODATA_DB_REMOTE_PORT", "5432"))
 
 

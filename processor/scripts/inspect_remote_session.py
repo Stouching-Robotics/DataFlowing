@@ -10,7 +10,7 @@ import asyncpg
 import paramiko
 
 
-REMOTE_SESSION = os.environ.get("EGODATA_REMOTE_SESSION", "/remote/path/to/session")
+REMOTE_SESSION = "/vol1/docker/odoo-dev/Data Acquisition/data/sessions/episode_000014/episode_000014"
 
 
 def print_tree(sftp: paramiko.SFTPClient, root: str) -> None:
@@ -38,7 +38,7 @@ async def print_db_mapping() -> None:
         host="127.0.0.1",
         port=15432,
         user="odoo",
-        password=os.environ.get("EGODATA_DB_PASSWORD", ""),
+        password="myodoo",
         database="data_acq",
     )
     try:
@@ -81,7 +81,7 @@ def main() -> None:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(
-        os.environ.get("EGODATA_SSH_HOST", ""),
+        "192.168.110.41",
         username="Stouch",
         password=password,
         look_for_keys=False,

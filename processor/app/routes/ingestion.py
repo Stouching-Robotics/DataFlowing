@@ -6,6 +6,8 @@ data/sessions/<项目>/<批次名>/ + data/state/(审核状态、标注)。
 
 from __future__ import annotations
 
+import threading
+from collections import deque
 from pathlib import Path
 from uuid import UUID
 
@@ -80,6 +82,123 @@ def _ep_to_out_brief(ep: dict) -> dict:
 
 # ── 列表 / 详情 ───────────────────────────────────────
 
+# ── 深度预览预热(列表加载后后台生成,点击批次时已就绪) ──────────────
+# /episodes 每 15s 被前端轮询一次;把列表前 N 个有深度视频的批次排入
+# 单线程队列,后台先镜像后转码。全部尽力而为:失败静默,点击路径照常
+# 兜底生成。
+
+_PREWARM_QUEUE: deque[str] = deque()
+_PREWARM_QUEUED: set[str] = set()
+_PREWARM_LOCK = threading.Lock()
+_PREWARM_RUNNING = False
+_PREWARM_MAX_PER_PASS = 8
+_PREWARM_MAX_QUEUE = 24
+
+
+def _episode_depth_video_paths(ep: dict) -> list[Path]:
+    """该批次所有深度视频文件的权威路径(预热用,宽松按名称识别)。"""
+    batch = Path(ep.get("path") or "")
+    videos = batch / "videos"
+    if not videos.is_dir():
+        return []
+    from app.lerobot_v21 import is_depth_source
+
+    paths: list[Path] = []
+    try:
+        for feat in videos.iterdir():
+            if not feat.is_dir() or not is_depth_source(feat.name):
+                continue
+            for chunk in feat.glob("chunk-*/episode_*.mp4"):
+                if chunk.is_file():
+                    paths.append(chunk)
+    except OSError:
+        pass
+    return paths
+
+
+def _prewarm_worker() -> None:
+    """单线程消费预热队列;无任务即退出,由下次触发重启。
+
+    每个可见批次依次预热:素材清单(media-groups)→ 手部 3D 元数据 →
+    帧数据(frames-data)→ 深度预览转码。前三项填充服务端内存缓存,
+    让"点击批次"的首开在后端重启后也保持 ~1-2s(否则冷开要再付
+    media-groups ~7.7s + hand-3d 元数据 ~10.8s 的 NAS 读取)。
+    """
+    global _PREWARM_RUNNING
+    try:
+        while True:
+            with _PREWARM_LOCK:
+                if not _PREWARM_QUEUE:
+                    return
+                episode_id = _PREWARM_QUEUE.popleft()
+            try:
+                ep = get_episode(episode_id)
+                if ep is None:
+                    continue
+                # 1) 素材清单(点击门控的第一个 await)
+                try:
+                    episode_media_groups(episode_id)
+                except Exception:
+                    pass
+                # 2) 手部 3D 元数据(meta-only 路径,填充 hand3d meta 缓存)
+                try:
+                    from app.routes.video import get_hand_3d
+
+                    get_hand_3d(episode_id, None, None, None, None)
+                except Exception:
+                    pass
+                # 3) 帧数据(手套/传感器载荷,填 _frames_data_cache)
+                try:
+                    episode_frames_data(episode_id)
+                except Exception:
+                    pass
+                # 4) 深度预览转码(已有)
+                for video_path in _episode_depth_video_paths(ep):
+                    try:
+                        from app.browser_preview import (
+                            depth_preview_exists,
+                            ensure_depth_h264_preview,
+                            ensure_local_mirror,
+                        )
+
+                        if depth_preview_exists(video_path):
+                            continue
+                        ensure_local_mirror(video_path, wait_seconds=120)
+                        ensure_depth_h264_preview(video_path)
+                    except Exception:
+                        continue
+                print(f"[Prewarm] warmed {episode_id}")
+            except Exception:
+                continue
+    finally:
+        with _PREWARM_LOCK:
+            _PREWARM_RUNNING = False
+
+
+def _trigger_depth_prewarm(episode_ids: list[str]) -> None:
+    """把前 N 个未预热的批次排入队列并启动后台 worker(去重、有界)。"""
+    global _PREWARM_RUNNING
+    with _PREWARM_LOCK:
+        queued = 0
+        for episode_id in episode_ids:
+            if episode_id in _PREWARM_QUEUED:
+                continue
+            if queued >= _PREWARM_MAX_PER_PASS:
+                break
+            if len(_PREWARM_QUEUE) >= _PREWARM_MAX_QUEUE:
+                break
+            _PREWARM_QUEUED.add(episode_id)
+            _PREWARM_QUEUE.append(episode_id)
+            queued += 1
+        if not queued or _PREWARM_RUNNING:
+            return
+        _PREWARM_RUNNING = True
+        threading.Thread(
+            target=_prewarm_worker, name="depth-preview-prewarm",
+            daemon=True,
+        ).start()
+
+
 @router.get("/episodes")
 def episode_list(status: str | None = None, limit: int = 50, offset: int = 0,
                        brief: bool = False):
@@ -98,6 +217,11 @@ def episode_list(status: str | None = None, limit: int = 50, offset: int = 0,
                 episodes = [e for e in episodes if e.get("status") == status]
     total = len(episodes)
     episodes = episodes[offset:offset + limit]
+    # 预热深度预览:用户从列表点开前,后台先把预览生成好(尽力而为)
+    try:
+        _trigger_depth_prewarm([e["id"] for e in episodes])
+    except Exception:
+        pass
     serialize = _ep_to_out_brief if brief else _ep_to_out
     return {"episodes": [serialize(e) for e in episodes], "total": total,
             "limit": limit, "offset": offset}
@@ -441,6 +565,15 @@ def _detect_depth_sources(batch_dir, ep_id_str: str, master_frame_count: int = 0
             # filename alone must not turn a colour video into 3D input.
             if not metric_depth:
                 continue
+            # Warm the local transport mirror in the background while the
+            # review page is still mounting; the first full-stream decode
+            # then reads from local disk instead of the SSHFS mount.
+            try:
+                from app.browser_preview import ensure_local_mirror
+
+                ensure_local_mirror(video_path)
+            except Exception:
+                pass
             frames = 0
             fps = float(master_fps or info.get("fps") or 0)
             try:
@@ -478,9 +611,11 @@ def _detect_depth_sources(batch_dir, ep_id_str: str, master_frame_count: int = 0
                     f"/api/v1/video/{ep_id_str}/depth-codes/{source_name}/{{frame}}"),
                 "depth_codes_window_url": (
                     f"/api/v1/video/{ep_id_str}/depth-codes-window/"
-                    f"{source_name}?start_frame={{start}}&end_frame={{end}}"),
+                    f"{source_name}?start_frame={{start}}&end_frame={{end}}"
+                    f"&scale=2"),
                 "depth_codes_full_url": (
-                    f"/api/v1/video/{ep_id_str}/depth-codes-full/{source_name}"),
+                    f"/api/v1/video/{ep_id_str}/depth-codes-full/{source_name}"
+                    f"?scale=2"),
                 # Deprecated alias retained for clients that used the old
                 # frame URL; it now returns raw uint16 codes, never JET.
                 "depth_preview_url": (

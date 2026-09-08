@@ -26,6 +26,53 @@ function registerHandTile(canvas, hand) {
     if (canvas && values) renderHandSensorCanvas(canvas, values, hand === 'left');
 }
 
+function renderGloveHeatmapCanvas(canvas, values) {
+    // Plain 16x16 sensor heatmap drawn locally from the preloaded
+    // frames-data payload — mirrors the backend PNG (Viridis ramp +
+    // Gaussian-ish smoothing) without any per-frame HTTP request.
+    if (!canvas) return;
+    const size = 512, cell = size / 16;
+    if (canvas.width !== size || canvas.height !== size) {
+        canvas.width = size;
+        canvas.height = size;
+    }
+    const ctx = canvas.getContext('2d');
+    const matrix = Array.isArray(values) && Array.isArray(values[0])
+        ? values : [];
+    const flat = (Array.isArray(values) && !Array.isArray(values[0]))
+        ? values : (matrix.flat ? matrix.flat() : []);
+    if (!flat.length) return;
+    const vmax = Math.max(1, ...flat.map(v => Number(v) || 0));
+    const drawCells = () => {
+        ctx.fillStyle = '#121212';
+        ctx.fillRect(0, 0, size, size);
+        for (let r = 0; r < 16; r++) {
+            for (let c = 0; c < 16; c++) {
+                const value = Number(matrix[r] ? matrix[r][c]
+                    : flat[r * 16 + c]) || 0;
+                ctx.fillStyle = _viridisSensorColor(value, vmax);
+                ctx.fillRect(c * cell, r * cell, cell + 1, cell + 1);
+            }
+        }
+    };
+    if (typeof ctx.filter === 'string') {
+        // ~Gaussian blur like the backend's 7px kernel (Chrome/Firefox).
+        ctx.filter = 'blur(7px)';
+        drawCells();
+        ctx.filter = 'none';
+    } else {
+        drawCells();
+    }
+}
+
+function registerGloveTile(canvas, sensor) {
+    if (!canvas || !sensor) return;
+    canvasHandTiles.push({ canvas, sensor });
+    const frame = typeof getCurrentFrame === 'function' ? getCurrentFrame() : 0;
+    const values = _sensorValue(frame, sensor);
+    if (values) renderGloveHeatmapCanvas(canvas, values);
+}
+
 function unregisterHandTile(canvas) {
     canvasHandTiles = canvasHandTiles.filter(entry => entry.canvas !== canvas);
 }
@@ -293,10 +340,19 @@ function updateHandImages(frameIndex) {
 
     // Draw every frame from the already-loaded sensor sequence. No per-frame
     // HTTP request and no intentional frame skipping during playback.
-    canvasHandTiles.forEach(({ canvas, hand }) => {
-        const sensor = hand === 'left' ? sensorLeft : sensorRight;
-        const values = _sensorValue(frameIndex, sensor);
-        if (canvas && values) renderHandSensorCanvas(canvas, values, hand === 'left');
+    canvasHandTiles.forEach((entry) => {
+        if (entry.hand) {
+            const sensor = entry.hand === 'left' ? sensorLeft : sensorRight;
+            const values = _sensorValue(frameIndex, sensor);
+            if (entry.canvas && values) {
+                renderHandSensorCanvas(entry.canvas, values, entry.hand === 'left');
+            }
+        } else if (entry.sensor) {
+            const values = _sensorValue(frameIndex, entry.sensor);
+            if (entry.canvas && values) {
+                renderGloveHeatmapCanvas(entry.canvas, values);
+            }
+        }
     });
 
     const el = document.getElementById('heatmap-frame');

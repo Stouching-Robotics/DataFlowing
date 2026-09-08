@@ -1425,8 +1425,8 @@ async function mountGroupedSource(source, tile) {
         if (player) players[groupedSourceKey(source)] = player;
         return;
     }
-    if (source.kind === 'glove' || source.kind === 'depth' || source.kind === 'hand') {
-        const img = (source.kind === 'hand' || source.kind === 'glove')
+    if (source.kind === 'depth' || source.kind === 'hand') {
+        const img = source.kind === 'hand'
             ? document.createElement('canvas') : document.createElement('img');
         // Hand-pressure panels are generated on a wide 800x220 canvas. Keep
         // that native ratio instead of stretching the heatmap vertically.
@@ -1451,12 +1451,6 @@ async function mountGroupedSource(source, tile) {
             // Hand-pressure tile: use the full frames-data payload and draw
             // locally; this avoids one PNG request per video frame.
             if (typeof registerHandTile === 'function') registerHandTile(img, source.hand);
-        } else if (source.kind === 'glove') {
-            // Glove heatmap tile: draw locally from the preloaded
-            // frames-data payload too (no per-frame PNG requests).
-            if (typeof registerGloveTile === 'function') {
-                registerGloveTile(img, source.source_key);
-            }
         } else if (source.kind === 'depth') {
             // Depth streams are mounted by the Canvas/code path above.
         } else {

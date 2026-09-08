@@ -2265,6 +2265,33 @@ async def _upload_video_file(client: httpx.AsyncClient, upload_base: str,
     return None
 
 
+def _slice_propose_clip(video_path: Path, out_dir: Path) -> Path | None:
+    """整片规划专用切片:降采样到 ≤640px / 5fps 低码率。
+
+    长批次(如 305s)原分辨率整片 base64 内联会打出 50MiB+ 的 JSON,
+    租用网关直接把连接掐断(ReadError)。规划阶段只需要看清动作边界,
+    5fps/640px 足够;时长不变,start_s/end_s 仍映射源视频时间。
+    """
+    import subprocess
+
+    out = out_dir / "propose_clip.mp4"
+    cmd = ["ffmpeg", "-y", "-loglevel", "error",
+           "-i", str(video_path),
+           "-vf", "scale='min(640,iw)':-2,fps=5",
+           "-c:v", "libx264", "-crf", "30", "-preset", "veryfast",
+           "-pix_fmt", "yuv420p",
+           "-movflags", "+faststart", "-an", str(out)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"[ai_annotation] propose clip error: {exc}")
+        return None
+    if r.returncode != 0 or not out.is_file() or out.stat().st_size < 1024:
+        print(f"[ai_annotation] propose clip failed: {r.stderr[:300]}")
+        return None
+    return out
+
+
 def _inline_video_data_url(clip: Path, *,
                            max_bytes: int = API_INLINE_VIDEO_MAX_BYTES,
                            label: str = "API VLM") -> str:
@@ -2414,7 +2441,7 @@ async def _vlm_propose_api(video_path: Path, fps: float, total_frames: int,
         raise VLMAnnotationError("configuration_error", err)
     whole = {"start_frame_index": 0,
              "end_frame_index": max(0, total_frames - 1)}
-    clip = _slice_segment_clip(video_path, fps, whole, None, None, tmp_dir)
+    clip = _slice_propose_clip(video_path, tmp_dir)
     if clip is None:
         raise VLMAnnotationError("video_slice_failed", "API VLM 输入视频切片失败")
     try:
@@ -2425,6 +2452,8 @@ async def _vlm_propose_api(video_path: Path, fps: float, total_frames: int,
     except ValueError as exc:
         raise VLMAnnotationError(
             "api_video_too_large", str(exc)) from exc
+    # propose 剪辑统一 5fps,fps 提示与剪辑实际一致(时长不变,时间轴对齐)
+    propose_fps = 5.0
     prompts = _prompts()
     template = prompts.get("plan_prompt_zh" if lang == "zh" else "plan_prompt_en")
     vocab = prompts.get("vocab_zh" if lang == "zh" else "vocab_en", "")
@@ -2437,7 +2466,7 @@ async def _vlm_propose_api(video_path: Path, fps: float, total_frames: int,
         "\n\n输出要求：最终答案必须放在 assistant 的 content 字段中，"
         "只输出完整 JSON，不要把答案只放在 reasoning 或思考内容中。")
     content = [
-        _api_video_content(vlm_cfg, video_ref, fps),
+        _api_video_content(vlm_cfg, video_ref, propose_fps),
         {"type": "text", "text": prompt},
     ]
     try:

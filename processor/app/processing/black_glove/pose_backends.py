@@ -29,6 +29,14 @@ class RtmposePoseBackend:
     name = "rtmpose"
 
     def __init__(self, device: str = "cpu"):
+        if device == "auto":
+            # auto = 有 CUDA provider 用 cuda,否则 cpu(rtmlib 不识别 auto)
+            try:
+                import onnxruntime as ort
+                device = ("cuda" if "CUDAExecutionProvider"
+                          in ort.get_available_providers() else "cpu")
+            except Exception:
+                device = "cpu"
         try:
             from rtmlib import RTMPose
             self._pose = RTMPose(_RTMPOSE_URL, model_input_size=(256, 256),
@@ -78,12 +86,13 @@ class MediaPipePoseBackend:
             return vision.HandLandmarker.create_from_options(options)
 
         self._lm = make(mp_python.BaseOptions.Delegate.CPU)
-        if device == "cuda":
+        if device in ("auto", "cuda"):
             try:
                 candidate = make(mp_python.BaseOptions.Delegate.GPU)
                 _smoke(candidate, mp)
                 self._lm.close()
                 self._lm = candidate
+                device = "cuda"
             except Exception as exc:
                 print(f"HandLandmarker GPU 初始化失败（{exc}），回退 CPU")
                 device = "cpu"

@@ -18,6 +18,7 @@ processor 是数据接收、处理、审核和导出系统。
 10. [垃圾桶](#10-垃圾桶)
 11. [常见问题](#11-常见问题)
 12. [数据和程序说明](#12-数据和程序说明)
+13. [代码结构与功能说明](#13-代码结构与功能说明)
 
 ## 1. 项目整体流程
 
@@ -643,6 +644,252 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 ```
 
 不要把 .env、API Key、Token、真实数据和服务器凭据提交到 Git。
+
+## 13. 代码结构与功能说明
+
+本章用于说明页面背后的前端、后端、Worker 和数据处理代码。普通操作不需要修改这些文件；需要维护功能时，可以根据本章快速找到对应位置。
+
+### 13.1 系统代码链路
+
+    浏览器页面
+        ↓
+    HTML 模板和 JavaScript
+        ↓
+    FastAPI 后端接口
+        ↓
+    项目、Episode、标注和工作流
+        ↓
+    Worker 领取处理任务
+        ↓
+    工作流模块执行后处理
+        ↓
+    保存关键点、3D、传感器和标注结果
+        ↓
+    视频审核和数据导出
+
+业务数据主要保存在项目文件中。用户账号可以使用数据库；数据库暂时不可用时，程序保留兼容回退能力。
+
+### 13.2 代码目录树
+
+    processor/
+    ├── app/                         # Python 后端
+    │   ├── main.py                  # FastAPI 启动入口
+    │   ├── config.py                # 环境变量和系统配置
+    │   ├── paths.py                 # 统一目录路径
+    │   ├── localstore.py            # 项目、工作流和 Episode 文件状态
+    │   ├── database.py              # 用户账号数据库连接
+    │   ├── models.py                # 数据库模型
+    │   ├── workflow_dispatch.py     # 工作流匹配、自动派发和历史回填
+    │   ├── workflow_bindings.py     # 工作流与实际设备输入绑定
+    │   ├── ai_annotation.py         # AI 标注服务
+    │   ├── export_engine.py         # 导出任务公共逻辑
+    │   ├── lerobot_export.py        # LeRobot 3.0 数据生成
+    │   ├── lerobot_v21.py           # LeRobot 2.1 兼容处理
+    │   ├── hdf5_export.py           # HDF5 数据生成
+    │   ├── routes/                  # 页面和业务接口
+    │   ├── api/                     # 项目、工作流和 Worker 接口
+    │   └── processing/              # 工作流后处理框架
+    │       ├── registry.py           # 自动注册处理模块
+    │       ├── catalog.py            # 向工作流页面提供模块清单
+    │       ├── batch.py              # 查找批次中的视频和 Parquet
+    │       └── modules/              # 每个工作流节点的执行代码
+    ├── worker/                      # 后台处理程序
+    │   ├── __main__.py              # Worker 启动入口
+    │   ├── runner.py                # 领取和执行工作流任务
+    │   └── client.py                # 与后端 Worker API 通信
+    ├── web/                         # 前端页面
+    │   ├── templates/               # HTML 页面模板
+    │   ├── static/js/               # 页面交互、播放和渲染
+    │   └── workflow-studio/         # React 工作流编辑器源码
+    ├── scripts/                     # 部署、迁移和维护脚本
+    ├── tests/                       # 自动测试
+    ├── models/                      # 本地模型文件
+    ├── docs/                        # 中文和英文项目文档
+    ├── deploy.py                    # 一键部署入口
+    └── requirements*.txt            # Python 依赖
+
+<code>.venv*</code>、<code>.pytest_cache</code> 和 <code>.backups</code> 是本机环境、测试缓存或备份，不属于主要业务代码。
+
+### 13.3 前端代码
+
+前端由两部分组成：
+
+1. 普通页面使用 HTML 模板和原生 JavaScript；
+2. 工作流编辑器使用 React 和 TypeScript。
+
+#### 页面模板
+
+| 文件 | 作用 |
+| --- | --- |
+| <code>web/templates/base.html</code> | 公共页面框架、左侧菜单和通用资源 |
+| <code>web/templates/overview.html</code> | 首页 |
+| <code>web/templates/tasks.html</code> | 项目管理页面 |
+| <code>web/templates/index.html</code> | 标注和视频审核页面 |
+| <code>web/templates/trash.html</code> | 垃圾桶页面 |
+| <code>web/templates/login.html</code> | 登录页面 |
+| <code>web/templates/users.html</code> | 用户管理页面，目前仍在开发 |
+| <code>web/templates/workflow_studio.html</code> | 工作流编辑器入口 |
+
+#### 页面 JavaScript
+
+| 文件 | 作用 |
+| --- | --- |
+| <code>web/static/js/dashboard.js</code> | 首页统计、最近数据和刷新 |
+| <code>web/static/js/tasks.js</code> | 项目创建、编辑、删除和批次展开 |
+| <code>web/static/js/app.js</code> | Episode 列表、审核、删除和导出操作 |
+| <code>web/static/js/player.js</code> | 视频加载、统一播放时钟和帧同步 |
+| <code>web/static/js/annotations.js</code> | 标注片段、时间条和逐帧标注 |
+| <code>web/static/js/slice-preview.js</code> | 右上角标注片段预览 |
+| <code>web/static/js/hand-overlay.js</code> | 在 RGB 原图上绘制 2D 手部关键点 |
+| <code>web/static/js/depth-renderer.js</code> | 将原始 12-bit 深度码渲染为网页伪彩色 |
+| <code>web/static/js/heatmap.js</code> | 手套传感器数据同步显示 |
+| <code>web/static/js/media-cache.js</code> | 使用 IndexedDB 缓存关键点和传感器数据 |
+| <code>web/static/js/i18n.js</code> | 中英文界面文字 |
+| <code>web/static/js/login.js</code> | 登录表单 |
+| <code>web/static/js/users.js</code> | 用户管理交互，目前仍在开发 |
+
+工作流编辑器源码位于 <code>web/workflow-studio/src/</code>。编译后的文件位于 <code>web/static/workflow-studio/</code>，修改工作流页面时应修改源码并重新构建，不要直接修改编译结果。
+
+### 13.4 后端入口和页面接口
+
+<code>app/main.py</code> 是后端入口，主要负责：
+
+- 启动 FastAPI；
+- 初始化文件目录和用户数据库；
+- 预热项目与 Episode 元数据缓存；
+- 启动上传处理队列；
+- 注册页面、项目、视频、标注、工作流和导出接口；
+- 提供静态文件缓存和大媒体文件传输规则。
+
+| 文件 | 作用 |
+| --- | --- |
+| <code>app/routes/pages.py</code> | 返回首页、项目、审核、工作流和垃圾桶页面 |
+| <code>app/routes/dashboard.py</code> | 首页统计、最近 Episode 和趋势 |
+| <code>app/routes/session.py</code> | 接收压缩包、解压、整理目录和导入元数据 |
+| <code>app/routes/ingestion.py</code> | Episode 列表、详情、审核、重跑、删除和恢复 |
+| <code>app/routes/video.py</code> | RGB 视频、深度码、深度预览、2D、3D 和传感器接口 |
+| <code>app/routes/annotations.py</code> | 创建、修改、删除和逐帧读取标注 |
+| <code>app/routes/export.py</code> | 单个导出、批量导出、任务状态和下载 |
+| <code>app/routes/auth.py</code> | 登录、退出和当前用户 |
+| <code>app/routes/devices.py</code> | 采集设备心跳和输入能力 |
+
+### 13.5 项目、工作流和 Worker API
+
+| 文件 | 作用 |
+| --- | --- |
+| <code>app/api/projects.py</code> | 项目创建、编辑、删除、输入源和工作流绑定 |
+| <code>app/api/workflows.py</code> | 工作流创建、保存、运行、使用情况和重试 |
+| <code>app/api/worker.py</code> | Worker 领取任务、下载输入、心跳、完成和失败上报 |
+| <code>app/api/exceptions.py</code> | 汇总和清理处理异常 |
+| <code>app/api/users.py</code> | 用户创建、角色、状态和删除，目前仍在开发 |
+
+后端与 Worker 的任务过程：
+
+    后端创建运行记录
+        ↓
+    Worker 领取任务
+        ↓
+    Worker 下载 Episode 输入
+        ↓
+    执行工作流节点
+        ↓
+    Worker 上传结果并报告完成
+        ↓
+    Episode 进入审核或通过状态
+
+Worker 会定期发送心跳。如果 Worker 中断，任务不会立刻丢失，后端可以在超时后重新安排。
+
+### 13.6 工作流后处理模块
+
+<code>app/processing/modules/</code> 中一个 Python 文件通常对应一个工作流节点。模块通过注册表自动出现在工作流编辑器中，并由 Worker 执行。
+
+| 模块文件 | 作用 |
+| --- | --- |
+| <code>mono_camera.py</code> | 单路 RGB 输入 |
+| <code>rgbd_camera.py</code> | RGB 和深度输入 |
+| <code>stereo_camera.py</code> | 左、右双目 RGB 输入 |
+| <code>stereo_rgbd_camera.py</code> | 左、右 RGB 和深度输入 |
+| <code>glove_sensor.py</code> | 手套传感器输入 |
+| <code>mediapipe_hand.py</code> | MediaPipe 手部关键点和手势识别 |
+| <code>rgb_hand_3d.py</code> | 裸手 RGB 二维关键点和预览空间效果 |
+| <code>black_hand_rgb_3d.py</code> | 黑手套 RGB 二维关键点和预览空间效果 |
+| <code>depth_hand_3d.py</code> | RGB-D 手部模块使用的真实 3D 计算辅助代码，不是独立节点 |
+| <code>black_glove_hand.py</code> | 黑手套关键点处理 |
+| <code>ai_annotation.py</code> | 声明并触发 AI 自动标注 |
+| <code>annotation.py</code> | 人工标注工作流节点 |
+| <code>human_review.py</code> | 人工审核门 |
+| <code>ai_quality_review.py</code> | 视频和标注自动质量检查 |
+| <code>lerobot_export.py</code> | LeRobot 导出节点 |
+| <code>hdf5_export.py</code> | HDF5 导出节点 |
+
+增加工作流模块时，应同时检查：
+
+1. 模块输入和输出类型；
+2. Worker 是否能够执行；
+3. 工作流编辑器是否正确显示；
+4. 处理结果是否能在审核页面读取；
+5. 导出模块是否包含新增结果。
+
+### 13.7 数据、缓存和导出
+
+| 文件 | 作用 |
+| --- | --- |
+| <code>app/localstore.py</code> | 扫描和缓存项目、Episode、工作流及运行状态 |
+| <code>app/storage.py</code> | 文件上传、校验、保存和远程同步 |
+| <code>app/remote_storage.py</code> | 远程存储访问 |
+| <code>app/media_groups.py</code> | 组织 RGB、深度和传感器媒体组 |
+| <code>app/media_cache.py</code> | 服务端媒体缓存 |
+| <code>app/browser_preview.py</code> | 生成浏览器兼容的视频预览 |
+| <code>app/artifact_resolver.py</code> | 查找工作流处理结果 |
+| <code>app/export_engine.py</code> | 统一导出流程 |
+| <code>app/lerobot_export.py</code> | 生成 LeRobot 3.0 数据集 |
+| <code>app/lerobot_v21.py</code> | 生成和兼容 LeRobot 2.1 数据 |
+| <code>app/hdf5_export.py</code> | 生成 HDF5 数据集 |
+
+源数据、后处理结果和导出副本需要分清：
+
+    data/sessions/    # 项目源数据和合并后的后处理字段
+    data/tmp/         # 临时处理文件
+    浏览器 IndexedDB # 前端预览缓存，可以重新生成
+    导出压缩包        # 根据工作流设置生成的交付文件
+
+不要把浏览器伪彩色深度图当作源数据保存。源深度仍然是原始深度码。
+
+### 13.8 修改功能时去哪里
+
+| 需要修改的功能 | 前端位置 | 后端或处理位置 |
+| --- | --- | --- |
+| 首页统计 | <code>dashboard.js</code> | <code>routes/dashboard.py</code> |
+| 项目页面 | <code>tasks.js</code> | <code>api/projects.py</code> |
+| 上传和解压 | 项目页面 | <code>routes/session.py</code> |
+| 工作流编辑器 | <code>workflow-studio/src/</code> | <code>api/workflows.py</code> |
+| 工作流自动运行 | 项目状态显示 | <code>workflow_dispatch.py</code> |
+| RGB 视频播放 | <code>player.js</code> | <code>routes/video.py</code> |
+| 播放帧同步 | <code>player.js</code> | <code>routes/video.py</code> |
+| 2D 手部关键点 | <code>hand-overlay.js</code> | 手部处理模块 |
+| 3D 手部空间 | <code>player.js</code> | <code>processing/modules/*3d*.py</code> |
+| 深度伪彩色 | <code>depth-renderer.js</code> | <code>routes/video.py</code> |
+| 手套传感器 | <code>heatmap.js</code> | <code>glove_sensor.py</code> |
+| 标注时间条 | <code>annotations.js</code> | <code>routes/annotations.py</code> |
+| AI 标注 | <code>annotations.js</code> | <code>ai_annotation.py</code> |
+| 视频审核 | <code>app.js</code> | <code>routes/ingestion.py</code> |
+| 单个和批量导出 | <code>app.js</code> | <code>routes/export.py</code> |
+| LeRobot 格式 | 导出按钮 | <code>lerobot_export.py</code>、<code>lerobot_v21.py</code> |
+| HDF5 格式 | 导出按钮 | <code>hdf5_export.py</code> |
+| 垃圾桶 | <code>trash.html</code> | <code>routes/ingestion.py</code> |
+| 用户管理 | <code>users.js</code> | <code>api/users.py</code> |
+
+### 13.9 排查问题的顺序
+
+遇到问题时，建议按照下面顺序检查：
+
+1. 先确认问题出现在哪个页面；
+2. 找到该页面对应的 JavaScript；
+3. 在浏览器开发者工具中检查接口是否失败；
+4. 根据接口地址找到对应的 Python 路由；
+5. 如果是工作流任务，再检查 Worker 和处理模块；
+6. 如果是显示不同步，再检查当前 Episode 的帧数、帧率和缓存；
+7. 修改后运行测试，再打开真实数据验证。
 
 ## 结尾
 

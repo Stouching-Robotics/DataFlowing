@@ -18,6 +18,7 @@ This guide keeps the project features, pages, screenshots, and operating instruc
 10. [Trash](#10-trash)
 11. [Frequently asked questions](#11-frequently-asked-questions)
 12. [Data and program information](#12-data-and-program-information)
+13. [Code structure and responsibilities](#13-code-structure-and-responsibilities)
 
 ## 1. Overall process
 
@@ -609,6 +610,252 @@ Raw depth videos store depth codes. The browser's pseudo-color preview is not wr
     PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 
 Do not commit <code>.env</code>, API keys, tokens, real data, or server credentials to Git.
+
+## 13. Code structure and responsibilities
+
+This chapter explains the frontend, backend, Worker, and data-processing code behind the pages. Normal operation does not require changing these files. When maintaining a feature, use this chapter to find the corresponding code quickly.
+
+### 13.1 System code flow
+
+    Browser page
+        ↓
+    HTML templates and JavaScript
+        ↓
+    FastAPI backend APIs
+        ↓
+    Projects, Episodes, annotations, and workflows
+        ↓
+    Worker claims a processing job
+        ↓
+    Workflow modules run post-processing
+        ↓
+    Save keypoints, 3D, sensor, and annotation results
+        ↓
+    Video review and data export
+
+Business data is primarily stored in project files. User accounts can use a database. The application retains a compatibility fallback when the database is temporarily unavailable.
+
+### 13.2 Code directory tree
+
+    processor/
+    ├── app/                         # Python backend
+    │   ├── main.py                  # FastAPI application entry point
+    │   ├── config.py                # Environment variables and system settings
+    │   ├── paths.py                 # Shared directory paths
+    │   ├── localstore.py            # Project, workflow, and Episode file state
+    │   ├── database.py              # User account database connection
+    │   ├── models.py                # Database models
+    │   ├── workflow_dispatch.py     # Workflow matching, dispatch, and backfill
+    │   ├── workflow_bindings.py     # Bind workflows to actual device inputs
+    │   ├── ai_annotation.py         # AI annotation service
+    │   ├── export_engine.py         # Shared export-job logic
+    │   ├── lerobot_export.py        # LeRobot 3.0 dataset generation
+    │   ├── lerobot_v21.py           # LeRobot 2.1 compatibility
+    │   ├── hdf5_export.py           # HDF5 dataset generation
+    │   ├── routes/                  # Page and business APIs
+    │   ├── api/                     # Project, workflow, and Worker APIs
+    │   └── processing/              # Workflow processing framework
+    │       ├── registry.py           # Automatic module registration
+    │       ├── catalog.py            # Module catalog for the workflow page
+    │       ├── batch.py              # Find videos and Parquet files in a batch
+    │       └── modules/              # Execution code for workflow nodes
+    ├── worker/                      # Background processing program
+    │   ├── __main__.py              # Worker entry point
+    │   ├── runner.py                # Claim and execute workflow jobs
+    │   └── client.py                # Communicate with the backend Worker API
+    ├── web/                         # Frontend pages
+    │   ├── templates/               # HTML page templates
+    │   ├── static/js/               # Page interaction, playback, and rendering
+    │   └── workflow-studio/         # React workflow editor source
+    ├── scripts/                     # Deployment, migration, and maintenance
+    ├── tests/                       # Automated tests
+    ├── models/                      # Local model files
+    ├── docs/                        # Chinese and English documentation
+    ├── deploy.py                    # One-command deployment entry point
+    └── requirements*.txt            # Python dependencies
+
+<code>.venv*</code>, <code>.pytest_cache</code>, and <code>.backups</code> are local environments, test caches, or backups. They are not part of the main business code.
+
+### 13.3 Frontend code
+
+The frontend has two parts:
+
+1. Standard pages use HTML templates and plain JavaScript.
+2. The workflow editor uses React and TypeScript.
+
+#### Page templates
+
+| File | Responsibility |
+| --- | --- |
+| <code>web/templates/base.html</code> | Common page frame, left navigation, and shared resources |
+| <code>web/templates/overview.html</code> | Home page |
+| <code>web/templates/tasks.html</code> | Project management page |
+| <code>web/templates/index.html</code> | Annotation and video-review pages |
+| <code>web/templates/trash.html</code> | Trash page |
+| <code>web/templates/login.html</code> | Login page |
+| <code>web/templates/users.html</code> | User management page, still under development |
+| <code>web/templates/workflow_studio.html</code> | Workflow editor entry page |
+
+#### Page JavaScript
+
+| File | Responsibility |
+| --- | --- |
+| <code>web/static/js/dashboard.js</code> | Home statistics, recent data, and refresh |
+| <code>web/static/js/tasks.js</code> | Create, edit, delete, and expand projects and batches |
+| <code>web/static/js/app.js</code> | Episode list, review, deletion, and export actions |
+| <code>web/static/js/player.js</code> | Video loading, central playback clock, and frame synchronization |
+| <code>web/static/js/annotations.js</code> | Annotation segments, timeline, and frame-level annotation |
+| <code>web/static/js/slice-preview.js</code> | Annotation segment preview in the upper-right corner |
+| <code>web/static/js/hand-overlay.js</code> | Draw 2D hand keypoints over the RGB video |
+| <code>web/static/js/depth-renderer.js</code> | Render raw 12-bit depth codes as browser pseudo-color |
+| <code>web/static/js/heatmap.js</code> | Display glove sensor data in sync with video |
+| <code>web/static/js/media-cache.js</code> | Cache keypoints and sensor data in IndexedDB |
+| <code>web/static/js/i18n.js</code> | Chinese and English interface text |
+| <code>web/static/js/login.js</code> | Login form |
+| <code>web/static/js/users.js</code> | User management interactions, still under development |
+
+The workflow editor source is in <code>web/workflow-studio/src/</code>. Its compiled files are in <code>web/static/workflow-studio/</code>. Change the source and rebuild the editor; do not edit the compiled output directly.
+
+### 13.4 Backend entry point and page APIs
+
+<code>app/main.py</code> is the backend entry point. It is responsible for:
+
+- Starting FastAPI;
+- Initializing file directories and the user database;
+- Warming project and Episode metadata caches;
+- Starting the upload processing queue;
+- Registering page, project, video, annotation, workflow, and export APIs;
+- Configuring static-file caching and large-media transfer behavior.
+
+| File | Responsibility |
+| --- | --- |
+| <code>app/routes/pages.py</code> | Return the Home, Projects, Review, Workflow, and Trash pages |
+| <code>app/routes/dashboard.py</code> | Home statistics, recent Episodes, and trends |
+| <code>app/routes/session.py</code> | Receive archives, extract files, normalize directories, and import metadata |
+| <code>app/routes/ingestion.py</code> | Episode list, details, approval, reprocessing, deletion, and restoration |
+| <code>app/routes/video.py</code> | RGB video, depth code, depth preview, 2D, 3D, and sensor APIs |
+| <code>app/routes/annotations.py</code> | Create, edit, delete, and read per-frame annotations |
+| <code>app/routes/export.py</code> | Single export, batch export, export status, and downloads |
+| <code>app/routes/auth.py</code> | Login, logout, and current-user APIs |
+| <code>app/routes/devices.py</code> | Collector heartbeat and input capabilities |
+
+### 13.5 Project, workflow, and Worker APIs
+
+| File | Responsibility |
+| --- | --- |
+| <code>app/api/projects.py</code> | Create, edit, and delete projects; manage inputs and workflow bindings |
+| <code>app/api/workflows.py</code> | Create, save, run, inspect usage, and retry workflows |
+| <code>app/api/worker.py</code> | Claim jobs, download inputs, send heartbeats, and report completion or failure |
+| <code>app/api/exceptions.py</code> | Aggregate and clear processing exceptions |
+| <code>app/api/users.py</code> | Create users and manage roles, statuses, and deletion; still under development |
+
+The backend and Worker job flow is:
+
+    Backend creates a workflow run
+        ↓
+    Worker claims the job
+        ↓
+    Worker downloads the Episode input
+        ↓
+    Workflow nodes execute
+        ↓
+    Worker uploads the result and reports completion
+        ↓
+    Episode enters Reviewing or Approved
+
+The Worker sends regular heartbeats. If it stops, the job is not immediately lost; the backend can schedule it again after the lease expires.
+
+### 13.6 Workflow processing modules
+
+In <code>app/processing/modules/</code>, one Python file usually represents one workflow node. Modules are registered automatically, displayed in the workflow editor, and executed by the Worker.
+
+| Module file | Responsibility |
+| --- | --- |
+| <code>mono_camera.py</code> | Single RGB input |
+| <code>rgbd_camera.py</code> | RGB and depth input |
+| <code>stereo_camera.py</code> | Left and right stereo RGB input |
+| <code>stereo_rgbd_camera.py</code> | Left and right RGB plus depth input |
+| <code>glove_sensor.py</code> | Glove sensor input |
+| <code>mediapipe_hand.py</code> | MediaPipe hand keypoint and gesture recognition |
+| <code>rgb_hand_3d.py</code> | Bare-hand RGB 2D keypoints and spatial preview |
+| <code>black_hand_rgb_3d.py</code> | Black-glove RGB 2D keypoints and spatial preview |
+| <code>depth_hand_3d.py</code> | Real 3D calculation helper used by RGB-D hand modules; not a standalone node |
+| <code>black_glove_hand.py</code> | Black-glove keypoint processing |
+| <code>ai_annotation.py</code> | Declare and trigger automatic AI annotation |
+| <code>annotation.py</code> | Human annotation workflow node |
+| <code>human_review.py</code> | Human-review gate |
+| <code>ai_quality_review.py</code> | Automatic video and annotation quality checks |
+| <code>lerobot_export.py</code> | LeRobot export node |
+| <code>hdf5_export.py</code> | HDF5 export node |
+
+When adding a workflow module, check:
+
+1. The module input and output types;
+2. Whether the Worker can execute it;
+3. Whether the workflow editor displays it correctly;
+4. Whether the Review page can read its output;
+5. Whether export modules include the new output.
+
+### 13.7 Data, cache, and export code
+
+| File | Responsibility |
+| --- | --- |
+| <code>app/localstore.py</code> | Scan and cache projects, Episodes, workflows, and run states |
+| <code>app/storage.py</code> | Upload, validate, save, and remotely synchronize files |
+| <code>app/remote_storage.py</code> | Remote storage access |
+| <code>app/media_groups.py</code> | Organize RGB, depth, and sensor media groups |
+| <code>app/media_cache.py</code> | Server-side media cache |
+| <code>app/browser_preview.py</code> | Generate browser-compatible video previews |
+| <code>app/artifact_resolver.py</code> | Locate workflow processing results |
+| <code>app/export_engine.py</code> | Shared export flow |
+| <code>app/lerobot_export.py</code> | Generate LeRobot 3.0 datasets |
+| <code>app/lerobot_v21.py</code> | Generate and support LeRobot 2.1 data |
+| <code>app/hdf5_export.py</code> | Generate HDF5 datasets |
+
+Keep source data, processing results, and export copies distinct:
+
+    data/sessions/     # Project source data and merged processing fields
+    data/tmp/          # Temporary processing files
+    Browser IndexedDB # Frontend preview cache; can be regenerated
+    Export archives   # Delivery files generated from workflow settings
+
+Do not store the browser's pseudo-color depth images as source data. The source depth remains raw depth codes.
+
+### 13.8 Where to change a feature
+
+| Feature | Frontend | Backend or processing |
+| --- | --- | --- |
+| Home statistics | <code>dashboard.js</code> | <code>routes/dashboard.py</code> |
+| Projects page | <code>tasks.js</code> | <code>api/projects.py</code> |
+| Upload and extraction | Projects page | <code>routes/session.py</code> |
+| Workflow editor | <code>workflow-studio/src/</code> | <code>api/workflows.py</code> |
+| Automatic workflow run | Project status display | <code>workflow_dispatch.py</code> |
+| RGB video playback | <code>player.js</code> | <code>routes/video.py</code> |
+| Playback frame synchronization | <code>player.js</code> | <code>routes/video.py</code> |
+| 2D hand keypoints | <code>hand-overlay.js</code> | Hand-processing modules |
+| 3D hand space | <code>player.js</code> | <code>processing/modules/*3d*.py</code> |
+| Depth pseudo-color | <code>depth-renderer.js</code> | <code>routes/video.py</code> |
+| Glove sensor | <code>heatmap.js</code> | <code>glove_sensor.py</code> |
+| Annotation timeline | <code>annotations.js</code> | <code>routes/annotations.py</code> |
+| AI annotation | <code>annotations.js</code> | <code>ai_annotation.py</code> |
+| Video review | <code>app.js</code> | <code>routes/ingestion.py</code> |
+| Single and batch export | <code>app.js</code> | <code>routes/export.py</code> |
+| LeRobot format | Export button | <code>lerobot_export.py</code>, <code>lerobot_v21.py</code> |
+| HDF5 format | Export button | <code>hdf5_export.py</code> |
+| Trash | <code>trash.html</code> | <code>routes/ingestion.py</code> |
+| User management | <code>users.js</code> | <code>api/users.py</code> |
+
+### 13.9 Troubleshooting order
+
+When a problem occurs, check it in this order:
+
+1. Confirm which page shows the problem.
+2. Find the JavaScript file used by that page.
+3. Check the browser developer tools for failed API requests.
+4. Use the API address to find the corresponding Python route.
+5. If it is a workflow job, inspect the Worker and processing module.
+6. If displays are out of sync, inspect the current Episode's frame count, FPS, and cache.
+7. Run the tests after making changes, then validate with real data.
 
 ## Closing note
 

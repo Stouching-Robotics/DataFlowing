@@ -112,9 +112,11 @@ function _resolveSensorMapping(sensors) {
 
     // Filter to pressure-sensor columns only (ignore hand_angles, hand_joints, etc.).
     // Accepts "sensors_left/right", SenseGlove "left_glove"/"right_glove" and
-    // tactile "left"/"right" naming.
+    // tactile "left"/"right" naming. IMU/valid telemetry columns must never
+    // win the right/left assignment over a real pressure array.
     const pressureSensors = sensors.filter(s => {
         const n = s.toLowerCase();
+        if (n.includes('imu') || n.endsWith('_valid')) return false;
         return n.includes('sensor') || n.includes('glove') || n.includes('tactile');
     });
     // If no pressure sensors found, fall back to all columns

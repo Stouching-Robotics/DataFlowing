@@ -378,6 +378,9 @@ def episode_frames_data(episode_id: str):
                         # 列(hand_pose 等)不含这些关键字,天然排除
                         if not ("sensor" in lower or "glove" in lower or "tactile" in lower):
                             continue
+                        # IMU/valid 列是遥测而非触觉压力阵列,不参与热力图
+                        if "imu" in lower or lower.endswith("_valid"):
+                            continue
                         if sname in available_sensors:
                             continue
                         # 真实压力数据(全文件均匀采样)才驱动热力图
@@ -479,45 +482,6 @@ def _member_label(camera: str, role: str) -> str:
         "left_aux": "Left Aux", "right_aux": "Right Aux", "aux": "Aux",
     }
     return label_map.get(role, camera)
-
-
-def _detect_glove_sources(batch_dir, ep_id_str: str, project_name: str = "") -> list[dict]:
-    """Detect real glove/tactile columns in the canonical episode parquet."""
-    if batch_dir is None:
-        return []
-    from app.localstore import episode_has_glove_sensor
-    episode = get_episode(ep_id_str)
-    if episode is None:
-        episode = {"id": ep_id_str, "project": project_name or ""}
-    if not episode_has_glove_sensor(episode):
-        return []
-    try:
-        import pyarrow.parquet as pq
-    except ImportError:
-        return []
-    sources: list[dict] = []
-    for parq_file in _canonical_data_files(Path(batch_dir), ep_id_str):
-        try:
-            names = pq.ParquetFile(parq_file).schema_arrow.names
-        except Exception:
-            continue
-        for col in names:
-            if not col.startswith("observation."):
-                continue
-            source_key = col.split(".", 1)[1]
-            lower = source_key.lower()
-            if not any(token in lower for token in ("glove", "sensor", "tactile")):
-                continue
-            if not _col_has_pressure(parq_file, col):
-                continue
-            sources.append({
-                "id": f"glove:{source_key}",
-                "kind": "glove",
-                "source_key": source_key,
-                "label": source_key,
-                "heatmap_url": f"/api/v1/video/{ep_id_str}/heatmap/{{frame}}?sensor={source_key}",
-            })
-    return sources
 
 
 def _detect_depth_sources(batch_dir, ep_id_str: str, master_frame_count: int = 0,
@@ -734,7 +698,6 @@ def episode_media_groups(episode_id: str):
         result["singles"].append(entry)
         result["sources"].append(_as_source(entry, None))
 
-    result["sources"].extend(_detect_glove_sources(batch_dir, episode_id, ep.get("project") or ""))
     result["sources"].extend(_detect_depth_sources(
         batch_dir,
         episode_id,

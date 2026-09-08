@@ -481,10 +481,13 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   onNodesChange: (changes) => set((s) => {
     // React Flow can emit non-drag position updates while measuring or
     // remounting controlled nodes. Only a position change with dragging=true
-    // is a user edit; remove/add are always user edits.
+    // is a user edit; remove (delete key) is a user edit.
+    // 'add' changes are emitted by React Flow when the controlled nodes
+    // array is replaced externally (loadWorkflow / switching workflows), so
+    // they are NOT user edits here — palette drops add nodes via direct
+    // setState and bypass onNodesChange entirely.
     const userChange = changes.some((c) =>
       c.type === 'remove'
-      || c.type === 'add'
       || (c.type === 'position' && c.dragging === true),
     );
     if (userChange) {
@@ -742,25 +745,19 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     });
   },
 
-  /** 应用模板到当前工作流:模板内容(剔除输入设备节点)替换当前画布,
+  /** 应用模板到当前工作流:模板内容(含采集端输入设备节点)替换当前画布,
    *  但保留当前工作流的 ID 与名称 —— 用户在自己的工作流里搭流程,
-   *  保存时仍是更新当前工作流,而不是顶替成模板的 "(copy)"。 */
+   *  保存时仍是更新当前工作流,而不是顶替成模板的 "(copy)"。
+   *  输入卡一并带入:卡内 source_key 若与当前项目设备不符,
+   *  用户在卡片配置里重新选择即可。 */
   newWorkflowFromTemplate: async (template) => {
     const wf = await api.getWorkflow(template.id);
     const src = wf.graph || { nodes: [], edges: [] };
-    // 模板样式 = 只含后处理链:剔除全部 input 设备节点及其关联边,
-    // 悬空输入保留 —— 设备卡片由用户在采集端上报后按实际设备手动添加。
-    const inputIds = new Set(
-      (src.nodes || [])
-        .filter((n) => (n.data as WorkflowNodeData)?.category === 'input')
-        .map((n) => n.id),
-    );
     const migrated = _migrateWorkflowGraph(src);
     const nodes = (migrated.nodes || [])
-      .filter((n) => !inputIds.has(n.id))
       .map(_hydrateNode)
       .map((n) => ({ ...n, selected: false, dragging: false }));
-    const edges = (migrated.edges || []).filter((e) => !inputIds.has(e.source) && !inputIds.has(e.target));
+    const edges = migrated.edges || [];
     const cur = get();
     set({
       nodes, edges,

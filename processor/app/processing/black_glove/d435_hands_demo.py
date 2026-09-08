@@ -356,18 +356,36 @@ class MediaPipeHandPipeline:
         self._pixel_filters: Dict[Tuple[int, int], OneEuroFilter2D] = {}
         self._world_filters: Dict[Tuple[int, int], OneEuroFilter3D] = {}
 
-        # 构建 landmarker
-        options = vision.HandLandmarkerOptions(
-            base_options=mp_python.BaseOptions(model_asset_path=model_path),
-            running_mode=vision.RunningMode.VIDEO,
-            num_hands=num_hands,
-            min_hand_detection_confidence=det_conf,
-            min_hand_presence_confidence=0.5,
-            min_tracking_confidence=track_conf,
-        )
-        self._landmarker = vision.HandLandmarker.create_from_options(options)
+        # 构建 landmarker:优先 GPU delegate,初始化/首帧冒烟失败回退 CPU
+        # (与 rgb_hand_3d 模块同一策略;Blackwell 等新卡不支持时自动回退)。
+        def make(delegate):
+            return vision.HandLandmarker.create_from_options(
+                vision.HandLandmarkerOptions(
+                    base_options=mp_python.BaseOptions(
+                        model_asset_path=model_path, delegate=delegate),
+                    running_mode=vision.RunningMode.VIDEO,
+                    num_hands=num_hands,
+                    min_hand_detection_confidence=det_conf,
+                    min_hand_presence_confidence=0.5,
+                    min_tracking_confidence=track_conf,
+                ))
+
+        self._landmarker = make(mp_python.BaseOptions.Delegate.CPU)
+        try:
+            candidate = make(mp_python.BaseOptions.Delegate.GPU)
+            # 冒烟:VIDEO 模式要求时间戳单调递增,逐帧新建 Image 喂 3 帧
+            for i in range(3):
+                probe = mp.Image(image_format=mp.ImageFormat.SRGB,
+                                 data=np.zeros((64, 64, 3), np.uint8))
+                candidate.detect_for_video(probe, i)
+            self._landmarker.close()
+            self._landmarker = candidate
+            print("[d435_hands_demo] HandLandmarker GPU delegate active")
+        except Exception as exc:
+            print(f"[d435_hands_demo] HandLandmarker GPU 初始化失败（{exc}），回退 CPU")
         self._preprocessor = _Preprocessor()
-        self._t0 = time.perf_counter()
+        # _t0 预借 50ms:GPU 冒烟已用掉时间戳 0/1/2,首帧 ts 必须大于 2
+        self._t0 = time.perf_counter() - 0.05
 
     def process(self, frame: np.ndarray) -> FrameResult:
         """处理一帧 BGR 图像，返回 FrameResult（.hands: [HandResult, ...]）。"""

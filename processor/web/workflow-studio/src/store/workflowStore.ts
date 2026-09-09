@@ -110,11 +110,12 @@ const DEVICE_CATEGORY_LABELS: Record<string, string> = {
   mono_rgb: 'RGB Camera',
   stereo_rgb: 'Stereo RGB Camera',
   glove_sensor: 'Glove Sensor',
+  gripper_device: 'UMI Gripper',
 };
 
 const CAMERA_INPUT_TYPES = new Set([
   'mono_camera', 'rgbd_camera', 'rgb_camera', 'fisheye_camera',
-  'stereo_camera', 'stereo_rgbd_camera',
+  'stereo_camera', 'stereo_rgbd_camera', 'gripper_device',
 ]);
 
 function cameraSourceKeys(node: Node<WorkflowNodeData>): string[] {
@@ -236,6 +237,14 @@ function _migrateWorkflowGraph(graph: { nodes?: Node<WorkflowNodeData>[]; edges?
         { key: 'video_right', label: 'Right RGB Video' },
         { key: 'depth', label: 'Depth' },
       ];
+    } else if (nodeType === 'gripper_device') {
+      data.inputs = [];
+      data.outputs = [
+        { key: 'rgb_video', label: 'RGB Video' },
+        { key: 'gripper_state', label: 'ESP Gripper State' },
+        { key: 'slam_trajectory', label: 'SLAM Trajectory' },
+        { key: 'tactile_force_matrices', label: 'Left and Right Force Matrices' },
+      ];
     } else if (nodeType === 'rgb_to_2d_bare_hand'
         || nodeType === 'rgb_to_2d_black_glove') {
       data.inputs = [{ key: 'video', label: 'RGB Video' }];
@@ -264,6 +273,9 @@ function _migrateWorkflowGraph(graph: { nodes?: Node<WorkflowNodeData>[]; edges?
         : '';
     if (resultOutput && sourceHandle === 'result') {
       nextHandle = resultOutput;
+    } else if (sourceType === 'gripper_device'
+        && ['tactile_left', 'tactile_right'].includes(sourceHandle)) {
+      nextHandle = 'tactile_force_matrices';
     } else if (['rgb_to_2d_bare_hand', 'rgb_to_2d_black_glove'].includes(sourceType)
         && sourceHandle.startsWith('hand_3d')) {
       nextHandle = sourceHandle.replace(/^hand_3d/, 'hand_keypoints');
@@ -281,12 +293,24 @@ function _migrateWorkflowGraph(graph: { nodes?: Node<WorkflowNodeData>[]; edges?
     };
   });
 
+  // If both historical tactile ports targeted the same input, their merged
+  // handle represents one connection and must not produce a duplicate edge.
+  const seenGripperEdges = new Set<string>();
+  const dedupedEdges = edges.filter((edge) => {
+    if (sourceTypes.get(edge.source) !== 'gripper_device'
+        || edge.sourceHandle !== 'tactile_force_matrices') return true;
+    const key = `${edge.source}|${edge.sourceHandle}|${edge.target}|${edge.targetHandle || ''}`;
+    if (seenGripperEdges.has(key)) return false;
+    seenGripperEdges.add(key);
+    return true;
+  });
+
   // Existing local drafts may be loaded without a round trip through the API.
   // Keep their RGB-D graph equivalent to the server migration: an RGB-D input
   // card feeds both typed inputs when the old graph already had the video edge.
-  const edgeKeys = new Set(edges.map((edge) =>
+  const edgeKeys = new Set(dedupedEdges.map((edge) =>
     `${edge.source}|${edge.target}|${edge.targetHandle || ''}`));
-  for (const edge of [...edges]) {
+  for (const edge of [...dedupedEdges]) {
     if (edge.targetHandle !== 'video'
         || !['rgbd_camera', 'stereo_rgbd_camera']
           .includes(sourceTypes.get(edge.source) || '')
@@ -296,7 +320,7 @@ function _migrateWorkflowGraph(graph: { nodes?: Node<WorkflowNodeData>[]; edges?
     }
     const key = `${edge.source}|${edge.target}|depth`;
     if (edgeKeys.has(key)) continue;
-    edges.push({
+    dedupedEdges.push({
       ...edge,
       id: `xy-edge__${edge.source}depth-${edge.target}depth`,
       sourceHandle: 'depth',
@@ -304,7 +328,7 @@ function _migrateWorkflowGraph(graph: { nodes?: Node<WorkflowNodeData>[]; edges?
     });
     edgeKeys.add(key);
   }
-  return { nodes, edges };
+  return { nodes, edges: dedupedEdges };
 }
 
 /** 节点数据补齐:用注册表描述符填充缺失的 label/icon/color/端口/configSchema。
@@ -320,10 +344,11 @@ function _hydrateNode(node: Node<WorkflowNodeData>): Node<WorkflowNodeData> {
     'rgbd_to_3d_bare_hand', 'rgb_to_2d_bare_hand',
     'rgbd_to_3d_black_glove', 'rgb_to_2d_black_glove', 'annotation', 'ai_annotation',
     'human_review', 'ai_quality_review', 'lerobot_export', 'hdf5_export',
+    'gripper_device',
   ]);
   const controlledPorts = new Set([
     'rgb_camera', 'mono_camera', 'fisheye_camera', 'rgbd_camera',
-    'stereo_camera', 'stereo_rgbd_camera', 'glove_sensor', 'mediapipe_hand', 'annotation',
+    'stereo_camera', 'stereo_rgbd_camera', 'glove_sensor', 'gripper_device', 'mediapipe_hand', 'annotation',
     'ai_annotation', 'human_review', 'ai_quality_review', 'lerobot_export',
     'hdf5_export',
     'rgbd_to_3d_bare_hand', 'rgb_to_2d_bare_hand',
@@ -414,7 +439,7 @@ export function isConnectionValid(
 
   // 视频类端口兼容:stereo_camera 输出 video_left/video_right,
   // mediapipe_hand 输入是 video —— 同属视频数据,应允许连接。
-  const videoKeys = ['video', 'video_left', 'video_right'];
+  const videoKeys = ['video', 'rgb_video', 'video_left', 'video_right'];
   if (videoKeys.includes(inp.key) && videoKeys.includes(out.key)) return true;
 
   return out.key === inp.key;                   // typed ports must match

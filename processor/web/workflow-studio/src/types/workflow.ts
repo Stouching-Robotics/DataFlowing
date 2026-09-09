@@ -104,7 +104,7 @@ export interface DeviceInputSource {
   /** Standardized UI name; name remains the raw compatibility identifier. */
   display_name?: string;
   kind?: string;
-  device_type?: 'rgbd_camera' | 'stereo_rgbd_camera' | 'mono_rgb' | 'stereo_rgb' | 'glove_sensor' | string;
+  device_type?: 'rgbd_camera' | 'stereo_rgbd_camera' | 'mono_rgb' | 'stereo_rgb' | 'glove_sensor' | 'gripper_device' | string;
   lens?: string;
   label?: string;
   input_type: string;

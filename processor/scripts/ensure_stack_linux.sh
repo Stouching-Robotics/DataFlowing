@@ -57,12 +57,15 @@ while :; do
         continue
     fi
 
-    ensure_unit_started egodata-backend.service
+    # The active installation uses the processor-local API/worker units.
+    # The old egodata-backend/egodata-workers units point at the pre-split
+    # Data Acquisition directory and must not be started after boot.
+    ensure_unit_started egodata-api.service
 
     # Workers must only be started after the API has confirmed both the
     # PostgreSQL tunnel and the remote storage are usable.
     if backend_ready; then
-        ensure_unit_started egodata-workers.service
+        ensure_unit_started egodata-worker.service
     fi
 
     sleep "${sleep_until_ready}"

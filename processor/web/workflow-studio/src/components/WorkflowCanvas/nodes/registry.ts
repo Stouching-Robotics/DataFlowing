@@ -51,6 +51,14 @@ const CANONICAL_PORTS: Record<string, Pick<NodeTypeDescriptor, 'inputs' | 'outpu
   glove_sensor: {
     inputs: [], outputs: [{ key: 'sensor_data', label: 'Glove Sensor Data' }],
   },
+  gripper_device: {
+    inputs: [], outputs: [
+      { key: 'rgb_video', label: 'RGB Video' },
+      { key: 'gripper_state', label: 'ESP Gripper State' },
+      { key: 'slam_trajectory', label: 'SLAM Trajectory' },
+      { key: 'tactile_force_matrices', label: 'Left and Right Force Matrices' },
+    ],
+  },
   mediapipe_hand: {
     inputs: [{ key: 'video', label: 'RGB Video' }],
     outputs: [{ key: 'hand_keypoints', label: 'Hand 2D' }],
@@ -250,6 +258,19 @@ const BUILTIN: NodeTypeDescriptor[] = [
     inputs: [],
     outputs: [{ key: 'sensor_data', label: 'Glove Sensor Data' }],
     defaultConfig: { source_key: '', device: 'SenseGlove', hand: 'both', fps: 60 },
+  },
+  {
+    type: 'gripper_device', category: 'input', label: 'UMI Gripper',
+    icon: 'ant-design:robot-outlined', color: MODULE_COLORS.input,
+    description: 'Composite acquisition source. Publishes one gripper RGB video, ESP32 grip state, SLAM trajectory, and paired left/right 250×250×3 force matrices to downstream workflow nodes.',
+    inputs: [],
+    outputs: [
+      { key: 'rgb_video', label: 'RGB Video' },
+      { key: 'gripper_state', label: 'ESP Gripper State' },
+      { key: 'slam_trajectory', label: 'SLAM Trajectory' },
+      { key: 'tactile_force_matrices', label: 'Left and Right Force Matrices' },
+    ],
+    defaultConfig: { source_key: '', fps: 30 },
   },
   // ── Process ──
   {

@@ -642,6 +642,20 @@ def episode_media_groups(episode_id: str):
         """单个原始视频条目;手部骨骼由前端 SVG 覆盖层显示。"""
         cam = item["source_key"]
         stream = streams.get(cam) or {}
+        video_cache_key = None
+        try:
+            raw_path = Path(str(stream.get("path") or ""))
+            candidates = [raw_path] if raw_path.is_absolute() else [
+                batch_dir / raw_path,
+                batch_dir.parents[1] / raw_path,
+            ]
+            for video_path in candidates:
+                if video_path.is_file():
+                    stat = video_path.stat()
+                    video_cache_key = f"{stat.st_size:x}-{stat.st_mtime_ns:x}"
+                    break
+        except OSError:
+            pass
         entry = {
             "source_key": cam,
             "role": item.get("role", "primary"),
@@ -654,6 +668,7 @@ def episode_media_groups(episode_id: str):
             # raw endpoint remains available for download/diagnostics.
             "stream_url": f"/api/v1/video/{episode_id}/{cam}/preview-stream",
             "raw_stream_url": f"/api/v1/video/{episode_id}/{cam}/stream",
+            "video_cache_key": video_cache_key,
         }
         return entry
 
@@ -666,6 +681,7 @@ def episode_media_groups(episode_id: str):
             "label": entry["label"],
             "stream_url": entry["stream_url"],
             "raw_stream_url": entry.get("raw_stream_url"),
+            "video_cache_key": entry.get("video_cache_key"),
             "frame_count": entry["frame_count"],
             "fps": entry["fps"],
         }

@@ -11,6 +11,7 @@ const CAMERA_TYPES = [
   'mono_camera', 'rgbd_camera', 'rgb_camera', 'fisheye_camera',
   'stereo_camera', 'stereo_rgbd_camera',
 ];
+const DEVICE_INPUT_TYPES = [...CAMERA_TYPES, 'gripper_device'];
 const DEPTH_PROCESS_TYPES = ['rgbd_to_3d_bare_hand', 'rgbd_to_3d_black_glove'];
 
 const DEVICE_CATEGORY_LABELS: Record<string, string> = {
@@ -19,6 +20,7 @@ const DEVICE_CATEGORY_LABELS: Record<string, string> = {
   mono_rgb: 'RGB Camera',
   stereo_rgb: 'Stereo RGB Camera',
   glove_sensor: 'Glove Sensor',
+  gripper_device: 'UMI Gripper',
 };
 
 function cameraCategoryLabel(data: WorkflowNodeData): string {
@@ -30,6 +32,7 @@ function cameraCategoryLabel(data: WorkflowNodeData): string {
   if (data.nodeType === 'rgbd_camera') return DEVICE_CATEGORY_LABELS.rgbd_camera;
   if (data.nodeType === 'mono_camera' || data.nodeType === 'rgb_camera'
       || data.nodeType === 'fisheye_camera') return DEVICE_CATEGORY_LABELS.mono_rgb;
+  if (data.nodeType === 'gripper_device') return DEVICE_CATEGORY_LABELS.gripper_device;
   const byType = data.device_type ? DEVICE_CATEGORY_LABELS[String(data.device_type)] : '';
   if (byType) return byType;
   const stored = String(data.device_display_name || '');
@@ -40,7 +43,7 @@ function cameraCategoryLabel(data: WorkflowNodeData): string {
 export const WorkflowNodeComponent = memo(function WorkflowNodeComponent({ data, selected, id }: NodeProps) {
   const d = data as unknown as WorkflowNodeData;
   const hdrColor = d.color || '#475569';
-  const isCamera = CAMERA_TYPES.includes(d.nodeType);
+  const isCamera = DEVICE_INPUT_TYPES.includes(d.nodeType);
   // 画布节点悬停说明:与侧边栏一致(功能 + 可连接性)
   const desc = getNodeType(d.nodeType)?.description;
   const topField = getTopConfigField(d);
@@ -145,7 +148,9 @@ export const WorkflowNodeComponent = memo(function WorkflowNodeComponent({ data,
       config.position = value;
       if (selectedSource) {
         config.device_name = selectedSource.name;
-        if (selectedSource.input_type === 'stereo_camera'
+        if (selectedSource.input_type === 'gripper_device') {
+          config.source_keys = selectedSource.source_keys.join(',');
+        } else if (selectedSource.input_type === 'stereo_camera'
             || selectedSource.input_type === 'stereo_rgbd_camera') {
           config.source_keys = selectedSource.source_keys.join(',');
         } else {
@@ -316,6 +321,7 @@ function sourceMatchesCameraType(
   if (nodeType === 'rgbd_camera') return category === 'rgbd_camera';
   if (nodeType === 'stereo_camera') return category === 'stereo_rgb';
   if (nodeType === 'glove_sensor') return category === 'glove_sensor';
+  if (nodeType === 'gripper_device') return category === 'gripper_device';
   if (storedDeviceType && String(storedDeviceType) === 'rgbd_camera') {
     return category === 'rgbd_camera';
   }
@@ -326,7 +332,7 @@ function sourceMatchesCameraType(
 
 function getTopConfigField(data: WorkflowNodeData): ConfigField | null {
   const schema = data.configSchema || [];
-  if (CAMERA_TYPES.includes(data.nodeType)) {
+  if (DEVICE_INPUT_TYPES.includes(data.nodeType)) {
     return schema.find((field) => field.name === 'source_key') || {
       name: 'source_key', type: 'string', label: 'Source key',
       default: data.config?.source_key || data.config?.position || '',

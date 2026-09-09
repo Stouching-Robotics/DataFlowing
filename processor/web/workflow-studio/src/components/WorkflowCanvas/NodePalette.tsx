@@ -8,7 +8,7 @@ const LEGACY_INPUT_TYPES = ['rgb_camera', 'fisheye_camera'];
 // 新工作流始终从这组稳定的采集端分类开始。真实设备名称由工作流卡片
 // 内部的 source_key 控件从项目上传/心跳数据中选择,不作为调色板卡片。
 const FIXED_INPUT_TYPES = [
-  'glove_sensor', 'mono_camera', 'rgbd_camera', 'stereo_camera', 'stereo_rgbd_camera',
+  'gripper_device', 'glove_sensor', 'mono_camera', 'rgbd_camera', 'stereo_camera', 'stereo_rgbd_camera',
 ];
 // MediaPipe Hand is retained as a backend/old-workflow compatibility node;
 // the current hand modules are exposed through the canonical process cards.

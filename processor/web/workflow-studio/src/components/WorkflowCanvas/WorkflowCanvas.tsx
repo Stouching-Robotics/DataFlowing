@@ -40,7 +40,13 @@ export function WorkflowCanvas() {
     }
     const sourceKeys = deviceSource?.source_keys || [];
     const sourceConfig = deviceSource
-      ? (deviceSource.input_type === 'stereo_camera'
+      ? (deviceSource.input_type === 'gripper_device'
+        ? {
+            source_keys: sourceKeys.join(','),
+            source_key: deviceSource.source_key || sourceKeys[0] || '',
+            position: deviceSource.source_key || sourceKeys[0] || '',
+          }
+        : deviceSource.input_type === 'stereo_camera'
         || deviceSource.input_type === 'stereo_rgbd_camera')
         ? {
             source_keys: sourceKeys.join(','),

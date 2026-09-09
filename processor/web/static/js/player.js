@@ -1,5 +1,5 @@
 /* Plyr video player management */
-console.log('[player.js] build 202609030900-sync-barrier-central-clock');
+console.log('[player.js] build 202609091912-tactile-chunk-prefetch');
 
 const players = {};  // {camera_name: Plyr instance}
 let currentEpisodeId = null;
@@ -58,6 +58,8 @@ function _cancelEpisodeMediaLoad(clearCanvas = true) {
     currentImageTiles = [];
     currentDepthPreviewTiles = [];
     currentHand3dTiles = [];
+    currentSlamTiles = [];
+    currentTactileTiles = [];
     workspaceGrid = null;
     workspaceMainRow = null;
     workspaceHandFooter = null;
@@ -172,6 +174,15 @@ let hand3dFrameCacheBySource = {};
 let _hand3dTileEntry = null;    // 3D tile 引用,懒加载回调重绘用
 let currentHand3dTiles = [];    // 画布中的 3D 骨骼 tile {canvas, source, rotX, rotY, ...}
 let currentDepthPreviewTiles = []; // raw uint16 depth codes + frontend Canvas
+let currentTactileTiles = [];   // 左右力矩阵合并预览,按统一帧号刷新
+let slamData = null;             // /slam-trajectory response for current episode
+let slamFramesByIndex = {};
+let slamWindowInflight = null;
+let currentSlamTiles = [];        // 画布中的 SLAM 轨迹 tile
+let tactileMatrixData = null;    // /tactile-matrix-meta response
+const SLAM_DISPLAY_SMOOTH_ALPHA = 0.35;
+const SLAM_DISPLAY_JOIN_GAP_FRAMES = 3;
+const SLAM_DISPLAY_CAMERA_DISTANCE_SCALE = 1.55;
 const _depthLittleEndian = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
 // Keep one recently-used complete raw-code buffer across episode clicks. The
 // decoded D435 stream is large, so bound this cache to one typical episode;
@@ -257,6 +268,74 @@ const DEPTH_FULL_PRELOAD = true;
 // now covers every episode recorded so far.  Clips beyond this fall back to
 // the strict all-windows preload barrier instead.
 const DEPTH_FULL_PRELOAD_MAX_FRAMES = 2000;
+
+// Complete browser-side video blobs make arbitrary progress-bar seeks local
+// and keep the rendered depth preview on the same seek timeline as RGB.
+const _browserVideoAssetCache = new Map();
+const BROWSER_VIDEO_ASSET_CACHE_MAX = 4;
+
+function _browserVideoAssetUrl(source, fallbackUrl) {
+    const url = String(fallbackUrl || '');
+    if (!url) return '';
+    const revision = source && (
+        source.depth_cache_key || source.video_cache_key || source.cache_key);
+    if (!revision || /(?:^|[?&])v=/.test(url)) return url;
+    return `${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(revision)}`;
+}
+
+async function _preloadBrowserVideoAsset(source, fallbackUrl, sessionToken) {
+    const episodeAtRequest = currentEpisodeId;
+    const tokenAtRequest = sessionToken == null
+        ? _playbackSessionToken : sessionToken;
+    const isActive = () => isCurrentPlaybackSession(
+        episodeAtRequest, tokenAtRequest);
+    if (!isActive()) return null;
+    const url = _browserVideoAssetUrl(source, fallbackUrl);
+    if (!url) return null;
+    const key = `${episodeAtRequest}:${source?.kind || 'video'}:` +
+        `${source?.source_key || ''}:${url}`;
+    const existing = _browserVideoAssetCache.get(key);
+    if (existing?.url) return existing.url;
+    if (existing?.promise) return existing.promise;
+
+    const promise = (async () => {
+        try {
+            const response = await fetch(url, {
+                cache: 'force-cache',
+                signal: getMediaLoadSignal() || undefined,
+            });
+            if (!response.ok) throw new Error(`video preload failed: ${response.status}`);
+            const blob = await response.blob();
+            if (!isActive()) return null;
+            const objectUrl = URL.createObjectURL(blob);
+            _browserVideoAssetCache.set(key, {
+                url: objectUrl, bytes: blob.size, ready: true,
+            });
+            while (_browserVideoAssetCache.size > BROWSER_VIDEO_ASSET_CACHE_MAX) {
+                const oldestKey = _browserVideoAssetCache.keys().next().value;
+                const oldest = _browserVideoAssetCache.get(oldestKey);
+                if (oldest?.url) URL.revokeObjectURL(oldest.url);
+                _browserVideoAssetCache.delete(oldestKey);
+            }
+            return objectUrl;
+        } catch (error) {
+            if (isActive()) {
+                console.warn('[player] complete video preload failed; fallback to range stream', error);
+            }
+            return null;
+        } finally {
+            const state = _browserVideoAssetCache.get(key);
+            if (state?.promise) {
+                if (state.url) _browserVideoAssetCache.set(key, {
+                    url: state.url, bytes: state.bytes, ready: true,
+                });
+                else _browserVideoAssetCache.delete(key);
+            }
+        }
+    })();
+    _browserVideoAssetCache.set(key, { promise });
+    return promise;
+}
 
 let _depthPlaybackStall = null;
 
@@ -756,6 +835,11 @@ window.invalidateEpisodePlaybackCache = function (episodeId) {
     for (const key of _hand3dFullCache.keys()) {
         if (key.startsWith(prefix)) _hand3dFullCache.delete(key);
     }
+    if (currentEpisodeId === episodeId) {
+        slamData = null;
+        slamFramesByIndex = {};
+        slamWindowInflight = null;
+    }
     if (window.EgoMediaCache && episodeId) {
         window.EgoMediaCache.removeEpisode(episodeId).catch(() => {});
     }
@@ -817,55 +901,88 @@ function _hand3dCached(frame, sourceKey) {
     return fr ? { h0: fr.h0 || null, h1: fr.h1 || null } : null;
 }
 
-function _hand3dFullCacheKey(sourceKey) {
-    return `${currentEpisodeId || ''}:${sourceKey || 'default'}`;
+function _hand3dArtifactRevision(sourceKey) {
+    const source = sourceKey || 'default';
+    const data = hand3dDataBySource[source] || hand3dData;
+    return String(data && data.artifact_revision || 'unknown');
 }
 
-function _restoreHand3DFull(cache, sourceKey) {
-    const saved = _hand3dFullCache.get(_hand3dFullCacheKey(sourceKey));
-    if (!saved || !saved.frames) return false;
+function _hand3dFullCacheKey(sourceKey, artifactRevision = null) {
+    const revision = artifactRevision == null
+        ? _hand3dArtifactRevision(sourceKey) : String(artifactRevision);
+    return `${currentEpisodeId || ''}:${sourceKey || 'default'}:${revision}`;
+}
+
+function _restoreHand3DFull(cache, sourceKey, artifactRevision) {
+    const saved = _hand3dFullCache.get(
+        _hand3dFullCacheKey(sourceKey, artifactRevision));
+    if (!saved || !saved.frames
+            || String(saved.artifactRevision || 'unknown') !== String(artifactRevision)) {
+        return false;
+    }
     cache.frames = saved.frames;
     cache.start = 0;
     cache.end = Math.max(0, Number(saved.count || 0) - 1);
     cache.fullReady = true;
+    cache.fullArtifactRevision = String(artifactRevision);
     return true;
 }
 
-function _rememberHand3DFull(cache, sourceKey, count) {
-    const key = _hand3dFullCacheKey(sourceKey);
+function _rememberHand3DFull(cache, sourceKey, count, artifactRevision) {
+    const key = _hand3dFullCacheKey(sourceKey, artifactRevision);
     _hand3dFullCache.delete(key);
-    _hand3dFullCache.set(key, { frames: cache.frames, count });
+    _hand3dFullCache.set(key, {
+        frames: cache.frames, count,
+        artifactRevision: String(artifactRevision),
+    });
     while (_hand3dFullCache.size > HAND3D_FULL_CACHE_MAX_EPISODES) {
         _hand3dFullCache.delete(_hand3dFullCache.keys().next().value);
     }
 }
 
-async function fetchHand3DFull(sourceKey) {
+async function fetchHand3DFull(sourceKey, sessionToken = _playbackSessionToken) {
     const source = sourceKey || 'default';
+    const episodeAtRequest = currentEpisodeId;
+    const tokenAtRequest = sessionToken;
+    const isActive = () => isCurrentPlaybackSession(
+        episodeAtRequest, tokenAtRequest);
+    if (!isActive()) return false;
     const cache = _hand3dCacheFor(source);
-    if (cache.fullReady) return true;
-    if (_restoreHand3DFull(cache, source)) return true;
-    if (cache.fullInflight) return cache.fullInflight;
     const data = hand3dDataBySource[source] || hand3dData;
+    const artifactRevision = String(
+        data && data.artifact_revision || 'unknown');
+    if (cache.fullReady
+            && String(cache.fullArtifactRevision || 'unknown')
+                === artifactRevision) {
+        return true;
+    }
+    if (cache.fullReady) cache.fullReady = false;
+    if (_restoreHand3DFull(cache, source, artifactRevision)) return true;
+    if (cache.fullInflight) return cache.fullInflight;
     const count = Number(data && data.count || 0);
     if (!count || count > HAND3D_FULL_PRELOAD_MAX_FRAMES) return false;
-    const episodeAtRequest = currentEpisodeId;
     const signal = getMediaLoadSignal();
-    const persistentKey = `${episodeAtRequest}:hand3d:${source}:${count}`;
+    const persistentKey = `${episodeAtRequest}:hand3d:${source}:${count}:${artifactRevision}`;
     cache.fullInflight = (async () => {
         try {
             if (window.EgoMediaCache) {
                 const saved = await window.EgoMediaCache.get(persistentKey);
+                if (!isActive()) return false;
                 const value = saved && saved.value;
                 if (value && Array.isArray(value.frames)
-                        && Number(value.count || 0) === count) {
+                        && Number(value.count || 0) === count
+                        && String(value.artifact_revision || 'unknown')
+                            === artifactRevision) {
                     const frames = {};
                     value.frames.forEach(fr => { frames[fr.f] = fr; });
+                    if (!isActive()) return false;
                     cache.frames = frames;
                     cache.start = 0;
                     cache.end = Math.max(0, count - 1);
                     cache.fullReady = true;
-                    _rememberHand3DFull(cache, source, count);
+                    cache.fullArtifactRevision = artifactRevision;
+                    _rememberHand3DFull(
+                        cache, source, count, artifactRevision);
                     return true;
                 }
             }
@@ -873,19 +990,26 @@ async function fetchHand3DFull(sourceKey) {
                 `/api/v1/video/${episodeAtRequest}/hand-3d?source_key=`
                 + `${encodeURIComponent(source)}&start_frame=0&end_frame=${count - 1}`,
                 signal ? { signal } : {});
-            if (!res.ok || currentEpisodeId !== episodeAtRequest) return false;
+            if (!res.ok || !isActive()) return false;
             const payload = await res.json();
-            if (currentEpisodeId !== episodeAtRequest) return false;
+            if (!isActive()) return false;
+            if (String(payload && payload.artifact_revision || 'unknown')
+                    !== artifactRevision) return false;
             const frames = {};
             (payload.frames || []).forEach(fr => { frames[fr.f] = fr; });
+            if (!isActive()) return false;
             cache.frames = frames;
             cache.start = 0;
             cache.end = Math.max(0, count - 1);
             cache.fullReady = true;
-            _rememberHand3DFull(cache, source, count);
-            if (window.EgoMediaCache) {
+            cache.fullArtifactRevision = artifactRevision;
+            _rememberHand3DFull(
+                cache, source, count, artifactRevision);
+            if (window.EgoMediaCache && isActive()) {
                 window.EgoMediaCache.put(persistentKey, {
-                    frames: payload.frames || [], count,
+                    frames: payload.frames || [],
+                    count,
+                    artifact_revision: artifactRevision,
                 });
             }
             return true;
@@ -1048,12 +1172,16 @@ function groupedSourceLabel(source) {
     if (source.kind === 'skeleton') return `${source.label || source.source_key} · ${t('skeleton_suffix')}`;
     if (source.kind === 'glove') return source.label || `${source.source_key} · ${t('glove_suffix')}`;
     if (source.kind === 'depth') return source.label || `${source.source_key} · ${t('depth_suffix')}`;
+    if (source.kind === 'slam_trajectory') return source.label || 'SLAM';
+    if (source.kind === 'tactile_force_left') return 'Left';
+    if (source.kind === 'tactile_force_right') return 'Right';
     if (source.kind === 'stereo_group') return `${source.label} · ${t('stereo_pair')}`;
     return source.label || source.source_key || t('video_suffix');
 }
 
 function _isBottomSource(source) {
-    return ['hand', 'depth', 'glove'].includes(source.kind);
+    return ['hand', 'depth', 'glove', 'tactile_force_left',
+        'tactile_force_right'].includes(source.kind);
 }
 
 function groupedSource(kind, source_key, meta) {
@@ -1065,7 +1193,8 @@ function expandWorkspaceItems(source) {
     if (source.kind === 'stereo_group') {
         return (source.members || []).map(m => ({
             kind: 'video', source_key: m.source_key, label: m.label,
-            stream_url: m.stream_url, frame_count: m.frame_count, fps: m.fps,
+            stream_url: m.stream_url, video_cache_key: m.video_cache_key,
+            frame_count: m.frame_count, fps: m.fps,
         }));
     }
     return [{ ...source }];
@@ -1166,6 +1295,10 @@ function removeGroupedSource(source) {
     currentImageTiles = currentImageTiles.filter(entry =>
         groupedSourceKey(entry.source) !== key);
     currentDepthPreviewTiles = currentDepthPreviewTiles.filter(entry =>
+        groupedSourceKey(entry.source) !== key);
+    currentSlamTiles = currentSlamTiles.filter(entry =>
+        groupedSourceKey(entry.source) !== key);
+    currentTactileTiles = currentTactileTiles.filter(entry =>
         groupedSourceKey(entry.source) !== key);
     workspaceSources = workspaceSources.filter(item => groupedSourceKey(item) !== key);
     renderSourceBar();
@@ -1374,6 +1507,7 @@ function _serializeSource(source) {
         depth_codes_url: source.depth_codes_url,
         raw_depth_url: source.raw_depth_url,
         depth_cache_key: source.depth_cache_key,
+        video_cache_key: source.video_cache_key,
         // Optional grayscale clock stream; never used as depth pixels.
         depth_video_url: source.depth_video_url,
         missing_frames: source.missing_frames,
@@ -1389,9 +1523,479 @@ function _frameUrl(urlTemplate, frameIndex) {
     return urlTemplate.replace('{frame}', Math.max(0, frameIndex));
 }
 
+function _tactileForceAt(frame, side) {
+    const map = tactileMatrixData?._forceByFrame;
+    const value = map && map[String(Math.max(0, Number(frame) || 0))]?.[side];
+    if (!Array.isArray(value) || value.length < 3
+            || !value.slice(0, 3).every(item => Number.isFinite(Number(item)))) {
+        return null;
+    }
+    const fx = Number(value[0]);
+    const fy = Number(value[1]);
+    const fz = Number(value[2]);
+    return { fx, fy, fz, magnitude: Math.hypot(fx, fy, fz) };
+}
+
+function _updateTactileForceTile(entry, frame) {
+    if (!entry) return;
+    const force = _tactileForceAt(frame, entry.source.side);
+    if (entry.forceValue) {
+        if (!force) {
+            entry.forceValue.textContent = 'Fx — · Fy — · Fz —';
+            entry.forceValue.title = 'Force data unavailable';
+        } else {
+            entry.forceValue.textContent =
+                `Fx ${Math.round(force.fx).toLocaleString()} · `
+                + `Fy ${Math.round(force.fy).toLocaleString()} · `
+                + `Fz ${Math.round(force.fz).toLocaleString()}`;
+            entry.forceValue.title =
+                `fx ${force.fx.toFixed(1)} · fy ${force.fy.toFixed(1)} · `
+                + `fz ${force.fz.toFixed(1)} mN`;
+        }
+    }
+    _renderTactileForceCurve(entry, frame);
+}
+
+// Fx/Fy/Fz history for one side across the whole episode, with a playhead at
+// the current frame. Colours follow the acquisition-side ForceCurveWidget.
+const TACTILE_FORCE_COLORS = ['#4fc3f7', '#aed581', '#ff8a65'];
+
+function _forceSeriesIndex(frame) {
+    const series = tactileMatrixData?.force_series;
+    if (!series || !Array.isArray(series.frames)) return null;
+    if (!tactileMatrixData._frameIndex) {
+        const map = new Map();
+        series.frames.forEach((value, index) => map.set(Number(value), index));
+        tactileMatrixData._frameIndex = map;
+    }
+    const index = tactileMatrixData._frameIndex.get(Math.round(Number(frame)));
+    return index === undefined ? null : index;
+}
+
+function _renderTactileForceCurve(entry, frame) {
+    const canvas = entry?.curveCanvas;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const width = Math.max(1, rect.width), height = Math.max(1, rect.height);
+    if (rect.width < 2 || rect.height < 2) {
+        // The tile is built before it is attached to the workspace, so the
+        // first call can run before layout. Retry once the layout exists.
+        if (!entry._curveRetry) {
+            entry._curveRetry = true;
+            requestAnimationFrame(() => {
+                entry._curveRetry = false;
+                _renderTactileForceCurve(entry, frame);
+            });
+        }
+        return;
+    }
+    const dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.round(width * dpr)
+            || canvas.height !== Math.round(height * dpr)) {
+        canvas.width = Math.round(width * dpr);
+        canvas.height = Math.round(height * dpr);
+    }
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+
+    const series = tactileMatrixData?.force_series?.[entry.source.side];
+    if (!Array.isArray(series) || !series.length) return;
+
+    const pad = { l: 4, r: 4, t: 8, b: 4 };
+    const innerW = width - pad.l - pad.r;
+    const innerH = height - pad.t - pad.b;
+    // Symmetric auto range: p99.5 of |value| rounded up to 500 mN, so the
+    // fixed +/-3000 mN range of the acquisition widget does not clip our data.
+    if (!entry._curveRange) {
+        const samples = [];
+        series.forEach(value => {
+            if (!value) return;
+            for (let axis = 0; axis < 3; axis++) {
+                const item = Math.abs(Number(value[axis]));
+                if (Number.isFinite(item)) samples.push(item);
+            }
+        });
+        samples.sort((a, b) => a - b);
+        const p995 = samples.length
+            ? samples[Math.min(samples.length - 1, Math.floor(samples.length * 0.995))]
+            : 0;
+        entry._curveRange = Math.max(500, Math.ceil(p995 / 500) * 500);
+    }
+    const range = entry._curveRange;
+    const mid = pad.t + innerH / 2;
+    const Y = value => mid - (value / range) * (innerH / 2) * 0.92;
+    const X = index => pad.l + (series.length <= 1
+        ? 0 : (index / (series.length - 1)) * innerW);
+
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(148,163,184,0.16)';
+    [0.5, -0.5].forEach(frac => {
+        const y = Y(frac * range);
+        ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(width - pad.r, y); ctx.stroke();
+    });
+    ctx.strokeStyle = 'rgba(148,163,184,0.38)';
+    ctx.beginPath();
+    ctx.moveTo(pad.l, mid); ctx.lineTo(width - pad.r, mid);
+    ctx.stroke();
+
+    for (let axis = 0; axis < 3; axis++) {
+        ctx.strokeStyle = TACTILE_FORCE_COLORS[axis];
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        let started = false;
+        series.forEach((value, index) => {
+            const item = value ? Number(value[axis]) : NaN;
+            if (!Number.isFinite(item)) { started = false; return; }
+            const x = X(index), y = Y(item);
+            if (!started) { ctx.moveTo(x, y); started = true; }
+            else { ctx.lineTo(x, y); }
+        });
+        ctx.stroke();
+    }
+
+    const headIndex = _forceSeriesIndex(frame);
+    if (headIndex !== null) {
+        const head = X(headIndex);
+        ctx.strokeStyle = 'rgba(248,250,252,0.85)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(head, pad.t - 3); ctx.lineTo(head, height - pad.b);
+        ctx.stroke();
+    }
+}
+
+function _createTactileWebGLRenderer(canvas) {
+    const gl = canvas.getContext('webgl2', {
+        alpha: false, antialias: false, premultipliedAlpha: false,
+    });
+    if (!gl) return null;
+    const vertexSource = `#version 300 es
+        in vec2 a_position;
+        out vec2 v_uv;
+        void main() {
+            v_uv = a_position * 0.5 + 0.5;
+            gl_Position = vec4(a_position, 0.0, 1.0);
+        }`;
+    const fragmentSource = `#version 300 es
+        precision highp float;
+        uniform sampler2D u_force_field;
+        uniform float u_zoom;
+        uniform vec2 u_pan;
+        in vec2 v_uv;
+        out vec4 out_color;
+        vec3 jet(float x) {
+            return clamp(vec3(
+                1.5 - abs(4.0 * x - 3.0),
+                1.5 - abs(4.0 * x - 2.0),
+                1.5 - abs(4.0 * x - 1.0)
+            ), 0.0, 1.0);
+        }
+        void main() {
+            // Zoom/pan happen in screen-uv space; the field itself is 250x250.
+            vec2 uv = (v_uv - 0.5) / u_zoom + 0.5 + u_pan;
+            if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+                out_color = vec4(0.0039, 0.0039, 0.502, 1.0);
+                return;
+            }
+            // Matrix row 0 is the top of the sensor; WebGL texture v=0 is
+            // the bottom, so flip only the sampling coordinate. The field is
+            // uploaded already normalised to 0..1 (R8), so no rescaling here.
+            float value = texture(u_force_field, vec2(uv.x, 1.0 - uv.y)).r;
+            out_color = vec4(jet(clamp(value, 0.0, 1.0)), 1.0);
+        }`;
+    const compile = (type, source) => {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+            console.warn('[player] tactile WebGL shader failed',
+                gl.getShaderInfoLog(shader));
+            gl.deleteShader(shader);
+            return null;
+        }
+        return shader;
+    };
+    const vertex = compile(gl.VERTEX_SHADER, vertexSource);
+    const fragment = compile(gl.FRAGMENT_SHADER, fragmentSource);
+    if (!vertex || !fragment) return null;
+    const program = gl.createProgram();
+    gl.attachShader(program, vertex);
+    gl.attachShader(program, fragment);
+    gl.linkProgram(program);
+    gl.deleteShader(vertex);
+    gl.deleteShader(fragment);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        console.warn('[player] tactile WebGL program failed',
+            gl.getProgramInfoLog(program));
+        gl.deleteProgram(program);
+        return null;
+    }
+    const position = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, position);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+        -1, -1, 1, -1, -1, 1, 1, 1,
+    ]), gl.STATIC_DRAW);
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return {
+        gl, program, position, texture,
+        positionLocation: gl.getAttribLocation(program, 'a_position'),
+        fieldLocation: gl.getUniformLocation(program, 'u_force_field'),
+        zoomLocation: gl.getUniformLocation(program, 'u_zoom'),
+        panLocation: gl.getUniformLocation(program, 'u_pan'),
+        field: null,
+        zoom: 1, pan: [0, 0], filter: null,
+        render(field = null, min = 0, max = 1) {
+            if (field) {
+                // R32F float textures are not filterable without
+                // OES_texture_float_linear; without it every sample returns 0
+                // and the whole tile renders as JET(0) - a flat dark blue that
+                // is indistinguishable from the background. Normalising to
+                // 8-bit here keeps the texture in the always-filterable R8
+                // format, so LINEAR/NEAREST both work on every driver.
+                if (field instanceof Float32Array) {
+                    const lo = Number.isFinite(Number(min)) ? Number(min) : 0;
+                    const hi = Number.isFinite(Number(max)) ? Number(max) : 1;
+                    const span = Math.max(hi - lo, 1e-6);
+                    const bytes = new Uint8Array(field.length);
+                    for (let i = 0; i < field.length; i++) {
+                        const value = (field[i] - lo) / span;
+                        bytes[i] = value <= 0 ? 0
+                            : value >= 1 ? 255 : Math.round(value * 255);
+                    }
+                    this.field = bytes;
+                } else {
+                    this.field = field;
+                }
+            }
+            const rect = canvas.getBoundingClientRect();
+            const dpr = window.devicePixelRatio || 1;
+            const width = Math.max(1, Math.round(rect.width * dpr));
+            const height = Math.max(1, Math.round(rect.height * dpr));
+            if (canvas.width !== width || canvas.height !== height) {
+                canvas.width = width;
+                canvas.height = height;
+            }
+            gl.viewport(0, 0, width, height);
+            gl.clearColor(0.0039, 0.0039, 0.502, 1.0);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            if (!this.field) return;
+            gl.useProgram(program);
+            gl.bindBuffer(gl.ARRAY_BUFFER, position);
+            gl.enableVertexAttribArray(this.positionLocation);
+            gl.vertexAttribPointer(this.positionLocation, 2, gl.FLOAT, false, 0, 0);
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            // One texel is one sensor cell. Sample NEAREST as soon as a cell
+            // covers at least one screen pixel (crisp cells, like the
+            // acquisition demo), and LINEAR only when shrinking - a NEAREST
+            // minification would drop isolated contact cells entirely.
+            const texelsPerPixel = (width / 250) * (this.zoom || 1);
+            const filter = texelsPerPixel >= 1 ? gl.NEAREST : gl.LINEAR;
+            if (this.filter !== filter) {
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+                this.filter = filter;
+            }
+            gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+            gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);   // 250-wide R8 rows
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, 250, 250, 0,
+                gl.RED, gl.UNSIGNED_BYTE, this.field);
+            gl.uniform1i(this.fieldLocation, 0);
+            gl.uniform1f(this.zoomLocation, this.zoom || 1);
+            gl.uniform2f(this.panLocation,
+                this.pan ? this.pan[0] : 0, this.pan ? this.pan[1] : 0);
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        },
+    };
+}
+
+// Wheel zoom / drag pan / double-click reset for one tactile matrix tile.
+// One texture texel is one sensor cell, so zooming in reveals the individual
+// contact cells that the whole-field view averages away (same interaction as
+// the acquisition-side demo viewer).
+function _tactileScreenUv(canvas, clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    return [
+        (clientX - rect.left) / Math.max(1, rect.width),
+        1 - (clientY - rect.top) / Math.max(1, rect.height),
+    ];
+}
+
+function _clampTactileView(renderer) {
+    const limit = Math.max(0, (1 - 1 / renderer.zoom) / 2);
+    renderer.pan[0] = Math.max(-limit, Math.min(limit, renderer.pan[0]));
+    renderer.pan[1] = Math.max(-limit, Math.min(limit, renderer.pan[1]));
+}
+
+function initTactileView(entry) {
+    const canvas = entry?.canvas;
+    const renderer = entry?.renderer;
+    if (!canvas || !renderer) return;
+    const maxZoom = 12;
+    canvas.addEventListener('wheel', event => {
+        event.preventDefault();
+        const [u, v] = _tactileScreenUv(canvas, event.clientX, event.clientY);
+        const before = 1 / renderer.zoom;
+        renderer.zoom = Math.max(1, Math.min(maxZoom,
+            renderer.zoom * (event.deltaY < 0 ? 1.2 : 1 / 1.2)));
+        const delta = before - 1 / renderer.zoom;
+        renderer.pan[0] += (u - 0.5) * delta;
+        renderer.pan[1] += (v - 0.5) * delta;
+        _clampTactileView(renderer);
+        canvas.style.cursor = renderer.zoom > 1 ? 'grab' : 'default';
+        renderer.render();
+    }, { passive: false });
+    canvas.addEventListener('pointerdown', event => {
+        if (event.button !== 0 || renderer.zoom <= 1) return;
+        entry._panDrag = { x: event.clientX, y: event.clientY };
+        canvas.style.cursor = 'grabbing';
+        if (canvas.setPointerCapture) canvas.setPointerCapture(event.pointerId);
+        event.preventDefault();
+    });
+    canvas.addEventListener('pointermove', event => {
+        if (!entry._panDrag) return;
+        const rect = canvas.getBoundingClientRect();
+        renderer.pan[0] -= (event.clientX - entry._panDrag.x)
+            / Math.max(1, rect.width) / renderer.zoom;
+        renderer.pan[1] += (event.clientY - entry._panDrag.y)
+            / Math.max(1, rect.height) / renderer.zoom;
+        entry._panDrag = { x: event.clientX, y: event.clientY };
+        _clampTactileView(renderer);
+        renderer.render();
+    });
+    const endPan = event => {
+        if (!entry._panDrag) return;
+        entry._panDrag = null;
+        canvas.style.cursor = renderer.zoom > 1 ? 'grab' : 'default';
+        if (event && canvas.hasPointerCapture
+                && canvas.hasPointerCapture(event.pointerId)) {
+            canvas.releasePointerCapture(event.pointerId);
+        }
+    };
+    canvas.addEventListener('pointerup', endPan);
+    canvas.addEventListener('pointercancel', endPan);
+    canvas.addEventListener('dblclick', () => {
+        renderer.zoom = 1;
+        renderer.pan = [0, 0];
+        canvas.style.cursor = 'default';
+        renderer.render();
+    });
+}
+
+// One chunk = 96 frames of 250x250 R8 = 6 MB per request. The old code issued
+// one 250 KB request per frame per side (15 MB/s during playback), which
+// saturated the browser's socket buffers (net::ERR_NO_BUFFER_SPACE). Chunks
+// are cached in memory, so playback and scrubbing need no network at all.
+const TACTILE_CHUNK_FRAMES = 96;
+const TACTILE_FIELD_STRIDE = 250 * 250;
+
+function _tactileChunkKey(frame) {
+    return Math.floor(Math.max(0, frame) / TACTILE_CHUNK_FRAMES)
+        * TACTILE_CHUNK_FRAMES;
+}
+
+function _tactileFrameField(entry, frame) {
+    const chunk = entry.chunks.get(_tactileChunkKey(frame));
+    if (!chunk) return null;
+    const index = Math.round(Number(frame)) - chunk.first;
+    if (index < 0 || index >= chunk.count) return null;
+    return chunk.bytes.subarray(
+        index * TACTILE_FIELD_STRIDE, (index + 1) * TACTILE_FIELD_STRIDE);
+}
+
+function _fetchTactileChunk(entry, chunkStart) {
+    if (!entry?.renderer || entry.chunks.has(chunkStart)
+            || entry.chunkInflight.has(chunkStart)) return;
+    entry.chunkInflight.add(chunkStart);
+    const episodeAtRequest = currentEpisodeId;
+    const tokenAtRequest = _playbackSessionToken;
+    const signal = getMediaLoadSignal();
+    const url = `/api/v1/video/${currentEpisodeId}/tactile-matrix-range`
+        + `?side=${entry.source.side}&start=${chunkStart}`
+        + `&limit=${TACTILE_CHUNK_FRAMES}&v=202609091912-tactile-chunk-prefetch`;
+    const options = { credentials: 'same-origin', cache: 'force-cache' };
+    if (signal) options.signal = signal;
+    fetch(url, options).then(response => {
+        if (!response.ok) throw new Error(`tactile range failed: ${response.status}`);
+        const first = Number(response.headers.get('X-Force-First'));
+        const count = Number(response.headers.get('X-Force-Frames'));
+        return response.arrayBuffer().then(buffer => ({ buffer, first, count }));
+    }).then(({ buffer, first, count }) => {
+        entry.chunkInflight.delete(chunkStart);
+        if (!isCurrentPlaybackSession(episodeAtRequest, tokenAtRequest)
+                || !entry.canvas.isConnected) return;
+        if (!Number.isFinite(first) || !Number.isFinite(count) || count <= 0
+                || buffer.byteLength < count * TACTILE_FIELD_STRIDE) return;
+        entry.chunks.set(chunkStart, {
+            first, count,
+            bytes: new Uint8Array(buffer, 0, count * TACTILE_FIELD_STRIDE),
+        });
+        // Paint the frame the player is showing if it just arrived.
+        if (entry.pendingFrame !== null && entry.pendingFrame !== undefined) {
+            const field = _tactileFrameField(entry, entry.pendingFrame);
+            if (field) {
+                entry.renderer.render(field);
+                entry.loadedFrame = entry.pendingFrame;
+            }
+        }
+        // Keep one chunk of look-ahead warm so playback never waits on the
+        // network; the server caches each chunk, so repeats are cheap.
+        const next = chunkStart + TACTILE_CHUNK_FRAMES;
+        if (!entry.frameCount || next < entry.frameCount) {
+            _fetchTactileChunk(entry, next);
+        }
+    }).catch(error => {
+        entry.chunkInflight.delete(chunkStart);
+        if (error?.name !== 'AbortError'
+                && isCurrentPlaybackSession(episodeAtRequest, tokenAtRequest)) {
+            console.warn('[player] tactile chunk unavailable', error);
+        }
+    });
+}
+
+function _loadTactileWebGLFrame(entry, frame) {
+    if (!entry?.canvas || !entry.renderer || !entry.source) return;
+    const targetFrame = Math.max(0, Math.round(Number(frame) || 0));
+    entry.pendingFrame = targetFrame;
+    const field = _tactileFrameField(entry, targetFrame);
+    if (field) {
+        entry.renderer.render(field);
+        entry.loadedFrame = targetFrame;
+        const next = _tactileChunkKey(targetFrame) + TACTILE_CHUNK_FRAMES;
+        if (!entry.frameCount || next < entry.frameCount) {
+            _fetchTactileChunk(entry, next);
+        }
+        return;
+    }
+    _fetchTactileChunk(entry, _tactileChunkKey(targetFrame));
+}
+
 async function mountGroupedSource(source, tile) {
     const episodeAtMount = currentEpisodeId;
+    const sessionTokenAtMount = _playbackSessionToken;
     if (!tile || currentEpisodeId !== episodeAtMount) return;
+    if (source.kind === 'slam_trajectory') {
+        const canvas = document.createElement('canvas');
+        canvas.className = 'w-full h-full block bg-black';
+        tile.appendChild(canvas);
+        const entry = {
+            canvas, source, rotY: 0, rotX: 0.35, zoom: 1,
+            pan: [0, 0, 0], dragging: false, dragMode: '',
+            lastX: 0, lastY: 0, fit: null, _lastCam: null,
+        };
+        currentSlamTiles.push(entry);
+        initSlamDrag(entry);
+        if (!isCurrentPlaybackSession(episodeAtMount, sessionTokenAtMount)
+                || !tile.isConnected) return;
+        renderSlamTile(entry, 0);
+        return;
+    }
     if (source.kind === 'hand3d_world') {
         // 3D 手部世界坐标交互窗口:canvas 渲染 /hand-3d 逐帧数据
         // (worker 只产 parquet,前端实时投影;拖拽旋转 + 滚轮缩放)
@@ -1407,8 +2011,63 @@ async function mountGroupedSource(source, tile) {
         // Do not reveal the spatial canvas before its initial frame window is
         // available. RGB/2D and 3D then enter the workspace together.
         await _ensureHand3DInitialWindow(source.source_key || 'default');
-        if (currentEpisodeId !== episodeAtMount || !tile.isConnected) return;
+        if (!isCurrentPlaybackSession(episodeAtMount, sessionTokenAtMount)
+                || !tile.isConnected) return;
         renderHand3DTile(entry, 0);
+        return;
+    }
+    if (source.kind === 'tactile_force_left'
+            || source.kind === 'tactile_force_right') {
+        // One tile per side: pressure field on top, its Fx/Fy/Fz history
+        // underneath. The acquisition-side GripperSideWidget stacks the same
+        // way (heatmap above, force curve below).
+        const holder = document.createElement('div');
+        holder.className = 'w-full h-full min-h-0 flex flex-col';
+        const matrixBox = document.createElement('div');
+        matrixBox.className = 'relative flex-1 min-h-0';
+        matrixBox.style.backgroundColor = 'rgb(1, 1, 128)';
+        const canvas = document.createElement('canvas');
+        canvas.className = 'w-full h-full block';
+        canvas.setAttribute('aria-label',
+            source.side === 'right' ? 'Right force matrix' : 'Left force matrix');
+        matrixBox.appendChild(canvas);
+        const forceValue = document.createElement('div');
+        forceValue.className = 'absolute z-10 rounded text-white pointer-events-none';
+        forceValue.style.cssText = 'top:6px;left:6px;padding:2px 6px;font-size:11px;'
+            + 'background:rgba(0,0,0,.6);font-variant-numeric:tabular-nums;';
+        forceValue.textContent = 'Fx — · Fy — · Fz —';
+        matrixBox.appendChild(forceValue);
+        const curveBox = document.createElement('div');
+        curveBox.className = 'relative shrink-0';
+        curveBox.style.cssText = 'height:92px;background:#0b1220;'
+            + 'border-top:1px solid rgba(51,65,85,.5);';
+        const curveCanvas = document.createElement('canvas');
+        curveCanvas.className = 'w-full h-full block';
+        curveBox.appendChild(curveCanvas);
+        const curveCaption = document.createElement('div');
+        curveCaption.className = 'absolute pointer-events-none';
+        curveCaption.style.cssText = 'top:2px;left:6px;font-size:10px;color:#64748b;';
+        curveCaption.textContent = '力 mN';
+        curveBox.appendChild(curveCaption);
+        holder.appendChild(matrixBox);
+        holder.appendChild(curveBox);
+        tile.appendChild(holder);
+        const renderer = _createTactileWebGLRenderer(canvas);
+        const entry = { canvas, renderer, source, lastFrame: -1, forceValue,
+            curveCanvas, loadedFrame: -1, pendingFrame: null,
+            chunks: new Map(), chunkInflight: new Set(),
+            frameCount: Number(tactileMatrixData?.frame_count) || 0 };
+        initTactileView(entry);
+        canvas.title = '滚轮缩放 / 拖拽平移 / 双击复位';
+        currentTactileTiles.push(entry);
+        const frame = typeof currentFrameTarget === 'number' ? currentFrameTarget : 0;
+        _updateTactileForceTile(entry, frame);
+        if (renderer) {
+            renderer.render();
+            _loadTactileWebGLFrame(entry, frame);
+        } else {
+            forceValue.textContent = 'WebGL2 unavailable';
+        }
         return;
     }
     if (source.kind === 'depth' && source.depth_video_url) {
@@ -1417,11 +2076,17 @@ async function mountGroupedSource(source, tile) {
         // clamp/scale/colormap math as the former canvas renderer).  Play
         // them as native videos: instant open, native seek, and frame sync
         // through the same master-drift loop as every other camera.
+        const playbackUrl = await _preloadBrowserVideoAsset(
+            source, source.depth_video_url, sessionTokenAtMount);
+        if (!isCurrentPlaybackSession(episodeAtMount, sessionTokenAtMount)
+                || !tile.isConnected) return;
         const holder = document.createElement('div');
         holder.id = `player-container-${groupedSourceDomId(source)}`;
         holder.className = 'bg-black rounded overflow-hidden w-full h-full min-h-0 relative';
         tile.appendChild(holder);
-        const player = initPlayer(holder.id, source.depth_video_url);
+        const player = initPlayer(
+            holder.id, playbackUrl || _browserVideoAssetUrl(
+                source, source.depth_video_url));
         if (player) players[groupedSourceKey(source)] = player;
         return;
     }
@@ -1465,10 +2130,13 @@ async function mountGroupedSource(source, tile) {
     holder.id = `player-container-${groupedSourceDomId(source)}`;
     holder.className = 'bg-black rounded overflow-hidden w-full h-full min-h-0';
     tile.appendChild(holder);
-    const url = source.stream_url ||
+    const sourceUrl = source.stream_url ||
         await pickVideoUrl(episodeAtMount, source.source_key);
-    if (currentEpisodeId !== episodeAtMount || !tile.isConnected) return;
-    const player = initPlayer(holder.id, url);
+    const playbackUrl = await _preloadBrowserVideoAsset(
+        source, sourceUrl, sessionTokenAtMount);
+    if (!isCurrentPlaybackSession(episodeAtMount, sessionTokenAtMount)
+            || !tile.isConnected) return;
+    const player = initPlayer(holder.id, playbackUrl || sourceUrl);
     if (player) players[groupedSourceKey(source)] = player;
     // 手部骨骼 SVG 叠加层(只加在原始视频上;skeleton/渲染 tile 不加)
     // The first keypoint window is part of the shared initial-frame barrier.
@@ -1490,12 +2158,12 @@ function bindGloveSync(player) {
 
 let _lastImageTileFrame = -1;
 function _refreshImageTilesAt(frame) {
-    if (!currentImageTiles.length && !currentDepthPreviewTiles.length) return;
+    if (!currentImageTiles.length && !currentDepthPreviewTiles.length
+            && !currentTactileTiles.length) return;
     _refreshDepthTilesAt(frame);
-    if (!currentImageTiles.length) return;
-    if (frame === _lastImageTileFrame) return;
-    _lastImageTileFrame = frame;
-    currentImageTiles.forEach((entry) => {
+    if (currentImageTiles.length && frame !== _lastImageTileFrame) {
+        _lastImageTileFrame = frame;
+        currentImageTiles.forEach((entry) => {
         const { img, source } = entry;
         // Hand/glove tiles are driven by heatmap.js from the preloaded
         // frames-data payload; only template-based non-depth tiles are
@@ -1508,6 +2176,13 @@ function _refreshImageTilesAt(frame) {
             url = source.heatmap_url || source.depth_preview_url || source.depth_url;
         }
         if (url) img.src = _frameUrl(url, frame);
+        });
+    }
+    currentTactileTiles.forEach(entry => {
+        if (!entry.canvas || entry.lastFrame === frame) return;
+        entry.lastFrame = frame;
+        _updateTactileForceTile(entry, frame);
+        _loadTactileWebGLFrame(entry, frame);
     });
 }
 
@@ -1668,21 +2343,25 @@ function _createWorkspaceTile(source, movable, reorderContainer) {
         tile.style.alignSelf = 'center';
     }
 
-    const label = document.createElement('span');
-    label.className = 'absolute z-10 top-1 left-1 bg-black/70 text-gray-200 text-[10px] px-1.5 py-0.5 rounded';
-    label.textContent = groupedSourceLabel(source);
-    tile.appendChild(label);
+    if (!source.kind.startsWith('tactile_force_')) {
+        const label = document.createElement('span');
+        label.className = 'absolute z-10 top-1 left-1 bg-black/70 text-gray-200 text-[10px] px-1.5 py-0.5 rounded';
+        label.textContent = groupedSourceLabel(source);
+        tile.appendChild(label);
+    }
 
-    const remove = document.createElement('button');
-    remove.type = 'button';
-    remove.className = 'absolute z-10 top-1 right-1 bg-black/70 text-gray-300 hover:text-white text-xs w-5 h-5 rounded';
-    remove.textContent = '\u00d7';
-    remove.title = t('remove_source');
-    remove.onclick = event => {
-        event.stopPropagation();
-        removeGroupedSource(source);
-    };
-    tile.appendChild(remove);
+    if (!source.kind.startsWith('tactile_force_')) {
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.className = 'absolute z-10 top-1 right-1 bg-black/70 text-gray-300 hover:text-white text-xs w-5 h-5 rounded';
+        remove.textContent = '\u00d7';
+        remove.title = t('remove_source');
+        remove.onclick = event => {
+            event.stopPropagation();
+            removeGroupedSource(source);
+        };
+        tile.appendChild(remove);
+    }
 
     if (!movable) return tile;
 
@@ -2042,7 +2721,8 @@ function renderGroupedWorkspaceLegacy() {
     // Two fixed zones: a video area on top (free drag-to-reorder) and a
     // heatmap area below (left-hand on the left column, right-hand on the
     // right column — always, per requirement).
-    const isImageSource = s => ['glove', 'depth', 'hand'].includes(s.kind);
+    const isImageSource = s => ['glove', 'depth', 'hand',
+        'tactile_force_left', 'tactile_force_right'].includes(s.kind);
     const vids = workspaceSources.filter(s => !isImageSource(s));
     const imgs = workspaceSources.filter(s => isImageSource(s));
 
@@ -2086,17 +2766,21 @@ function renderGroupedWorkspaceLegacy() {
         tile.style.minWidth = '0';
         tile.style.width = '100%';
         tile.style.height = '100%';
-        const label = document.createElement('span');
-        label.className = 'absolute z-10 top-1 left-1 bg-black/70 text-gray-200 text-[10px] px-1.5 py-0.5 rounded';
-        label.textContent = groupedSourceLabel(source);
-        tile.appendChild(label);
-        const remove = document.createElement('button');
-        remove.type = 'button';
-        remove.className = 'absolute z-10 top-1 right-1 bg-black/70 text-gray-300 hover:text-white text-xs w-5 h-5 rounded';
-        remove.textContent = '×';
-        remove.title = t('remove_source');
-        remove.onclick = () => removeGroupedSource(source);
-        tile.appendChild(remove);
+        if (!source.kind.startsWith('tactile_force_')) {
+            const label = document.createElement('span');
+            label.className = 'absolute z-10 top-1 left-1 bg-black/70 text-gray-200 text-[10px] px-1.5 py-0.5 rounded';
+            label.textContent = groupedSourceLabel(source);
+            tile.appendChild(label);
+        }
+        if (!source.kind.startsWith('tactile_force_')) {
+            const remove = document.createElement('button');
+            remove.type = 'button';
+            remove.className = 'absolute z-10 top-1 right-1 bg-black/70 text-gray-300 hover:text-white text-xs w-5 h-5 rounded';
+            remove.textContent = '×';
+            remove.title = t('remove_source');
+            remove.onclick = () => removeGroupedSource(source);
+            tile.appendChild(remove);
+        }
         if (inVideoRow) {
             // Drag to reorder videos (DOM-level swap — playback keeps running)
             tile.draggable = true;
@@ -2197,7 +2881,9 @@ function _defaultWorkspaceFromGroups() {
     // 并已把 hand3d_world 加入 workspaceSources,整表重建不能冲掉
     // (否则开关显示开启、窗口实际不存在 —— 竞态脱节 bug)
     const keep = workspaceSources.filter(s =>
-        s.kind === 'hand3d_world' || s.kind === 'depth');
+        s.kind === 'hand3d_world' || s.kind === 'slam_trajectory'
+        || s.kind === 'depth' || s.kind === 'tactile_force_left'
+        || s.kind === 'tactile_force_right');
     // Depth is a first-class default preview source. It must be present in
     // workspaceSources before renderGroupedWorkspace takes its mount Promise
     // snapshot; adding it immediately after render creates a race where the
@@ -2213,7 +2899,8 @@ function _defaultWorkspaceFromGroups() {
     if (grp && (grp.members || []).length) {
         workspaceSources = grp.members.map(m => ({
             kind: 'video', source_key: m.source_key, label: m.label,
-            stream_url: m.stream_url, frame_count: m.frame_count, fps: m.fps,
+            stream_url: m.stream_url, video_cache_key: m.video_cache_key,
+            frame_count: m.frame_count, fps: m.fps,
         }));
         workspaceSources.push(...retained);
         return;
@@ -2222,7 +2909,8 @@ function _defaultWorkspaceFromGroups() {
     if (singles.length) {
         workspaceSources = singles.map(single => ({
             kind: 'video', source_key: single.source_key, label: single.label,
-            stream_url: single.stream_url, frame_count: single.frame_count, fps: single.fps,
+            stream_url: single.stream_url, video_cache_key: single.video_cache_key,
+            frame_count: single.frame_count, fps: single.fps,
         }));
     }
     workspaceSources.push(...retained);
@@ -2248,12 +2936,18 @@ async function loadGroupedEpisodeVideo(episodeId, cameras, options = {}) {
     currentImageTiles = [];
     currentDepthPreviewTiles = [];
     currentHand3dTiles = [];
+    currentSlamTiles = [];
+    currentTactileTiles = [];
     hand3dData = null;
     hand3dDataBySource = {};
     hand3dFrameCache = { frame: -1, data: null, inflight: -1 };
     hand3dFrameCacheBySource = {};
     hand3dWindow = { start: -1, end: -1, frames: {}, inflight: false };
     hand3dWindowBySource = {};
+    slamData = null;
+    slamFramesByIndex = {};
+    slamWindowInflight = null;
+    tactileMatrixData = null;
     _depthPlaybackStall = null;
     _hand3dViewAnchor = null;
     _h3dBaseDist = null;
@@ -2316,6 +3010,8 @@ async function loadGroupedEpisodeVideo(episodeId, cameras, options = {}) {
     // building the workspace. The 3D tile itself then awaits its first data
     // window together with each RGB overlay's first keypoint window.
     const hand3dReady = loadHand3D(episodeId, loadToken);
+    const slamReady = loadSlamTrajectory(episodeId, loadToken);
+    const tactileReady = loadTactileMatrixMeta(episodeId, loadToken);
 
     const grid = document.getElementById('video-grid');
     if (!grid) { hideVideoLoading(); return; }
@@ -2330,10 +3026,18 @@ async function loadGroupedEpisodeVideo(episodeId, cameras, options = {}) {
         if (!isCurrentPlaybackSession(episodeId, loadToken)) return;  // 丢弃过期响应
         if (res.ok) {
             currentMediaGroups = await res.json();
-            await hand3dReady;
+            await Promise.all([hand3dReady, slamReady, tactileReady]);
             if (!isCurrentPlaybackSession(episodeId, loadToken)) return;
             renderSourceBar();
             _defaultWorkspaceFromGroups();
+            // SLAM is a first-class spatial source. Add it before the initial
+            // workspace render so it enters the same mount barrier as RGB.
+            if (typeof window.ensureSlamTrajectoryTile === 'function') {
+                window.ensureSlamTrajectoryTile();
+            }
+            if (typeof window.ensureTactileMatrixTile === 'function') {
+                window.ensureTactileMatrixTile();
+            }
             // Add the selected spatial source before renderGroupedWorkspace
             // takes its Promise.all(mounted) snapshot.
             if (typeof ensureHand3dWorldTile === 'function'
@@ -2418,12 +3122,16 @@ function loadEpisodeVideo(episodeId, cameras, options = {}) {
     // can leave the global skeleton switch disabled for the next episode.
     if (typeof destroyAllHandOverlays === 'function') destroyAllHandOverlays();
     currentHand3dTiles = [];
+    currentSlamTiles = [];
     hand3dData = null;
     hand3dDataBySource = {};
     hand3dFrameCache = { frame: -1, data: null, inflight: -1 };
     hand3dFrameCacheBySource = {};
     hand3dWindow = { start: -1, end: -1, frames: {}, inflight: false };
     hand3dWindowBySource = {};
+    slamData = null;
+    slamFramesByIndex = {};
+    slamWindowInflight = null;
     _depthPlaybackStall = null;
     _hand3dViewAnchor = null;
     _h3dBaseDist = null;
@@ -3382,10 +4090,469 @@ const HAND3D_CONNECTIONS = [
     [0, 17],                                        // 掌根
 ];
 
+async function loadSlamTrajectory(episodeId, sessionToken = null) {
+    try {
+        const signal = getMediaLoadSignal();
+        const res = await fetch(
+            `/api/v1/video/${episodeId}/slam-trajectory?max_points=10000`,
+            signal ? { signal, cache: 'no-store' } : { cache: 'no-store' });
+        if (!isCurrentPlaybackSession(episodeId, sessionToken)) return null;
+        if (!res.ok) return null;
+        const data = await res.json();
+        if (!isCurrentPlaybackSession(episodeId, sessionToken)) return null;
+        if (!data || data.available !== true) return null;
+        slamData = data;
+        slamFramesByIndex = {};
+        (data.frames || data.trajectory || []).forEach(row => {
+            const frame = Number(row && row.f);
+            const pose = row && row.p;
+            const valid = Array.isArray(pose) && pose.length >= 7
+                && pose.slice(0, 7).every(value => Number.isFinite(Number(value)))
+                && Math.hypot(...pose.slice(3, 7).map(Number)) >= 0.5;
+            if (Number.isFinite(frame) && valid) slamFramesByIndex[frame] = row;
+        });
+        return data;
+    } catch (_) {
+        return null;
+    }
+}
+
+async function loadTactileMatrixMeta(episodeId, sessionToken = null) {
+    try {
+        const signal = getMediaLoadSignal();
+        const res = await fetch(
+            `/api/v1/video/${episodeId}/tactile-matrix-meta?v=202609091720-tactile-fetch-slam-axis`,
+            signal ? { signal, cache: 'no-store' } : { cache: 'no-store' });
+        if (!isCurrentPlaybackSession(episodeId, sessionToken)) return null;
+        if (!res.ok) return null;
+        const data = await res.json();
+        if (!isCurrentPlaybackSession(episodeId, sessionToken)) return null;
+        if (!data || data.available !== true) return null;
+        // Scalar fx/fy/fz values are small enough to preload once per
+        // episode.  Keep them indexed by frame so scrubbing does not issue a
+        // second parquet request for every tactile image.
+        const series = data.force_series;
+        const forceByFrame = Object.create(null);
+        if (series && Array.isArray(series.frames)) {
+            series.frames.forEach((frame, index) => {
+                const key = String(Number(frame));
+                forceByFrame[key] = {
+                    left: Array.isArray(series.left) ? series.left[index] : null,
+                    right: Array.isArray(series.right) ? series.right[index] : null,
+                };
+            });
+        }
+        data._forceByFrame = forceByFrame;
+        tactileMatrixData = data;
+        return data;
+    } catch (_) {
+        return null;
+    }
+}
+
+window.ensureSlamTrajectoryTile = function () {
+    if (!slamData || slamData.available !== true) return;
+    const source = {
+        kind: 'slam_trajectory',
+        source_key: 'slam_trajectory',
+        label: 'SLAM',
+    };
+    const key = groupedSourceKey(source);
+    if (workspaceSources.some(item => groupedSourceKey(item) === key)) return;
+    workspaceSources.push(source);
+};
+
+window.ensureTactileMatrixTile = function () {
+    if (!tactileMatrixData || tactileMatrixData.available !== true) return;
+    const sources = [
+        { kind: 'tactile_force_left', source_key: 'tactile_force_left',
+            side: 'left', label: 'Left' },
+        { kind: 'tactile_force_right', source_key: 'tactile_force_right',
+            side: 'right', label: 'Right' },
+    ];
+    sources.forEach(source => {
+        const key = groupedSourceKey(source);
+        if (!workspaceSources.some(item => groupedSourceKey(item) === key)) {
+            workspaceSources.push(source);
+        }
+    });
+};
+
+function _slamRows() {
+    if (!slamData) return [];
+    const rows = Array.isArray(slamData.trajectory) && slamData.trajectory.length
+        ? slamData.trajectory : slamData.frames;
+    return (rows || []).filter(row => row && Array.isArray(row.p)
+        && row.p.length >= 7
+        && row.p.slice(0, 3).every(value => Number.isFinite(Number(value))));
+}
+
+function _slamSmoothRows() {
+    if (!slamData) return [];
+    if (Array.isArray(slamData._displayRows)) return slamData._displayRows;
+    const rows = _slamRows();
+    let previous = null;
+    let previousFrame = null;
+    const smoothed = rows.map(row => {
+        const raw = row.p.slice(0, 3).map(Number);
+        const frame = Number(row.f);
+        const frameGap = previousFrame === null ? Infinity : frame - previousFrame;
+        const canSmooth = previous && frameGap <= SLAM_DISPLAY_JOIN_GAP_FRAMES;
+        const point = canSmooth
+            ? raw.map((value, axis) => previous[axis]
+                + SLAM_DISPLAY_SMOOTH_ALPHA * (value - previous[axis]))
+            : raw;
+        row._displayPosition = point;
+        previous = point;
+        previousFrame = frame;
+        return row;
+    });
+    slamData._displayRows = smoothed;
+    return smoothed;
+}
+
+// The acquisition side records the S80M camera pose in a gravity-aligned
+// world frame: +Z is up (measured on real data - a physical turn of the
+// gripper rotates about world +Z, and the gripper's own up axis sits within
+// ~12 deg of it for the whole episode). The browser camera uses a right-handed
+// frame with Y up, so display=[source X, source Z, -source Y] keeps the
+// stored values untouched and puts world up on screen up.
+function _slamDisplayPoint(sourcePoint) {
+    return [Number(sourcePoint[0]), Number(sourcePoint[2]), -Number(sourcePoint[1])];
+}
+
+function _slamSourcePoint(row) {
+    const point = Array.isArray(row && row._displayPosition)
+        ? row._displayPosition : row && row.p;
+    return point ? point.slice(0, 3).map(Number) : null;
+}
+
+function _slamCanJoinRows(previousRow, row) {
+    if (!previousRow || !row) return false;
+    const gap = Number(row.f) - Number(previousRow.f);
+    return Number.isFinite(gap) && gap <= SLAM_DISPLAY_JOIN_GAP_FRAMES;
+}
+
+function _slamNearestRow(frame) {
+    const target = Math.max(0, Math.round(Number(frame) || 0));
+    const rows = _slamSmoothRows();
+    if (!rows.length) return null;
+    // If the current video frame has no valid pose, keep the last pose that
+    // has already happened. Never select a future pose for the live marker.
+    let best = null;
+    rows.forEach(row => {
+        const rowFrame = Number(row.f);
+        if (rowFrame <= target && (!best || rowFrame > Number(best.f))) {
+            best = row;
+        }
+    });
+    return best;
+}
+
+function _slamFit(rows) {
+    const points = rows.map(row => _slamDisplayPoint(_slamSourcePoint(row)));
+    const min = [Infinity, Infinity, Infinity];
+    const max = [-Infinity, -Infinity, -Infinity];
+    points.forEach(point => point.forEach((value, axis) => {
+        min[axis] = Math.min(min[axis], value);
+        max[axis] = Math.max(max[axis], value);
+    }));
+    const span = Math.max(max[0] - min[0], max[1] - min[1], max[2] - min[2], 0.4);
+    const center = min.map((value, axis) => (value + max[axis]) / 2);
+    const gridStep = 0.2;
+    const gridY = Math.floor((min[1] - 0.08) / gridStep) * gridStep;
+    const half = Math.max(0.6, Math.ceil((span * 0.7) / gridStep) * gridStep);
+    const fov = 45 * Math.PI / 180;
+    const baseDist = Math.max(
+        1.2,
+        Math.min(
+            6,
+            span * 1.25 * SLAM_DISPLAY_CAMERA_DISTANCE_SCALE
+                / Math.tan(fov / 2),
+        ),
+    );
+    return { points, min, max, center, gridY, half, baseDist };
+}
+
+function _slamRotateVector(pose, vector) {
+    let qx = Number(pose[3]), qy = Number(pose[4]);
+    let qz = Number(pose[5]), qw = Number(pose[6]);
+    const norm = Math.hypot(qx, qy, qz, qw);
+    if (![qx, qy, qz, qw].every(Number.isFinite) || norm < 1e-6) return vector;
+    qx /= norm;
+    qy /= norm;
+    qz /= norm;
+    qw /= norm;
+    const tx = 2 * (qy * vector[2] - qz * vector[1]);
+    const ty = 2 * (qz * vector[0] - qx * vector[2]);
+    const tz = 2 * (qx * vector[1] - qy * vector[0]);
+    return [
+        vector[0] + qw * tx + qy * tz - qz * ty,
+        vector[1] + qw * ty + qz * tx - qx * tz,
+        vector[2] + qw * tz + qx * ty - qy * tx,
+    ];
+}
+
+function _slamGripperState(row) {
+    const values = row && Array.isArray(row.g) ? row.g : null;
+    if (!values || values.length < 1) return null;
+    const percent = Number(values[0]);
+    if (!Number.isFinite(percent)) return null;
+    return {
+        percent: Math.max(0, Math.min(100, percent)),
+        gripped: Number(values[1]) >= 0.5,
+    };
+}
+
+function renderSlamTile(entry, frameOverride) {
+    if (!entry || !entry.canvas) return;
+    const canvas = entry.canvas;
+    const rect = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(1, rect.width), h = Math.max(1, rect.height);
+    if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+        canvas.width = Math.round(w * dpr);
+        canvas.height = Math.round(h * dpr);
+    }
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = 'rgba(3,7,18,0.95)';
+    ctx.fillRect(0, 0, w, h);
+
+    const rows = _slamSmoothRows();
+    if (!rows.length) return;
+    if (!entry.fit) entry.fit = _slamFit(rows);
+    const fit = entry.fit;
+    const frame = typeof frameOverride === 'number'
+        ? frameOverride : (typeof currentFrameTarget === 'number' ? currentFrameTarget : 0);
+    const cam = _hand3dCam(
+        fit.points, w, h, entry.rotY || 0, entry.rotX || 0.35,
+        entry.zoom || 1, fit.baseDist, entry.pan || [0, 0, 0]);
+    entry._lastCam = cam;
+    const project = point => _projectHand3D(point, cam);
+    const line = (a, b, color, width = 1) => {
+        const pa = project(a), pb = project(b);
+        if (!Number.isFinite(pa[0]) || !Number.isFinite(pa[1])
+                || !Number.isFinite(pb[0]) || !Number.isFinite(pb[1])) return;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = width;
+        ctx.beginPath();
+        ctx.moveTo(pa[0], pa[1]);
+        ctx.lineTo(pb[0], pb[1]);
+        ctx.stroke();
+    };
+
+    // Ground grid: every square is exactly 0.2 m. Labels are intentionally
+    // kept to one small unit marker so the spatial view stays uncluttered.
+    const minX = fit.center[0] - fit.half;
+    const maxX = fit.center[0] + fit.half;
+    const minZ = fit.center[2] - fit.half;
+    const maxZ = fit.center[2] + fit.half;
+    for (let x = minX; x <= maxX + 0.001; x += 0.2) {
+        line([x, fit.gridY, minZ], [x, fit.gridY, maxZ], 'rgba(75,85,99,0.55)');
+    }
+    for (let z = minZ; z <= maxZ + 0.001; z += 0.2) {
+        line([minX, fit.gridY, z], [maxX, fit.gridY, z], 'rgba(75,85,99,0.55)');
+    }
+
+    // Small axis marker at the fitted area: the recorded world axes, drawn in
+    // the display frame that _slamDisplayPoint produces (world +Z is up).
+    const axisOrigin = [fit.center[0], fit.gridY, fit.center[2]];
+    const axisTips = [
+        // World axes: X and Y horizontal, Z up.
+        [[axisOrigin[0] + 0.2, axisOrigin[1], axisOrigin[2]], 'rgb(248,90,90)', 'X'],
+        [[axisOrigin[0], axisOrigin[1], axisOrigin[2] - 0.2], 'rgb(80,220,130)', 'Y'],
+        [[axisOrigin[0], axisOrigin[1] + 0.2, axisOrigin[2]], 'rgb(90,150,255)', 'Z'],
+    ];
+    axisTips.forEach(([tip, color, label]) => {
+        line(axisOrigin, tip, color, 1.5);
+        const projected = project(tip);
+        if (!Number.isFinite(projected[0]) || !Number.isFinite(projected[1])) return;
+        ctx.font = '10px sans-serif';
+        ctx.fillStyle = color;
+        ctx.fillText(label, projected[0] + 3, projected[1] - 3);
+    });
+    const axis = project(axisOrigin);
+    if (Number.isFinite(axis[0]) && Number.isFinite(axis[1])) {
+        ctx.font = '9px sans-serif';
+        ctx.fillStyle = 'rgba(148,163,184,0.8)';
+        ctx.fillText('0.2m', axis[0] + 5, axis[1] + 12);
+    }
+
+    const current = Number(frame);
+    let previous = null;
+    let previousRow = null;
+    rows.forEach(row => {
+        const rowFrame = Number(row.f);
+        if (rowFrame > current) return;
+        const sourcePoint = _slamSourcePoint(row);
+        const point = _slamDisplayPoint(sourcePoint);
+        if (previous && _slamCanJoinRows(previousRow, row)) {
+            line(previous, point, 'rgba(34,211,238,0.95)', 2);
+        }
+        previous = point;
+        previousRow = row;
+    });
+
+    const currentRow = _slamNearestRow(current);
+    if (currentRow) {
+        const pose = currentRow.p.map(Number);
+        const sourcePoint = _slamSourcePoint(currentRow);
+        const point = _slamDisplayPoint(sourcePoint);
+        const projected = project(point);
+        if (Number.isFinite(projected[0]) && Number.isFinite(projected[1])) {
+            ctx.fillStyle = '#f8fafc';
+            ctx.beginPath();
+            ctx.arc(projected[0], projected[1], 4, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.strokeStyle = '#06b6d4';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+        }
+        const axisLength = 0.08;
+        const colors = ['rgb(248,90,90)', 'rgb(80,220,130)', 'rgb(90,150,255)'];
+        [[1, 0, 0], [0, 1, 0], [0, 0, 1]].forEach((vector, index) => {
+            const rotated = _slamRotateVector(pose, vector);
+            const displayVector = _slamDisplayPoint(rotated);
+            line(point, [
+                point[0] + displayVector[0] * axisLength,
+                point[1] + displayVector[1] * axisLength,
+                point[2] + displayVector[2] * axisLength,
+            ], colors[index], 2);
+        });
+
+        // Simplified UMI gripper model. The recorded pose frame is the S80M
+        // camera frame; measured on real data the device axes sit at
+        // +X = camera right (~world +Y), +Y = gripper up (~world +Z, the
+        // camera is mounted inverted) and +Z = gripper forward (~world +X,
+        // the optical axis). So the body extends along local +Z, the two
+        // plates separate along local X, and each plate is 0.20m long
+        // (forward) by 0.05m tall (up) with a 0.12m maximum opening.
+        const grip = _slamGripperState(currentRow);
+        if (grip) {
+            const toDisplay = local => {
+                const rotated = _slamRotateVector(pose, local);
+                return _slamDisplayPoint([
+                    sourcePoint[0] + rotated[0],
+                    sourcePoint[1] + rotated[1],
+                    sourcePoint[2] + rotated[2],
+                ]);
+            };
+            const plateLength = 0.20;
+            const plateHeight = 0.05;
+            const maxHalfGap = 0.06;
+            const baseOffset = 0.10;
+            const halfGap = maxHalfGap * (1 - grip.percent / 100);
+            const jawColor = grip.gripped
+                ? 'rgba(248,90,90,0.95)' : 'rgba(88,168,232,0.95)';
+            const jawFill = grip.gripped
+                ? 'rgba(248,90,90,0.16)' : 'rgba(88,168,232,0.12)';
+            const relativeCorners = [
+                [0, -plateHeight / 2, -plateLength / 2],
+                [0, -plateHeight / 2, plateLength / 2],
+                [0, plateHeight / 2, plateLength / 2],
+                [0, plateHeight / 2, -plateLength / 2],
+            ];
+
+            for (const sign of [1, -1]) {
+                const centerX = sign * halfGap;
+                const corners = relativeCorners.map(corner => project(toDisplay([
+                    centerX + corner[0],
+                    corner[1],
+                    baseOffset + corner[2],
+                ])));
+                if (corners.every(item => Number.isFinite(item[0]) && Number.isFinite(item[1]))) {
+                    ctx.fillStyle = jawFill;
+                    ctx.strokeStyle = jawColor;
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    ctx.moveTo(corners[0][0], corners[0][1]);
+                    corners.slice(1).forEach(item => ctx.lineTo(item[0], item[1]));
+                    ctx.closePath();
+                    ctx.fill();
+                    ctx.stroke();
+                }
+                line(
+                    toDisplay([centerX, 0, baseOffset - plateLength / 2]),
+                    toDisplay([centerX, 0, baseOffset + plateLength / 2]),
+                    jawColor, 1);
+            }
+
+            // Rear crossbar plus the two supports that tie each plate back to
+            // the body, so the opening stays readable when it is small.
+            line(toDisplay([-maxHalfGap, 0, baseOffset]),
+                toDisplay([maxHalfGap, 0, baseOffset]),
+                'rgba(148,163,184,0.8)', 1.5);
+            for (const sign of [1, -1]) {
+                for (const cornerZ of [-plateLength / 2, plateLength / 2]) {
+                    line(
+                        toDisplay([sign * halfGap, 0, baseOffset + cornerZ]),
+                        toDisplay([0, 0, baseOffset + cornerZ]),
+                        'rgba(148,163,184,0.8)', 1);
+                }
+            }
+        }
+    }
+}
+
+function initSlamDrag(entry) {
+    if (!entry || !entry.canvas) return;
+    const canvas = entry.canvas;
+    canvas.style.cursor = 'grab';
+    canvas.addEventListener('mousedown', event => {
+        if (event.button !== 0 && event.button !== 1) return;
+        entry.dragging = true;
+        entry.dragMode = event.button === 1 ? 'pan' : 'rotate';
+        entry.lastX = event.clientX;
+        entry.lastY = event.clientY;
+        canvas.style.cursor = entry.dragMode === 'pan' ? 'move' : 'grabbing';
+        event.preventDefault();
+    });
+    window.addEventListener('mousemove', event => {
+        if (!entry.dragging) return;
+        const dx = event.clientX - entry.lastX;
+        const dy = event.clientY - entry.lastY;
+        if (entry.dragMode === 'pan' && entry._lastCam) {
+            const distance = Math.max(0.2, Math.hypot(
+                entry._lastCam.eye[0] - entry._lastCam.centroid[0],
+                entry._lastCam.eye[1] - entry._lastCam.centroid[1],
+                entry._lastCam.eye[2] - entry._lastCam.centroid[2]));
+            const worldPerPixel = distance / Math.max(1, entry._lastCam.f);
+            const pan = entry.pan || (entry.pan = [0, 0, 0]);
+            for (let i = 0; i < 3; i++) {
+                pan[i] += (-dx * entry._lastCam.right[i]
+                    + dy * entry._lastCam.up[i]) * worldPerPixel;
+            }
+        } else {
+            entry.rotY += dx * 0.01;
+            entry.rotX = Math.max(-1.2, Math.min(1.2, entry.rotX + dy * 0.01));
+        }
+        entry.lastX = event.clientX;
+        entry.lastY = event.clientY;
+        renderSlamTile(entry);
+    });
+    window.addEventListener('mouseup', () => {
+        if (!entry.dragging) return;
+        entry.dragging = false;
+        entry.dragMode = '';
+        canvas.style.cursor = 'grab';
+    });
+    canvas.addEventListener('contextmenu', event => event.preventDefault());
+    canvas.addEventListener('wheel', event => {
+        event.preventDefault();
+        entry.zoom = Math.min(6, Math.max(0.3,
+            (entry.zoom || 1) * Math.exp(-event.deltaY * 0.0015)));
+        renderSlamTile(entry);
+    }, { passive: false });
+}
+
 async function loadHand3D(episodeId, sessionToken = null) {
     try {
         const signal = getMediaLoadSignal();
-        const res = await fetch(`/api/v1/video/${episodeId}/hand-3d`, signal ? { signal } : {});
+        const res = await fetch(
+            `/api/v1/video/${episodeId}/hand-3d`,
+            signal ? { signal, cache: 'no-store' } : { cache: 'no-store' });
         if (!isCurrentPlaybackSession(episodeId, sessionToken)) return;  // 丢弃过期响应
         if (!res.ok) return;
         const data = await res.json();
@@ -3805,11 +4972,21 @@ function _normalizeDepthWorldDisplayScale(slots, entry, w, h) {
         for (const slot of slots) {
             const valid = slot.valid || [];
             if (valid.length < 4) continue;
-            const xs = valid.map(p => p[0]), ys = valid.map(p => p[1]);
-            const zs = valid.map(p => p[2]);
-            spans.push(Math.max(Math.max(...xs) - Math.min(...xs),
-                                Math.max(...ys) - Math.min(...ys),
-                                Math.max(...zs) - Math.min(...zs)));
+            // Ignore isolated depth outliers when choosing the fixed preview
+            // scale. A single bad landmark in #3's first frame was metres
+            // away from the hand and permanently made later frames tiny.
+            const robustSpan = values => {
+                const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
+                if (!sorted.length) return 0;
+                const quantile = fraction => sorted[Math.floor(
+                    (sorted.length - 1) * fraction)];
+                return quantile(0.95) - quantile(0.05);
+            };
+            spans.push(Math.max(
+                robustSpan(valid.map(p => p[0])),
+                robustSpan(valid.map(p => p[1])),
+                robustSpan(valid.map(p => p[2])),
+            ));
         }
         const measured = spans.length
             ? spans.reduce((sum, value) => sum + value, 0) / spans.length : 0;
@@ -3839,6 +5016,41 @@ function _normalizeDepthWorldDisplayScale(slots, entry, w, h) {
         slot.valid = slot.pts.filter(Boolean);
     });
     return scale;
+}
+
+// A few D435 frames contain landmark coordinates that jump metres away from
+// the wrist. Keep those points out of the 3D preview only. The parquet/API
+// values remain untouched, and a real hand landmark cannot be this far from
+// its wrist in the camera coordinate system.
+const HAND3D_WORLD_DISPLAY_MAX_HAND_RADIUS = 0.35;
+
+function _filterDepthWorldDisplayOutliers(slots) {
+    slots.forEach(slot => {
+        const points = slot.pts || [];
+        const wrist = points[0] || points.find(Boolean);
+        if (!wrist) return;
+
+        let validCount = 0;
+        let compactCount = 0;
+        const maxRadius = HAND3D_WORLD_DISPLAY_MAX_HAND_RADIUS;
+        const keep = points.map(point => {
+            if (!point) return false;
+            validCount += 1;
+            const dx = point[0] - wrist[0];
+            const dy = point[1] - wrist[1];
+            const dz = point[2] - wrist[2];
+            const isCompact = Math.hypot(dx, dy, dz) <= maxRadius;
+            if (isCompact) compactCount += 1;
+            return isCompact;
+        });
+
+        // Do not blank a sparse hand just because it has one questionable
+        // point. Only apply the filter when a usable compact skeleton remains.
+        if (compactCount < 4 || compactCount === validCount) return;
+        slot.pts = points.map((point, index) => point && keep[index] ? point : null);
+        slot.fin = slot.pts.map(Boolean);
+        slot.valid = slot.pts.filter(Boolean);
+    });
 }
 
 function _hand3dJointRadius(proj, index, tip = false, styleScale = 1) {
@@ -4129,6 +5341,9 @@ function renderHand3DTile(entry, frameOverride) {
         slots.forEach(s => all.push(...s.valid));
     }
     if (sourceData && sourceData.worldMode) {
+        _filterDepthWorldDisplayOutliers(slots);
+        all.length = 0;
+        slots.forEach(s => all.push(...s.valid));
         _normalizeDepthWorldDisplayScale(slots, entry, w, h);
         all.length = 0;
         slots.forEach(s => all.push(...s.valid));
@@ -4332,6 +5547,7 @@ function initHand3dDrag(entry) {
    标注高亮共用;闭包在调用时遍历,脚本加载时 tile 列表为空无影响) */
 setOnFrameChange((f) => {
     for (const entry of currentHand3dTiles) renderHand3DTile(entry, f);
+    for (const entry of currentSlamTiles) renderSlamTile(entry, f);
 });
 
 /* 图像素材(深度图/手套热力图)的逐帧 rAF 刷新循环(见 _startImageTileRaf) */

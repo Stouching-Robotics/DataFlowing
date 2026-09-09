@@ -36,6 +36,7 @@ _CAMERA_INPUTS = {
     "mono_camera", "rgbd_camera", "fisheye_camera", "rgb_camera",
     "stereo_camera", "stereo_rgbd_camera",
 }
+_COMPOSITE_INPUTS = {"gripper_device"}
 
 
 def project_workflow_ids(project: dict | None) -> list[str]:
@@ -100,10 +101,10 @@ def _node_source_groups(workflow: dict, bindings: dict | None) -> tuple[list[str
             continue
         data = node.get("data") or {}
         node_type = str(data.get("nodeType") or "")
-        if node_type not in _CAMERA_INPUTS and node_type != "glove_sensor":
+        if node_type not in _CAMERA_INPUTS | _COMPOSITE_INPUTS and node_type != "glove_sensor":
             continue
         values = _config_source_keys(data.get("config") or {})
-        target = sensor_keys if node_type == "glove_sensor" else camera_keys
+        target = sensor_keys if node_type in {"glove_sensor", "gripper_device"} else camera_keys
         target.extend(values)
     return camera_keys, sensor_keys
 
@@ -144,7 +145,8 @@ def _episode_input_groups(episode: dict) -> list[dict]:
     """Build physical input groups from the uploaded episode metadata.
 
     A group is the matching unit: one RGB stream, one Stereo pair, one RGB-D
-    device, or one Stereo RGB-D device with an RGB pair plus depth metadata.
+    device, one UMI gripper, or one Stereo RGB-D device with an RGB pair plus
+    depth metadata.
     The real source
     keys are kept for the worker snapshot, while ``input_type`` is the stable
     workflow contract.
@@ -282,10 +284,11 @@ def _workflow_input_specs(workflow: dict, bindings: dict | None) -> list[dict]:
             continue
         data = node.get("data") or {}
         node_type = str(data.get("nodeType") or "")
-        if node_type not in _CAMERA_INPUTS and node_type != "glove_sensor":
+        if node_type not in _CAMERA_INPUTS | _COMPOSITE_INPUTS and node_type != "glove_sensor":
             continue
         semantic = (
             "glove_sensor" if node_type == "glove_sensor"
+            else "gripper_device" if node_type == "gripper_device"
             else "stereo_rgbd_camera" if node_type == "stereo_rgbd_camera"
             else "rgbd_camera" if node_type == "rgbd_camera"
             else "stereo_rgb" if node_type == "stereo_camera"
@@ -348,7 +351,7 @@ def _auto_bindings_for_episode(workflow: dict, episode: dict,
             continue
         auto[spec["node_id"]] = (
             {"source_keys": ",".join(keys)}
-            if len(keys) > 1 or spec["semantic_type"] == "glove_sensor"
+            if len(keys) > 1 or spec["semantic_type"] in {"glove_sensor", "gripper_device"}
             else {"source_key": keys[0]}
         )
         matched.add(spec["node_id"])
@@ -363,7 +366,7 @@ def _clear_unmatched_input_configs(graph: dict, matched: set[str]) -> None:
         node_id = str(node.get("id") or "")
         data = node.get("data") or {}
         node_type = str(data.get("nodeType") or "")
-        if node_id in matched or (node_type not in _CAMERA_INPUTS and node_type != "glove_sensor"):
+        if node_id in matched or (node_type not in _CAMERA_INPUTS | _COMPOSITE_INPUTS and node_type != "glove_sensor"):
             continue
         config = data.get("config")
         if not isinstance(config, dict):

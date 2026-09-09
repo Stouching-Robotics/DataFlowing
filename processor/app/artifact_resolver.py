@@ -121,8 +121,17 @@ def _canonical_episode_data(session_dir: Path, episode_id: str | None,
                 / f"episode_{index:06d}.parquet")
         if not path.is_file():
             return None
-        import pandas as pd
-        columns = {str(name) for name in pd.read_parquet(path, engine="pyarrow").columns}
+        try:
+            import pyarrow.parquet as pq
+            # Use logical top-level names; physical schema names flatten nested
+            # landmark lists to ``element`` and make valid 3D artifacts look
+            # empty.
+            columns = {str(name) for name in
+                       pq.ParquetFile(path).schema_arrow.names}
+        except Exception:
+            import pandas as pd
+            columns = {str(name) for name in
+                       pd.read_parquet(path, columns=[], engine="pyarrow").columns}
         if dimension == "3d":
             marker = any(
                 "landmarks_3d" in name or "world_position" in name

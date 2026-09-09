@@ -40,7 +40,7 @@ _CAMERA_TYPE_RULES: dict[str, tuple[str, ...]] = {
 }
 
 # 匹配优先级(显式顺序,不依赖注册序):双目先认领,单目兜底
-_MATCH_PRIORITY = ["stereo_rgbd_camera", "stereo_camera", "rgbd_camera", "mono_camera"]
+_MATCH_PRIORITY = ["gripper_device", "stereo_rgbd_camera", "stereo_camera", "rgbd_camera", "mono_camera"]
 
 # 传感器类输入源关键词:mono 兜底认领时跳过(不抢手套/IMU/深度等)
 _SENSOR_NAME_KEYWORDS = ("glove", "imu", "action", "tactile", "sensor",
@@ -89,7 +89,18 @@ def match_input_modules(available: set[str]) -> list[dict]:
                     break
         # 2) 类型兜底
         if not hits:
-            if node_type == "mono_camera":
+            if node_type == "gripper_device":
+                # A UMI gripper publishes several internal channel names but
+                # represents one physical acquisition source.
+                gripper_hits = []
+                for a in sorted(available):
+                    if a in used:
+                        continue
+                    if "gripper" in a or "umi" in a:
+                        gripper_hits.append(a)
+                        used.add(a)
+                hits.extend(gripper_hits)
+            elif node_type == "mono_camera":
                 # 单目 = 兜底认领剩余相机名(跳过传感器/深度类名称)
                 for a in sorted(available):
                     if a in used:

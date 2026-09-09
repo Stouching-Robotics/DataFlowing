@@ -186,6 +186,24 @@ def _device_input_sources(episodes: list[dict]) -> list[dict]:
             continue
         low = [key.lower() for key in keys]
         kind = f"{item.get('kind') or ''} {item.get('name') or ''}".lower()
+        if "gripper" in kind or "umi" in kind:
+            # RGB/stereo/force channels published by UMI are one physical
+            # acquisition device.  Keep video source keys for compatibility,
+            # but expose one composite workflow input card.
+            rgb_key = next(
+                (key for key in keys
+                 if "rgb" in key.lower()
+                 and "stereo_left" not in key.lower()
+                 and "stereo_right" not in key.lower()),
+                keys[0],
+            )
+            item["source_keys"] = keys
+            item["slots"] = slots
+            item["input_type"] = "gripper_device"
+            item["source_key"] = rgb_key
+            item["label"] = f"{item['name']} · UMI Gripper"
+            result.append(item)
+            continue
         left_right = (any(key.endswith("_left") or "_left_" in key for key in low)
                       and any(key.endswith("_right") or "_right_" in key for key in low))
         is_stereo = len(keys) >= 2 and (left_right or "stereo" in kind)
@@ -244,6 +262,23 @@ def _online_input_sources(devices: list[dict]) -> list[dict]:
                           if str(key).strip()]
             stereo = len(keys) >= 2 and (left_right or "stereo" in kind)
             has_depth = bool(depth_keys) or "depth" in kind or "rgbd" in kind
+            if "gripper" in kind or "umi" in kind:
+                result.append({
+                    "id": str(device.get("device_id") or name), "name": name,
+                    "kind": device.get("kind") or "gripper",
+                    "input_type": "gripper_device",
+                    "source_key": next(
+                        (key for key in keys
+                         if "rgb" in key.lower()
+                         and "stereo_left" not in key.lower()
+                         and "stereo_right" not in key.lower()),
+                        keys[0],
+                    ),
+                    "source_keys": keys,
+                    "depth_keys": depth_keys,
+                    "label": f"{name} · UMI Gripper",
+                })
+                continue
             result.append({
                 "id": str(device.get("device_id") or name), "name": name,
                 "kind": device.get("kind") or "camera",

@@ -89,6 +89,17 @@ def _migrate_hand_ports(node_type: str, data: dict[str, Any]) -> bool:
         if outputs != old_outputs:
             data["outputs"] = outputs
             changed = True
+    if node_type == "gripper_device":
+        old_outputs = data.get("outputs") or []
+        outputs = [
+            _port("rgb_video", "RGB Video"),
+            _port("gripper_state", "ESP Gripper State"),
+            _port("slam_trajectory", "SLAM Trajectory"),
+            _port("tactile_force_matrices", "Left and Right Force Matrices"),
+        ]
+        if outputs != old_outputs:
+            data["outputs"] = outputs
+            changed = True
     if node_type in RGB_2D_TYPES:
         old_outputs = data.get("outputs") or []
         # The public contract is intentionally one output. Multi-view files
@@ -176,6 +187,15 @@ def migrate_graph_types(graph: dict | None) -> tuple[dict, bool]:
             )
             changed = True
             continue
+        if source_type == "gripper_device" and handle in {"tactile_left", "tactile_right"}:
+            edge["sourceHandle"] = "tactile_force_matrices"
+            edge["id"] = (
+                f"xy-edge__{edge.get('source') or ''}"
+                f"{edge.get('sourceHandle') or ''}-"
+                f"{edge.get('target') or ''}{edge.get('targetHandle') or ''}"
+            )
+            changed = True
+            continue
         if source_type not in RGB_2D_TYPES:
             continue
         if handle == "hand_3d" or handle.startswith("hand_3d#"):
@@ -204,6 +224,30 @@ def migrate_graph_types(graph: dict | None) -> tuple[dict, bool]:
                 f"{edge.get('target') or ''}{edge.get('targetHandle') or ''}"
             )
             changed = True
+
+    # Merging the two tactile ports can make two historical edges identical
+    # when both sides were connected to the same downstream input.
+    unique_edges: list[dict[str, Any]] = []
+    seen_gripper_edges: set[tuple[str, str, str, str]] = set()
+    for edge in result.get("edges") or []:
+        if not isinstance(edge, dict):
+            unique_edges.append(edge)
+            continue
+        if (node_types.get(str(edge.get("source") or "")) == "gripper_device"
+                and edge.get("sourceHandle") == "tactile_force_matrices"):
+            key = (
+                str(edge.get("source") or ""),
+                str(edge.get("sourceHandle") or ""),
+                str(edge.get("target") or ""),
+                str(edge.get("targetHandle") or ""),
+            )
+            if key in seen_gripper_edges:
+                changed = True
+                continue
+            seen_gripper_edges.add(key)
+        unique_edges.append(edge)
+    if len(unique_edges) != len(result.get("edges") or []):
+        result["edges"] = unique_edges
 
     # If an old workflow already used an RGB-D input card, complete its new
     # typed depth edge. Do not invent a depth source for old mono cards: those

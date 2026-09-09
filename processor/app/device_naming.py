@@ -18,6 +18,7 @@ DEVICE_LABELS = {
     "mono_rgb": "RGB Camera",
     "stereo_rgb": "Stereo RGB Camera",
     "glove_sensor": "Glove Sensor",
+    "gripper_device": "UMI Gripper",
 }
 
 
@@ -58,6 +59,12 @@ def camera_profile(kind: object = "", name: object = "",
     name_text = str(name or "").strip().lower()
     slot_keys = _keys(slots)
     text = " ".join([kind_text, name_text, *[key.lower() for key in slot_keys]])
+
+    # UMI publishes several internal channels (RGB, stereo and tactile data)
+    # but it is one physical workflow input.  Do this before stereo detection
+    # so its internal left/right camera slots are not exposed as a camera card.
+    if "gripper" in kind_text or "umi" in name_text:
+        return "gripper_device", None
 
     # Collectors do not always spell RGB slots with ``rgb``/``color``;
     # ``stereo_left`` and ``stereo_right`` are also color video streams. Any
@@ -105,6 +112,8 @@ def decorate_device_sources(sources: list[dict]) -> list[dict]:
         input_type = str(source.get("input_type") or "")
         if input_type == "glove_sensor":
             profile, lens = "glove_sensor", None
+        elif input_type == "gripper_device":
+            profile, lens = "gripper_device", None
         else:
             profile, lens = camera_profile(
                 source.get("kind"), source.get("name"),

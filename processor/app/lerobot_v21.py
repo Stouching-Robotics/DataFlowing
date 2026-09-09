@@ -170,16 +170,33 @@ def _depth_video_info_from_path(path: Path) -> dict[str, Any]:
         info = _read_json(info_path)
         feature = (info.get("features") or {}).get(
             f"observation.images.{source}", {})
-        video_info = feature.get("video_info") if isinstance(feature, dict) else None
-        return dict(video_info) if isinstance(video_info, dict) else {}
+        video_info = dict(feature.get("video_info")) if isinstance(feature, dict) and isinstance(feature.get("video_info"), dict) else {}
+        # 逐批次覆盖:episodes 索引行可声明 video.depth_encoding,
+        # 用于"同一会话混合新旧格式"的历史数据(如 9/4 对数批次与
+        # 8 月 mm/10 批次并存于一个会话)。
+        try:
+            import pyarrow.parquet as pq
+            idx = info_path.parent / "episodes" / "chunk-000" / f"{path.stem}.parquet"
+            if idx.is_file():
+                row = pq.read_table(idx).to_pandas().iloc[0]
+                override = row.get("video.depth_encoding")
+                if override and str(override).strip():
+                    video_info["video.depth_encoding"] = str(override).strip()
+        except Exception:
+            pass
+        return video_info
     return {}
 
 
 def _depth_video_mode(video_info: dict[str, Any]) -> str:
-    """Return ``log``, ``legacy_log`` or ``direct_mm`` for a stored stream."""
+    """Return ``log``, ``legacy_log``, ``legacy_mm10`` or ``direct_mm`` for a stored stream."""
     if not isinstance(video_info, dict):
         video_info = {}
     encoding = str(video_info.get("video.depth_encoding") or "").lower()
+    # 8 月老采集端深度按 0.1 系数存储(毫米/10),显式声明为 legacy_mm10。
+    # 该检查必须在 uint16_mm 检查之前,否则会被当成直接毫米读出 10 倍偏小。
+    if "mm10" in encoding or "mm/10" in encoding:
+        return "legacy_mm10"
     # Older uploads explicitly identify the gray12le samples as direct
     # millimetres.  This check must happen before the generic gray12le
     # fallback below; otherwise a direct-mm stream is interpreted as a log
@@ -765,6 +782,12 @@ class DepthVideoReader:
             # processing must retain its invalid-pixel semantics.
             depth[codes == 0] = 0
             return depth
+        if self.mode == "legacy_mm10":
+            # 8 月老采集端把毫米深度按 0.1 系数存储(码值 = mm/10),
+            # ×10 还原毫米;0 仍保持无效像素语义。
+            depth = codes.astype(np.float64) * 10.0
+            depth[codes == 0] = 0.0
+            return np.rint(np.clip(depth, 0, 65535)).astype("<u2")
         if self.mode == "legacy_log":
             low = float(self.video_info["video.depth_min"])
             high = float(self.video_info["video.depth_max"])

@@ -80,6 +80,7 @@ app.add_middleware(AuthMiddleware)
 # 像卡死。这些路径直接透传原始字节(去掉 accept-encoding 头即可)。
 _NO_COMPRESS_PATH_HINTS = (
     "download", "stream", "depth-codes", "depth-preview", "skeleton", "hdf5",
+    "tactile-matrix-data",
 )
 
 

@@ -257,6 +257,24 @@
         overlays.set(key, state);
         updateMenuStatus();
 
+        // The keypoint request and video metadata arrive independently. If
+        // keypoints win the race, _render() sees videoWidth === 0 and exits;
+        // without a later metadata event the overlay only appears after the
+        // central clock advances a few frames. Re-render on the first usable
+        // video layout while keeping the exact current frame.
+        const video = holder.querySelector('video');
+        const renderWhenVideoReady = () => {
+            if (overlays.get(key) !== state || state.status !== 'ready') return;
+            _render(state);
+        };
+        state.video = video;
+        state.renderWhenVideoReady = renderWhenVideoReady;
+        if (video) {
+            ['loadedmetadata', 'loadeddata', 'canplay', 'playing', 'resize']
+                .forEach(eventName => video.addEventListener(
+                    eventName, renderWhenVideoReady));
+        }
+
         // 首帧探测:数据存在性 + 第一窗口
         const initialReady = (async () => {
             const count = Number(source.frame_count) || 0;
@@ -290,6 +308,11 @@
         const st = overlays.get(key);
         if (!st) return;
         overlays.delete(key);
+        if (st.video && st.renderWhenVideoReady) {
+            ['loadedmetadata', 'loadeddata', 'canplay', 'playing', 'resize']
+                .forEach(eventName => st.video.removeEventListener(
+                    eventName, st.renderWhenVideoReady));
+        }
         st.svg.remove();
         updateMenuStatus();
     }

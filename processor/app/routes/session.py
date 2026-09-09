@@ -267,6 +267,8 @@ async def _process_upload_job(
         # ---- 读任务名 ----
         meta_root = _find_meta_dir(extract_tmp) or extract_tmp
         info = _read_json(meta_root / "meta" / "info.json")
+        if not isinstance(info, dict):
+            info = {}
         fps = info.get("fps", 30)
         codebase_version = info.get("codebase_version", "v3.0")
 
@@ -310,11 +312,21 @@ async def _process_upload_job(
             list_projects, write_episode_state, list_upload_history,
         )
         requested_project_id = str(project_id or "").strip()
-        project_name = (name or zip_info['prefix']).strip()
+        archive_project_name = str(
+            info.get("project_name") or info.get("task_name") or ""
+        ).strip()
+        archive_project_id = str(info.get("project_id") or "").strip()
+        # ``task_name`` is the project display name for collector archives.
+        # The upload form name remains a backwards-compatible fallback, while
+        # an explicit project_id still has highest priority below.
+        project_name = (archive_project_name or name or zip_info['prefix']).strip()
         # 项目可以先建好再搭工作流。只有 archived 项目不再接收新批次；
         # draft/active/paused 都保留数据归属，active 才决定是否自动派发。
         active_projects = [p for p in list_projects()
                            if p.get("status", "active") != "archived"]
+
+        def _name_key(value: object) -> str:
+            return sanitize_task_name(str(value or "")).casefold()
 
         def _project_aliases(project: dict) -> set[str]:
             aliases = {str(project.get("name") or "").strip()}
@@ -364,10 +376,11 @@ async def _process_upload_job(
             # Legacy clients may still send only name. Keep compatibility, but
             # require a unique exact/prefix resolution when no project_id was
             # supplied; the selected project remains visible in the response.
-            project_name_low = project_name.lower()
             exact_hits = [
                 p for p in active_projects
-                if project_name_low in {alias.lower() for alias in aliases_by_project[id(p)]}
+                if (_name_key(project_name) in {
+                    _name_key(alias) for alias in aliases_by_project[id(p)]
+                })
             ]
             if len(exact_hits) == 1:
                 matched_project = exact_hits[0]
@@ -380,7 +393,7 @@ async def _process_upload_job(
             else:
                 prefix_hits = [
                     p for p in active_projects
-                    if any(project_name_low.startswith(alias.lower())
+                    if any(_name_key(project_name).startswith(_name_key(alias))
                            for alias in aliases_by_project[id(p)])
                 ]
                 # Only use a prefix fallback when exactly one project wins.
@@ -390,13 +403,13 @@ async def _process_upload_job(
                         len(alias)
                         for p in prefix_hits
                         for alias in aliases_by_project[id(p)]
-                        if project_name_low.startswith(alias.lower())
+                        if _name_key(project_name).startswith(_name_key(alias))
                     )
                     longest_hits = [
                         p for p in prefix_hits
                         if any(
-                            project_name_low.startswith(alias.lower())
-                            and len(alias) == longest
+                            _name_key(project_name).startswith(_name_key(alias))
+                            and len(_name_key(alias)) == longest
                             for alias in aliases_by_project[id(p)]
                         )
                     ]
@@ -408,7 +421,18 @@ async def _process_upload_job(
                             detail=(f"Ambiguous project prefix '{project_name}'; "
                                     "provide project_id explicitly"),
                         )
-        project_folder = sanitize_task_name(matched_project["name"]) if matched_project else "Uncategorized"
+        resolved_project_name = str(
+            matched_project.get("name") if matched_project
+            else project_name or "Uncategorized"
+        ).strip() or "Uncategorized"
+        resolved_project_id = (
+            str(matched_project.get("id")) if matched_project and matched_project.get("id")
+            else archive_project_id or None
+        )
+        # A collector archive with a task/project name gets its own project
+        # root even when no server-side workflow/project record exists yet.
+        # This keeps ingestion isolated without creating a workflow.
+        project_folder = sanitize_task_name(resolved_project_name)
         upload_history = list_upload_history()
         project_dir = settings.storage_root / "sessions" / project_folder
         from app.project_dataset import (
@@ -435,7 +459,10 @@ async def _process_upload_job(
             project_dir, incoming_name,
             matched_project["name"] if matched_project else project_folder,
         )
-        batch_preexisted = batch_name in existing_ids
+        # Only an ID that came from an existing upload is a re-upload.  Never
+        # infer replacement from the generated candidate ID; old datasets may
+        # contain mismatched IDs such as index=0 / id=..._000001.
+        batch_preexisted = incoming_name in existing_ids
         is_reupload = batch_preexisted
         batch_dir = project_dir
         archive_size_bytes = archive_path.stat().st_size if archive_path.is_file() else 0
@@ -463,6 +490,13 @@ async def _process_upload_job(
         )
         normalize_extracted_dataset(staging_dir, batch_name)
         info = _read_json(staging_dir / "meta" / "info.json")
+        if not isinstance(info, dict):
+            info = {}
+        info["project_name"] = resolved_project_name
+        if resolved_project_id:
+            info["project_id"] = resolved_project_id
+        info["task_name"] = str(info.get("task_name") or resolved_project_name)
+        _write_json(staging_dir / "meta" / "info.json", info)
 
         # ---- 直接扫描规范化后的源视频,不把纯深度流当成 RGB 相机 ----
         video_records = []
@@ -492,7 +526,8 @@ async def _process_upload_job(
         new_state = {
             "id": batch_name,
             "name": batch_name,
-            "project": matched_project["name"] if matched_project else "Uncategorized",
+            "project": resolved_project_name,
+            "project_id": resolved_project_id,
             "status": "to_review",
             "fps": fps,
             "frame_count": master_frame_count,
@@ -647,8 +682,8 @@ async def _process_upload_job(
             "session_name": zip_info['prefix'],
             "files_preserved": str(batch_dir),
             "imported": 1 if video_records else 0,
-            "project_id": matched_project.get("id") if matched_project else None,
-            "project_name": matched_project.get("name") if matched_project else None,
+            "project_id": resolved_project_id,
+            "project_name": resolved_project_name,
             "dispatch": dispatch_result,
             "episodes": [{
                 "episode_id": batch_name,
@@ -1057,6 +1092,16 @@ def _read_json(path: Path) -> dict:
     if path.exists():
         with open(path) as f: return json.load(f)
     return {}
+
+
+def _write_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
 
 
 def _read_lines(path: Path) -> list[str]:

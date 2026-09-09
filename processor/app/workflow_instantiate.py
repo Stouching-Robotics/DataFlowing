@@ -39,7 +39,7 @@ from app.workflow_types import HAND_PROCESS_TYPES, migrate_graph_types
 # increment-instance de-duplication.
 INPUT_MODULES = {
     "mono_camera", "rgbd_camera", "rgb_camera", "fisheye_camera",
-    "stereo_camera", "stereo_rgbd_camera", "glove_sensor",
+    "stereo_camera", "stereo_rgbd_camera", "glove_sensor", "gripper_device",
 }
 VIDEO_PROCESS_TYPES = {
     "mediapipe_hand", *HAND_PROCESS_TYPES,
@@ -273,7 +273,22 @@ def complete_graph(graph: dict, camera_names: list[str], sensors: list[str]) -> 
         key for module, key in covered
         if module in {"stereo_camera", "stereo_rgbd_camera"}
     }
-    for group in _camera_groups(mains):
+    # UMI publishes a primary RGB stream and internal left/right streams. They
+    # belong to one physical source node, not three camera inputs.
+    gripper_mains = [
+        c for c in mains
+        if "gripper" in str(c).lower() or "umi" in str(c).lower()
+    ]
+    camera_mains = [c for c in mains if c not in gripper_mains]
+    covered_gripper = any(
+        module == "gripper_device" and key in {
+            value.lower() for value in gripper_mains
+        }
+        for module, key in covered
+    )
+    if gripper_mains and not covered_gripper:
+        video_groups.append(("gripper_device", gripper_mains))
+    for group in _camera_groups(camera_mains):
         mod = "stereo_camera" if len(group) > 1 else _camera_module(group[0])
         if mod in {"stereo_camera", "stereo_rgbd_camera"}:
             # A complete existing pair is already covered. An unpaired
@@ -340,7 +355,9 @@ def complete_graph(graph: dict, camera_names: list[str], sensors: list[str]) -> 
 
     # ── 5. 视频输入节点:连接模板中的视频处理节点 ──
     for mod, keys in video_groups:
-        if mod in {"stereo_camera", "stereo_rgbd_camera"}:
+        if mod == "gripper_device":
+            handles = ["rgb_video"]
+        elif mod in {"stereo_camera", "stereo_rgbd_camera"}:
             handles = ["video_left"] if len(keys) < 2 else ["video_left", "video_right"]
         else:
             handles = ["video"]
@@ -484,7 +501,7 @@ def batch_covers_instance(instance: dict, camera_names: list[str]) -> bool:
     }
     for n in graph.get("nodes", []):
         data = n.get("data") or {}
-        if data.get("category") != "input" or data.get("nodeType") == "glove_sensor":
+        if data.get("category") != "input" or data.get("nodeType") in {"glove_sensor", "gripper_device"}:
             continue
         keys = [str(k).lower() for k in _keys_of(data.get("config") or {})]
         if not keys:

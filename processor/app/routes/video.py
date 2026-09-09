@@ -5,6 +5,8 @@ import re
 import asyncio
 import shutil
 import threading
+import math
+from collections import OrderedDict
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -33,6 +35,28 @@ _DEPTH_READER_POOL_LOCK = threading.Lock()
 _DEPTH_READER_POOL_MAX = 8
 _DEPTH_FRAME_CACHE: dict[tuple[str, int], object] = {}
 _DEPTH_FRAME_CACHE_MAX = 48
+# Canonical SLAM rows are shared by the trajectory and frame-window requests.
+# The cache is keyed by file size/mtime so a workflow reprocess cannot return
+# a trajectory from an older parquet.
+_SLAM_DATA_CACHE: dict[str, tuple[str, list[dict]]] = {}
+_SLAM_DATA_CACHE_MAX = 8
+# UMI tactile matrices are stored as three flattened int16 planes per frame
+# (250*250*3).  Keep only encoded preview images here; never retain a whole
+# episode of matrices in the API process.
+_TACTILE_PREVIEW_CACHE: OrderedDict[tuple, bytes] = OrderedDict()
+_TACTILE_PREVIEW_CACHE_MAX = 48
+_TACTILE_FIELD_CACHE: OrderedDict[tuple, tuple[bytes, float, float]] = OrderedDict()
+_TACTILE_FIELD_CACHE_MAX = 96
+_TACTILE_PREVIEW_LOCK = threading.Lock()
+_TACTILE_SHAPE = (250, 250)
+_TACTILE_COLUMNS = {
+    "left": "observation.gripper_left_force_matrix",
+    "right": "observation.gripper_right_force_matrix",
+}
+_TACTILE_FORCE_COLUMNS = {
+    "left": "observation.gripper_left_force",
+    "right": "observation.gripper_right_force",
+}
 # Sequential decode is cheap, but decoding through more than this many
 # frames to reach a scrub target is not; jump via a seek reader instead.
 _DEPTH_WINDOW_SEEK_GAP = 6
@@ -224,6 +248,621 @@ def _canonical_episode_data_files(session_dir: Path, episode_id: str) -> list[Pa
         return list(episode_files(root, int(row.get("episode_index", 0))).get("data", []))
     except (OSError, TypeError, ValueError):
         return []
+
+
+def _read_gripper_state(value) -> list[float] | None:
+    """Read the legacy UMI state vector without changing its raw values.
+
+    The acquisition contract used by the current gripper writer is
+    ``[percent, gripped, raw]``.  Keep the complete vector in the response so
+    future renderers can use the encoder value without recomputing it.
+    """
+    if value is None:
+        return None
+    try:
+        values = list(value)
+    except TypeError:
+        return None
+    result: list[float] = []
+    for item in values[:3]:
+        try:
+            number = float(item)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(number):
+            return None
+        result.append(number)
+    return result or None
+
+
+def _read_slam_rows(path: Path) -> tuple[str, list[dict]]:
+    """Read canonical ``observation.slam_pose`` rows once per parquet revision."""
+    import numpy as np
+    import pandas as pd
+
+    path = Path(path)
+    try:
+        stat = path.stat()
+        revision = f"{int(stat.st_size):x}-{int(stat.st_mtime_ns):x}"
+    except OSError:
+        return "unknown", []
+    cache_key = str(path.resolve())
+    cached = _SLAM_DATA_CACHE.get(cache_key)
+    if cached is not None and cached[0] == revision:
+        return cached
+    columns = ["frame_index", "timestamp", "observation.slam_pose"]
+    has_gripper_state = False
+    try:
+        import pyarrow.parquet as pq
+        available_columns = set(pq.ParquetFile(path).schema_arrow.names)
+        has_gripper_state = "observation.gripper_state" in available_columns
+    except Exception:
+        pass
+    if has_gripper_state:
+        columns.append("observation.gripper_state")
+    try:
+        df = pd.read_parquet(path, columns=columns, engine="pyarrow")
+    except Exception:
+        return revision, []
+
+    rows: list[dict] = []
+    for _, row in df.iterrows():
+        try:
+            frame = int(row.get("frame_index", len(rows)))
+        except (TypeError, ValueError):
+            continue
+        timestamp = row.get("timestamp")
+        try:
+            timestamp = float(timestamp) if np.isfinite(float(timestamp)) else None
+        except (TypeError, ValueError):
+            timestamp = None
+        pose = row.get("observation.slam_pose")
+        try:
+            values = np.asarray(pose, dtype=np.float64).reshape(-1)
+        except (TypeError, ValueError):
+            values = np.empty(0, dtype=np.float64)
+
+        # A missing native SLAM sample is represented by an all-zero pose in
+        # some recordings.  It is not the same thing as a valid pose at the
+        # origin: a valid pose always has a unit quaternion.  Keep only valid
+        # poses and remember the gap so the renderer can break the polyline.
+        valid = values.size >= 7 and np.isfinite(values[:7]).all()
+        if valid:
+            quaternion_norm = float(np.linalg.norm(values[3:7]))
+            valid = 0.5 <= quaternion_norm <= 1.5
+        if not valid:
+            continue
+        rows.append({
+            "f": frame,
+            "p": [float(value) for value in values[:7]],
+            "t": timestamp,
+            "g": _read_gripper_state(row.get("observation.gripper_state"))
+            if has_gripper_state else None,
+        })
+    rows.sort(key=lambda item: item["f"])
+
+    # Decimation can legitimately make frame numbers non-consecutive, so the
+    # frontend must not infer a gap from every frame jump.  Mark only gaps
+    # caused by missing/invalid source rows; sampled long trajectories remain
+    # a continuous polyline.
+    previous_frame = None
+    for item in rows:
+        frame = int(item["f"])
+        item["gap_before"] = (
+            previous_frame is not None and frame != previous_frame + 1
+        )
+        previous_frame = frame
+    result = (revision, rows)
+    _SLAM_DATA_CACHE[cache_key] = result
+    while len(_SLAM_DATA_CACHE) > _SLAM_DATA_CACHE_MAX:
+        _SLAM_DATA_CACHE.pop(next(iter(_SLAM_DATA_CACHE)))
+    return result
+
+
+def _decimate_slam_rows(rows: list[dict], max_points: int) -> list[dict]:
+    if max_points <= 0 or len(rows) <= max_points:
+        return rows
+    if max_points == 1:
+        return [rows[0]]
+    indexes = {
+        round(index * (len(rows) - 1) / (max_points - 1))
+        for index in range(max_points)
+    }
+    return [rows[index] for index in sorted(indexes)]
+
+
+def _tactile_episode_file(episode_id: str) -> Path | None:
+    ep = get_episode(episode_id)
+    if ep is None:
+        return None
+    files = _canonical_episode_data_files(Path(ep["path"]), episode_id)
+    return files[0] if files else None
+
+
+def _tactile_matrix_columns(path: Path) -> set[str]:
+    try:
+        import pyarrow.parquet as pq
+        return set(pq.ParquetFile(path).schema_arrow.names)
+    except Exception:
+        return set()
+
+
+def _read_tactile_force_series(path: Path) -> dict | None:
+    """Read the small scalar-force series used by the matrix value badges."""
+    import numpy as np
+    import pyarrow.parquet as pq
+
+    try:
+        available = set(pq.ParquetFile(path).schema_arrow.names)
+        selected = [
+            column for column in _TACTILE_FORCE_COLUMNS.values()
+            if column in available
+        ]
+        if not selected:
+            return None
+        table = pq.read_table(path, columns=["frame_index", *selected])
+        frames = [int(value) for value in table.column("frame_index").to_pylist()]
+        result = {"frames": frames, "left": [], "right": []}
+        for side, column in _TACTILE_FORCE_COLUMNS.items():
+            if column not in selected:
+                result[side] = [None] * len(frames)
+                continue
+            values = table.column(column).to_pylist()
+            normalized = []
+            for value in values:
+                try:
+                    vector = np.asarray(value, dtype=np.float64).reshape(-1)
+                    if vector.size < 3 or not np.isfinite(vector[:3]).all():
+                        normalized.append(None)
+                    else:
+                        normalized.append([float(item) for item in vector[:3]])
+                except (TypeError, ValueError, OverflowError):
+                    normalized.append(None)
+            result[side] = normalized
+        return result
+    except Exception:
+        return None
+
+
+def _decode_tactile_matrix(value):
+    """Decode one canonical 250x250x3 row-diff force matrix to mN.
+
+    The recorder difference-encodes each sensor row after interleaving the
+    three components: ``[fx0, fy0, fz0, fx1, fy1, fz1, ...]``.  Therefore the
+    prefix sum must run over the full 750-value row before reshaping back to
+    HWC.  Splitting H/W/C first and accumulating each channel independently
+    produces a different matrix and was the cause of the incorrect preview.
+    The int16 cast is intentional: the recorder's contract is modulo-2^16 and
+    the final values are integer mN.
+    """
+    import numpy as np
+
+    if value is None:
+        return None
+    try:
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            raw = np.frombuffer(value, dtype="<i2")
+        else:
+            raw = np.asarray(value, dtype=np.int16).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+    if raw.size == 0:
+        return None
+    pixels = _TACTILE_SHAPE[0] * _TACTILE_SHAPE[1]
+    if raw.size == pixels * 3:
+        # Canonical data: row-diff over H x (W*3), then H x W x [fx,fy,fz].
+        flat_rows = raw.reshape(_TACTILE_SHAPE[0], _TACTILE_SHAPE[1] * 3)
+        decoded_hwc = np.cumsum(flat_rows, axis=1, dtype=np.int16)
+        decoded = decoded_hwc.reshape(*_TACTILE_SHAPE, 3).transpose(2, 0, 1)
+    elif raw.size == pixels:
+        # Legacy single-channel field: row-diff over H x W.
+        rows = raw.reshape(*_TACTILE_SHAPE)
+        decoded = np.cumsum(rows, axis=1, dtype=np.int16)[None, ...]
+    else:
+        return None
+    decoded = decoded.astype(np.float32)
+    if decoded.shape[0] == 1:
+        decoded = decoded.repeat(3, axis=0)
+    return decoded
+
+
+def _read_tactile_frame(path: Path, frame_index: int, side: str):
+    """Read only the requested parquet row and side.
+
+    PyArrow applies the frame_index predicate before materialising the list
+    column.  This keeps normal scrubbing bounded to one matrix row instead of
+    loading both force streams into the browser.
+    """
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    column = _TACTILE_COLUMNS.get(side)
+    if column is None:
+        return None
+    try:
+        table = pq.read_table(
+            path,
+            columns=["frame_index", column],
+            filters=[("frame_index", "=", int(frame_index))],
+        )
+        if table.num_rows == 0:
+            return None
+        frames = table.column("frame_index").to_pylist()
+        column_data = table.column(column)
+        if isinstance(column_data, pa.ChunkedArray):
+            column_data = column_data.combine_chunks()
+        offsets = np.asarray(column_data.offsets, dtype=np.int64)
+        values = np.asarray(column_data.values, dtype=np.int16)
+        for index, frame in enumerate(frames):
+            if int(frame) == int(frame_index):
+                decoded = _decode_tactile_matrix(
+                    values[offsets[index]:offsets[index + 1]])
+                # Some writers emit an empty vector for a valid first frame
+                # before the tactile device publishes its first sample. Keep
+                # that frame drawable as an all-zero matrix rather than
+                # making the UI show a broken image.
+                if decoded is None:
+                    return np.zeros((3, *_TACTILE_SHAPE), dtype=np.float32)
+                return decoded
+    except Exception:
+        return None
+    return None
+
+
+def _tactile_force_field(
+    path: Path, frame_index: int, side: str,
+) -> tuple[bytes, float, float] | None:
+    """Return one smoothed fz pressure field as float32 bytes.
+
+    The payload is numeric data, not a rendered image.  The frontend applies
+    the color map in WebGL2.  ``lo``/``hi`` preserve the acquisition-side
+    per-frame contrast normalization without sending a rendered image.
+    """
+    import cv2
+    import numpy as np
+
+    try:
+        stat = path.stat()
+        revision = (int(stat.st_size), int(stat.st_mtime_ns))
+    except OSError:
+        revision = (0, 0)
+    if side not in _TACTILE_COLUMNS:
+        return None
+    cache_key = (str(path.resolve()), revision, int(frame_index), side)
+    with _TACTILE_PREVIEW_LOCK:
+        cached = _TACTILE_FIELD_CACHE.get(cache_key)
+        if cached is not None:
+            _TACTILE_FIELD_CACHE.move_to_end(cache_key)
+            return cached
+
+    matrix = _read_tactile_frame(path, frame_index, side)
+    if matrix is None:
+        return None
+    # Match the acquisition-side heatmap exactly: the color field is the
+    # calibrated normal-pressure channel fz.  fx/fy remain available in the
+    # numeric force badge and are intentionally not mixed into this primary
+    # pressure visualization.
+    pressure = np.maximum(matrix[2], 0.0)
+    pressure = cv2.GaussianBlur(pressure, (3, 3), 0.8)
+    valid = pressure[pressure > 0.01]
+    lo = 0.0
+    hi = 1.0
+    if valid.size > 50:
+        lo = float(np.percentile(valid, 10))
+        hi = max(float(np.percentile(valid, 98)) * 1.3, lo + 0.5)
+    field = np.ascontiguousarray(pressure, dtype="<f4")
+    result = (field.tobytes(), lo, hi)
+    with _TACTILE_PREVIEW_LOCK:
+        _TACTILE_FIELD_CACHE[cache_key] = result
+        _TACTILE_FIELD_CACHE.move_to_end(cache_key)
+        while len(_TACTILE_FIELD_CACHE) > _TACTILE_FIELD_CACHE_MAX:
+            _TACTILE_FIELD_CACHE.popitem(last=False)
+    return result
+
+
+_TACTILE_RANGE_CACHE: OrderedDict[tuple, bytes] = OrderedDict()
+_TACTILE_RANGE_CACHE_MAX = 24
+
+
+def _tactile_range_payload(path: Path, first: int, last: int,
+                           side: str) -> bytes | None:
+    """Encode a run of consecutive fz fields as R8 plus per-frame min/max.
+
+    Body layout: ``frames * 250 * 250`` bytes of R8 (one byte per cell, row
+    major) followed by ``frames * 2`` little-endian float32 values holding
+    each frame's ``lo``/``hi`` normalisation pair.  One request per window
+    replaces one 250 KB request per frame, which is what saturated the
+    browser's socket buffers (net::ERR_NO_BUFFER_SPACE) during playback.
+    """
+    import cv2
+    import numpy as np
+    import pyarrow.parquet as pq
+
+    column = _TACTILE_COLUMNS.get(side)
+    if column is None or last <= first:
+        return None
+    try:
+        stat = path.stat()
+        revision = f"{int(stat.st_size):x}-{int(stat.st_mtime_ns):x}"
+    except OSError:
+        revision = "0-0"
+    cache_key = (str(path.resolve()), revision, int(first), int(last), side)
+    with _TACTILE_PREVIEW_LOCK:
+        cached = _TACTILE_RANGE_CACHE.get(cache_key)
+        if cached is not None:
+            _TACTILE_RANGE_CACHE.move_to_end(cache_key)
+            return cached
+    try:
+        table = pq.read_table(
+            path,
+            columns=["frame_index", column],
+            filters=[("frame_index", ">=", int(first)),
+                     ("frame_index", "<", int(last))],
+        )
+    except Exception:
+        return None
+    frames = [int(value) for value in table.column("frame_index").to_pylist()]
+    # Read the list column straight out of the arrow buffers: as_py() would
+    # materialise 187500 Python ints per frame (~100 ms each).
+    import pyarrow as pa
+    column_data = table.column(column)
+    if isinstance(column_data, pa.ChunkedArray):
+        column_data = column_data.combine_chunks()
+    offsets = np.asarray(column_data.offsets, dtype=np.int64)
+    values = np.asarray(column_data.values, dtype=np.int16)
+    rows = {frame: values[offsets[index]:offsets[index + 1]]
+            for index, frame in enumerate(frames)}
+    pixels = _TACTILE_SHAPE[0] * _TACTILE_SHAPE[1]
+    blocks: list[bytes] = []
+    pairs: list[float] = []
+    for frame in range(int(first), int(last)):
+        matrix = _decode_tactile_matrix(rows.get(frame))
+        if matrix is None:
+            blocks.append(bytes(pixels))
+            pairs.extend((0.0, 1.0))
+            continue
+        pressure = np.maximum(matrix[2], 0.0)
+        pressure = cv2.GaussianBlur(pressure, (3, 3), 0.8)
+        valid = pressure[pressure > 0.01]
+        lo = 0.0
+        hi = 1.0
+        if valid.size > 50:
+            lo = float(np.percentile(valid, 10))
+            hi = max(float(np.percentile(valid, 98)) * 1.3, lo + 0.5)
+        scaled = np.clip((pressure - lo) / (hi - lo + 1e-6), 0.0, 1.0)
+        blocks.append(np.rint(scaled * 255.0).astype(np.uint8).tobytes())
+        pairs.extend((lo, hi))
+    payload = b"".join(blocks) + np.asarray(pairs, dtype="<f4").tobytes()
+    with _TACTILE_PREVIEW_LOCK:
+        _TACTILE_RANGE_CACHE[cache_key] = payload
+        _TACTILE_RANGE_CACHE.move_to_end(cache_key)
+        while len(_TACTILE_RANGE_CACHE) > _TACTILE_RANGE_CACHE_MAX:
+            _TACTILE_RANGE_CACHE.popitem(last=False)
+    return payload
+
+
+def _tactile_preview_png(path: Path, frame_index: int, side: str) -> bytes | None:
+    """Render the numeric force field as a legacy WebP preview."""
+    import cv2
+    import numpy as np
+
+    try:
+        stat = path.stat()
+        revision = (int(stat.st_size), int(stat.st_mtime_ns))
+    except OSError:
+        revision = (0, 0)
+    cache_key = (str(path.resolve()), revision, int(frame_index), side)
+    with _TACTILE_PREVIEW_LOCK:
+        cached = _TACTILE_PREVIEW_CACHE.get(cache_key)
+        if cached is not None:
+            _TACTILE_PREVIEW_CACHE.move_to_end(cache_key)
+            return cached
+    field_data = _tactile_force_field(path, frame_index, side)
+    if field_data is None:
+        return None
+    raw, lo, hi = field_data
+    force_magnitude = np.frombuffer(raw, dtype="<f4").reshape(_TACTILE_SHAPE)
+    force_magnitude = np.clip(
+        (force_magnitude - lo) / (hi - lo + 1e-6), 0.0, 1.0
+    )
+    gray = np.uint8(np.round(force_magnitude * 255.0))
+    # Keep the complete 250x250 field visible as a real heatmap.  JET's
+    # lowest value is the cold blue end of the scale, so zero-pressure cells
+    # remain visible instead of turning the preview into a mostly-black image
+    # with a thin coloured line.  This changes only the visualization; the
+    # decoded force matrix and its zero cells are not modified.
+    colored = cv2.applyColorMap(gray, cv2.COLORMAP_JET)
+    _, encoded = cv2.imencode(".webp", colored,
+                              [cv2.IMWRITE_WEBP_QUALITY, 90])
+    result = encoded.tobytes()
+    with _TACTILE_PREVIEW_LOCK:
+        _TACTILE_PREVIEW_CACHE[cache_key] = result
+        _TACTILE_PREVIEW_CACHE.move_to_end(cache_key)
+        while len(_TACTILE_PREVIEW_CACHE) > _TACTILE_PREVIEW_CACHE_MAX:
+            _TACTILE_PREVIEW_CACHE.popitem(last=False)
+    return result
+
+
+@router.get("/{episode_id}/tactile-matrix-data/{frame_index}")
+def get_tactile_matrix_data(
+    episode_id: str,
+    frame_index: int,
+    side: str = Query("left", pattern="^(left|right)$"),
+):
+    """Return one numeric all-component force field for WebGL2 rendering."""
+    if frame_index < 0:
+        raise HTTPException(status_code=400, detail="frame_index must be non-negative")
+    path = _tactile_episode_file(episode_id)
+    if path is None or not _tactile_matrix_columns(path).intersection(_TACTILE_COLUMNS.values()):
+        raise HTTPException(status_code=404, detail="force matrices are unavailable")
+    field = _tactile_force_field(path, frame_index, side)
+    if field is None:
+        raise HTTPException(status_code=404, detail=f"no force matrix at frame {frame_index}")
+    raw, lo, hi = field
+    return Response(
+        content=raw,
+        media_type="application/octet-stream",
+        headers={
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "X-Force-Width": str(_TACTILE_SHAPE[1]),
+            "X-Force-Height": str(_TACTILE_SHAPE[0]),
+            "X-Force-Dtype": "float32-le",
+            "X-Force-Min": repr(lo),
+            "X-Force-Max": repr(hi),
+        },
+    )
+
+
+@router.get("/{episode_id}/tactile-matrix-meta")
+def get_tactile_matrix_meta(episode_id: str):
+    path = _tactile_episode_file(episode_id)
+    columns = _tactile_matrix_columns(path) if path else set()
+    sides = [side for side, column in _TACTILE_COLUMNS.items() if column in columns]
+    ep = get_episode(episode_id)
+    try:
+        stat = path.stat() if path else None
+        revision = f"{int(stat.st_size):x}-{int(stat.st_mtime_ns):x}" if stat else None
+    except OSError:
+        revision = None
+    force_series = _read_tactile_force_series(path) if path else None
+    return {
+        "available": bool(sides),
+        "episode_id": episode_id,
+        "sides": sides,
+        "shape": [250, 250, 3],
+        "units": ["mN", "mN", "mN"],
+        "channel_order": ["fx", "fy", "fz"],
+        "layout": "HWC",
+        "encoding": "row_diff_quantized",
+        "force_order": ["fx", "fy", "fz"],
+        "force_units": "mN",
+        "force_series": force_series,
+        "artifact_revision": revision,
+        "frame_count": int(ep.get("frame_count") or 0) if ep else 0,
+        "fps": float(ep.get("fps") or 30) if ep else 30.0,
+    }
+
+
+@router.get("/{episode_id}/tactile-matrix-range")
+def get_tactile_matrix_range(
+    episode_id: str,
+    side: str = Query("left", pattern="^(left|right)$"),
+    start: int = Query(0, ge=0),
+    end: int = Query(0, ge=0),
+    limit: int = Query(96, ge=1, le=256),
+):
+    """Return a run of consecutive fz fields for one side (R8 + min/max)."""
+    path = _tactile_episode_file(episode_id)
+    if path is None or not _tactile_matrix_columns(path).intersection(
+            _TACTILE_COLUMNS.values()):
+        raise HTTPException(status_code=404, detail="force matrices are unavailable")
+    ep = get_episode(episode_id)
+    total = int(ep.get("frame_count") or 0) if ep else 0
+    first = max(0, int(start))
+    last = int(end) if int(end) > first else first + int(limit)
+    last = min(last, first + int(limit))
+    if total:
+        first = min(first, max(0, total - 1))
+        last = min(last, total)
+    if last <= first:
+        raise HTTPException(status_code=404, detail="empty range")
+    payload = _tactile_range_payload(path, first, last, side)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="no force matrices in range")
+    return Response(
+        content=payload,
+        media_type="application/octet-stream",
+        headers={
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "X-Force-First": str(first),
+            "X-Force-Frames": str(last - first),
+            "X-Force-Width": str(_TACTILE_SHAPE[1]),
+            "X-Force-Height": str(_TACTILE_SHAPE[0]),
+            "X-Force-Encoding": "r8+minmax",
+        },
+    )
+
+
+@router.get("/{episode_id}/tactile-matrix/{frame_index}")
+def get_tactile_matrix_preview(
+    episode_id: str,
+    frame_index: int,
+    side: str = Query("left", pattern="^(left|right)$"),
+):
+    if frame_index < 0:
+        raise HTTPException(status_code=400, detail="frame_index must be non-negative")
+    path = _tactile_episode_file(episode_id)
+    if path is None or not _tactile_matrix_columns(path).intersection(_TACTILE_COLUMNS.values()):
+        raise HTTPException(status_code=404, detail="force matrices are unavailable")
+    image = _tactile_preview_png(path, frame_index, side)
+    if image is None:
+        raise HTTPException(status_code=404, detail=f"no force matrix at frame {frame_index}")
+    return Response(
+        content=image,
+        media_type="image/webp",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
+@router.get("/{episode_id}/slam-trajectory")
+def get_slam_trajectory(
+    episode_id: str,
+    start_frame: int | None = Query(None, ge=0),
+    end_frame: int | None = Query(None, ge=0),
+    max_points: int = Query(2400, ge=1, le=10000),
+):
+    """Return synchronized SLAM poses and a display-ready 3D trajectory.
+
+    Without a range, long episodes return a decimated trajectory.  With a
+    range, every valid pose in that frame window is returned so the browser
+    can place the current marker exactly without one request per frame.
+    Pose order is ``x,y,z,qx,qy,qz,qw`` and coordinates are metres when the
+    collector follows the UMI SLAM contract.
+    """
+    ep = get_episode(episode_id)
+    if ep is None:
+        return {"available": False, "episode_id": episode_id, "frames": [], "trajectory": []}
+    sdir = Path(ep["path"])
+    files = _canonical_episode_data_files(sdir, episode_id)
+    if not files:
+        return {"available": False, "episode_id": episode_id, "frames": [], "trajectory": []}
+    revision, rows = _read_slam_rows(files[0])
+    frame_count = int(ep.get("frame_count") or 0)
+    if rows:
+        frame_count = max(frame_count, int(rows[-1]["f"]) + 1)
+
+    ranged = start_frame is not None or end_frame is not None
+    if ranged:
+        start = max(0, int(start_frame or 0))
+        end = max(start, int(end_frame if end_frame is not None else start))
+        selected = [row for row in rows if start <= row["f"] <= end]
+        selected = _decimate_slam_rows(selected, max_points)
+        trajectory = selected
+    else:
+        start = 0
+        end = max(0, frame_count - 1)
+        trajectory = _decimate_slam_rows(rows, max_points)
+        # A short episode is returned in full, while long episodes use the
+        # same bounded sample for the initial current-frame lookup.
+        selected = trajectory
+    return {
+        "available": bool(rows),
+        "episode_id": episode_id,
+        "frame_count": frame_count,
+        "fps": float(ep.get("fps") or 30),
+        "unit": "m",
+        "pose_order": ["x", "y", "z", "qx", "qy", "qz", "qw"],
+        "gripper_state_order": ["percent", "gripped", "raw"] if any(
+            row.get("g") is not None for row in rows) else None,
+        "coordinate_frame": "slam_world",
+        "artifact_revision": revision,
+        "valid_frames": len(rows),
+        "start": start,
+        "end": end,
+        "frames": selected,
+        "trajectory": trajectory,
+    }
 
 async def _get_hand_keypoints_data(
     episode_id: str,
@@ -770,7 +1409,9 @@ def get_hand_3d(
     if cacheable_meta:
         from app.media_cache import get_hand3d_meta
         cached = get_hand3d_meta(episode_id)
-        if cached is not None and cached.get("meta_schema_version") == 2:
+        if (cached is not None
+                and cached.get("meta_schema_version") == 2
+                and cached.get("artifact_revision")):
             return cached
 
     # 手部产物只从 canonical episode parquet 读取；渲染视频不再持久化。
@@ -857,7 +1498,7 @@ def get_hand_3d(
     # canonical parquet.  Select the view with the most valid landmarks;
     # ties are stable and prefer the left camera.  The selected view still
     # contains both physical hand slots (hand_0 and hand_1).
-    columns = set(_pd.read_parquet(path, engine="pyarrow").columns)
+    columns = _hand3d_parquet_columns(path)
     source_keys = _hand3d_source_keys(columns)
     source_meta = {
         key: _hand3d_meta(path, key) for key in source_keys
@@ -914,7 +1555,7 @@ def get_hand_3d(
 
     def _read_hand3d_frames():
         """Read whichever canonical or legacy 3D columns this episode has."""
-        available = set(_pd.read_parquet(path, engine="pyarrow").columns)
+        available = _hand3d_parquet_columns(path)
         field_map = _hand3d_column_map(available, active_source)
         wanted = ["frame_index"]
         for hk, side in (("hand_0", "left"), ("hand_1", "right")):
@@ -1181,6 +1822,20 @@ def _hand3d_column_map(columns, source_key: str | None) -> dict[str, str]:
             if not name.startswith("processing.hand_3d.")}
 
 
+def _hand3d_parquet_columns(path: Path) -> set[str]:
+    """Read parquet column names without materializing any row data."""
+    try:
+        import pyarrow.parquet as _pq
+        # ``schema.names`` exposes physical leaf names for nested list columns
+        # (often just ``element``), which hides hand_N_landmarks_3d. Use the
+        # logical Arrow schema so the frame reader sees the real top-level
+        # parquet fields.
+        return set(_pq.ParquetFile(path).schema_arrow.names)
+    except Exception:
+        import pandas as _pd
+        return set(_pd.read_parquet(path, columns=[]).columns)
+
+
 def _hand3d_meta(path: Path, source_key: str | None = None) -> dict:
     """Describe canonical 3D data using the coordinate contract it stores.
 
@@ -1201,20 +1856,27 @@ def _hand3d_meta(path: Path, source_key: str | None = None) -> dict:
     valid_landmark_points = 0
     counted = False  # 计数是否真实执行过(前端据此区分"全空"与"统计失败")
     try:
-        columns = set(_pd.read_parquet(path, engine="pyarrow").columns)
+        # The browser must be able to distinguish two workflow outputs that
+        # happen to have the same episode id/frame count.  Size + mtime is a
+        # cheap revision for the canonical parquet and is stable for the
+        # lifetime of one published artifact.
+        artifact_stat = path.stat()
+        artifact_revision = (
+            f"{int(artifact_stat.st_size):x}-"
+            f"{int(artifact_stat.st_mtime_ns):x}"
+        )
+    except OSError:
+        artifact_revision = "unknown"
+    try:
+        columns = _hand3d_parquet_columns(path)
         field_map = _hand3d_column_map(columns, source_key)
         source_columns = [name for name in field_map.values()
                           if name.endswith("_depth_source")]
         if source_columns:
-            values = []
-            for name in source_columns:
-                values.extend(_pd.read_parquet(
-                    path, columns=[name], engine="pyarrow")[name]
-                    .dropna().astype(str).tolist())
-            is_rgb_estimated = any(
-                "rgb_estimate" in value.lower() or
-                "rgb_estimated" in value.lower()
-                for value in values)
+            # New metric depth artifacts always carry *_depth_source. Avoid
+            # decoding that entire object column during the click-time meta
+            # request; the source namespace is enough to classify the preview.
+            is_rgb_estimated = False
         else:
             is_rgb_estimated = any(
                 name.endswith("hand_left_3d") or
@@ -1231,10 +1893,15 @@ def _hand3d_meta(path: Path, source_key: str | None = None) -> dict:
         # metadata for the review UI; it never changes the stored data.
         # 采样统计:均匀散布读 1/3 的 row group(NAS 上全量读这些列
         # 实测 ~20s),计数按采样率放大保持量级;采样失败回退全量读。
-        count_raw = [field_map.get(name) for name in (
+        present_raw = [field_map.get(name) for name in (
             "hand_0_present", "hand_1_present",
+        ) if field_map.get(name)]
+        landmark_raw = [field_map.get(name) for name in (
             "hand_0_landmarks_3d", "hand_1_landmarks_3d",
         ) if field_map.get(name)]
+        # Presence booleans are enough for source selection and are much
+        # cheaper than decoding nested 21x3 landmark arrays over SSHFS.
+        count_raw = present_raw or landmark_raw
 
         def _count_rows(rows_iter) -> None:
             nonlocal valid_hand_frames, valid_landmark_points
@@ -1246,6 +1913,10 @@ def _hand3d_meta(path: Path, source_key: str | None = None) -> dict:
                     present = count_row.get(present_name) if present_name else True
                     points = count_row.get(points_name) if points_name else None
                     if present is False or points is None:
+                        if (points is None and present is not None
+                                and bool(present)):
+                            valid_landmark_points += 21
+                            row_has_hand = True
                         continue
                     try:
                         arr = _np.asarray(points, dtype=_np.float64)
@@ -1311,6 +1982,7 @@ def _hand3d_meta(path: Path, source_key: str | None = None) -> dict:
         "valid_hand_frames": int(valid_hand_frames),
         "valid_landmark_points": int(valid_landmark_points),
         "counted": bool(counted),
+        "artifact_revision": artifact_revision,
         "meta_schema_version": 2,
     }
 def _parse_range(range_header: str, file_size: int) -> tuple[int, int]:

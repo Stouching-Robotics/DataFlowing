@@ -876,6 +876,55 @@ def _merge_unique_dicts(existing: list[dict[str, Any]], additions: Any,
     return result
 
 
+def _project_data_contract(project_root: Path) -> tuple[set[str], set[str], set[str]]:
+    """Return the data columns, real video sources and semantic device slots.
+
+    ``meta/info.json`` is an aggregate and can outlive a camera stream after a
+    re-upload.  The canonical files are authoritative for the feature list.
+    This helper deliberately treats unreadable Parquet as empty instead of
+    preserving stale declarations that make the UI request missing media.
+    """
+    root = Path(project_root)
+    data_columns: set[str] = set()
+    data_root = root / "data"
+    if data_root.is_dir():
+        try:
+            import pyarrow.parquet as pq
+            for path in data_root.rglob("*.parquet"):
+                try:
+                    data_columns.update(str(name) for name in pq.read_schema(path).names)
+                except (OSError, ValueError):
+                    continue
+        except ImportError:
+            pass
+
+    video_sources = {
+        str(source) for source, _path in iter_video_streams(root / "videos")
+        if str(source).strip()
+    }
+    semantic_slots = set(video_sources)
+    if "observation.slam_pose" in data_columns:
+        semantic_slots.add("gripper_pose")
+    if "observation.gripper_left_force" in data_columns:
+        semantic_slots.add("gripper_force_left")
+    if "observation.gripper_right_force" in data_columns:
+        semantic_slots.add("gripper_force_right")
+    if "observation.gripper_left_force_matrix" in data_columns:
+        semantic_slots.add("gripper_force_matrix_left")
+    if "observation.gripper_right_force_matrix" in data_columns:
+        semantic_slots.add("gripper_force_matrix_right")
+    return data_columns, video_sources, semantic_slots
+
+
+def _feature_is_present(key: str, feature: Any,
+                       data_columns: set[str], video_sources: set[str]) -> bool:
+    if not isinstance(feature, dict):
+        return key in data_columns
+    if feature.get("dtype") == "video" or key.startswith("observation.images."):
+        return key.removeprefix("observation.images.") in video_sources
+    return key in data_columns
+
+
 def _merge_info(project_root: Path, source_info: dict[str, Any], rows: list[dict[str, Any]],
                 tasks: list[dict[str, Any]]) -> dict[str, Any]:
     target = _read_json(project_root / "meta" / "info.json", {})
@@ -885,8 +934,16 @@ def _merge_info(project_root: Path, source_info: dict[str, Any], rows: list[dict
     source_info = normalize_metadata_sources(source_info)
     if not target:
         target = dict(source_info)
+    for key in ("project_id", "project_name"):
+        if source_info.get(key) and not target.get(key):
+            target[key] = source_info[key]
     features = dict(target.get("features") or {})
     features.update(dict(source_info.get("features") or {}))
+    data_columns, video_sources, semantic_slots = _project_data_contract(project_root)
+    features = {
+        key: value for key, value in features.items()
+        if _feature_is_present(key, value, data_columns, video_sources)
+    }
     target.update({
         "format": "lerobot_v2.1",
         "codebase_version": "v2.1",
@@ -917,17 +974,71 @@ def _merge_info(project_root: Path, source_info: dict[str, Any], rows: list[dict
     target["devices"] = _merge_unique_dicts(
         target.get("devices") or [], source_info.get("devices"), ("key",),
     )
+    filtered_devices: list[dict[str, Any]] = []
+    for device in target["devices"]:
+        if not isinstance(device, dict):
+            continue
+        slots = [str(slot) for slot in (device.get("slots") or [])
+                 if str(slot) in semantic_slots]
+        if not slots:
+            continue
+        item = dict(device)
+        item["slots"] = slots
+        filtered_devices.append(item)
+    target["devices"] = filtered_devices
     names = dict(target.get("device_names") or {})
     names.update(dict(source_info.get("device_names") or {}))
-    target["device_names"] = names
+    target["device_names"] = {
+        key: value for key, value in names.items()
+        if key in semantic_slots
+    }
     cameras = dict(target.get("cameras") or {})
     cameras.update(dict(source_info.get("cameras") or {}))
-    target["cameras"] = cameras
+    target["cameras"] = {
+        key: value for key, value in cameras.items()
+        if key in video_sources
+    }
     sensors = list(dict.fromkeys(
         [str(value) for value in (target.get("sensors") or [])]
         + [str(value) for value in (source_info.get("sensors") or [])]
     ))
-    target["sensors"] = sensors
+    target["sensors"] = [
+        sensor for sensor in sensors
+        if any(sensor.casefold() in column.casefold() for column in data_columns)
+    ]
+    # Make the common UMI/SLAM contract machine-readable without guessing the
+    # meaning of the legacy three-value ``gripper_state`` vector.
+    semantic_fields = {
+        "observation.slam_pose": {
+            "names": ["x", "y", "z", "qx", "qy", "qz", "qw"],
+            "units": ["m", "m", "m", "unitless", "unitless", "unitless", "unitless"],
+            "quaternion_order": "xyzw",
+        },
+        "observation.gripper_left_force": {
+            "names": ["fx", "fy", "fz"],
+            "units": ["sensor_unit", "sensor_unit", "sensor_unit"],
+        },
+        "observation.gripper_right_force": {
+            "names": ["fx", "fy", "fz"],
+            "units": ["sensor_unit", "sensor_unit", "sensor_unit"],
+        },
+        "observation.gripper_left_force_matrix": {
+            "names": ["fx", "fy", "fz"],
+            "units": ["mN", "mN", "mN"],
+            "encoding": "row_diff_quantized",
+        },
+        "observation.gripper_right_force_matrix": {
+            "names": ["fx", "fy", "fz"],
+            "units": ["mN", "mN", "mN"],
+            "encoding": "row_diff_quantized",
+        },
+    }
+    for key, metadata in semantic_fields.items():
+        if key in target["features"]:
+            target["features"][key] = {
+                **target["features"][key],
+                **metadata,
+            }
     return target
 
 
@@ -1741,8 +1852,13 @@ def allocate_project_episode_id(project_root: Path, incoming_name: str,
         return incoming
     used = [int(row.get("episode_index")) for row in existing
             if _episode_index(row.get("episode_index")) is not None]
-    next_index = max(used, default=0) + 1
+    next_index = max(used, default=-1) + 1
     prefix = str(project_name or project_root.name or "episode").strip()
+    # Old projects may already contain a malformed pair such as
+    # episode_index=0 / episode_id=Project_000001.  Never reuse that ID for a
+    # new upload; the storage index and the public ID are separate concerns.
+    while f"{prefix}_{next_index:06d}" in existing_ids:
+        next_index += 1
     return f"{prefix}_{next_index:06d}"
 
 

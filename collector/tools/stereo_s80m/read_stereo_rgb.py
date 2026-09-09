@@ -49,6 +49,19 @@ if "--depth-sdk-dir" in sys.argv:
         DEPTH_SDK_DIR = os.path.abspath(sys.argv[_dd_idx + 1])
 DEPTH_MODE = DEPTH_SDK_DIR is not None
 
+# --device-serial <sn> / --device-path <usbdev>：多台 S80 相机同时接入时
+# 指定要打开的那台（按 USB 序列号 / USB 设备拓扑路径匹配）。两参数可
+# 同给（路径为准，序列号仅校验日志）；都不给 = 打开枚举到的第一台
+# （旧行为）。主程序按设备面板枚举出的序列号传入，保证每台相机只读
+# 自己的双目对，不再把多台读成同一台。
+TARGET_SERIAL = None
+TARGET_USB_PATH = None
+for _i, _a in enumerate(sys.argv):
+    if _a == "--device-serial" and _i + 1 < len(sys.argv):
+        TARGET_SERIAL = sys.argv[_i + 1]
+    elif _a == "--device-path" and _i + 1 < len(sys.argv):
+        TARGET_USB_PATH = sys.argv[_i + 1]
+
 # --cb-bridge：回调取帧（官方 GUI 同款消费方案，主程序默认开）。
 # 轮询 GetStereoFrames 与深度引擎绑定叠加会在交付帧内留下水平错位带
 #（8/31 主程序录制回归：25fps 档降缝率但不根治）；官方 GUI 用
@@ -119,12 +132,17 @@ else:
 #   接口 1.2 = IMU / 中置 RGB（取第一个节点）
 #   rgb_dev_port 一律置 NULL 禁用（主程序不用中置 RGB，且 RGB 初始化
 #   失败有崩溃史——3.9.1 会段错误）
-# 解析失败 → 保持原 yaml 不动（旧行为）。
+# 多台 S80 相机接入时按 USB 设备拓扑路径分组（device 符号链接的父级
+# 1-3.4.1 即 USB 设备节点，serial 文件在其下），--device-serial /
+# --device-path 指定目标相机；目标不存在 → 退出码 2 显式报错（绝不
+# 静默打开另一台——那是「多台读成同一台」的根源）。
+# 解析失败（非目标指定）→ 保持原 yaml 不动（旧行为）。
 _PORTS_TMP = None
 try:
     import re as _re
     import tempfile as _tempfile
-    _ports_nodes = {}
+    _cameras = {}          # usb_path → {"serial", "ports": {iface: [node…]}}
+    _order = []
     for _name in sorted(os.listdir("/sys/class/video4linux")):
         _vp = os.path.join("/sys/class/video4linux", _name)
         try:
@@ -140,9 +158,53 @@ try:
         _m = _re.match(r".+:(\d+\.\d+)$", _iface)
         if not _m:
             continue
-        _ports_nodes.setdefault(_m.group(1), []).append(f"/dev/{_name}")
-    _stereo_port = next(iter(_ports_nodes.get("1.0", [])), None)
-    _imu_port = next(iter(_ports_nodes.get("1.2", [])), None)
+        _usb = _iface.rsplit(":", 1)[0]
+        if _usb not in _cameras:
+            _serial = ""
+            try:
+                with open(os.path.join("/sys/bus/usb/devices", _usb, "serial"),
+                          encoding="utf-8") as _sf:
+                    _serial = _sf.read().strip()
+            except OSError:
+                pass
+            _cameras[_usb] = {"serial": _serial, "ports": {}}
+            _order.append(_usb)
+        _cameras[_usb]["ports"].setdefault(_m.group(1), []).append(f"/dev/{_name}")
+
+    # 目标相机选择：路径精确优先（USB 拓扑路径每台唯一）；仅给序列号时
+    # 按序列号匹配（0 台或 >1 台命中都报错退出）
+    _target = None
+    if TARGET_USB_PATH:
+        if TARGET_USB_PATH in _cameras:
+            _target = TARGET_USB_PATH
+            if TARGET_SERIAL and _cameras[_target]["serial"].lower() \
+                    != TARGET_SERIAL.lower():
+                print(f"[Ports] 警告: 路径 {TARGET_USB_PATH} 的序列号 "
+                      f"{_cameras[_target]['serial']} 与 --device-serial "
+                      f"{TARGET_SERIAL} 不符", file=sys.stderr)
+        else:
+            print(f"[Ports] 未找到 USB 设备 {TARGET_USB_PATH} 的 S80 相机；"
+                  f"可用: {[(p, _cameras[p]['serial']) for p in _order]}",
+                  file=sys.stderr)
+            sys.exit(2)
+    elif TARGET_SERIAL:
+        _hits = [p for p in _order
+                 if _cameras[p]["serial"].lower() == TARGET_SERIAL.lower()]
+        if len(_hits) == 1:
+            _target = _hits[0]
+        else:
+            print(f"[Ports] 序列号 {TARGET_SERIAL} 命中 {len(_hits)} 台"
+                  f"（需 1 台）；可用: "
+                  f"{[(p, _cameras[p]['serial']) for p in _order]}",
+                  file=sys.stderr)
+            sys.exit(2)
+    elif _order:
+        _target = _order[0]
+
+    _stereo_port = _imu_port = None
+    if _target:
+        _stereo_port = next(iter(_cameras[_target]["ports"].get("1.0", [])), None)
+        _imu_port = next(iter(_cameras[_target]["ports"].get("1.2", [])), None)
     if _stereo_port:
         _tf = _tempfile.NamedTemporaryFile(
             mode="w", suffix="_s80m_ports.yaml", delete=False)
@@ -158,9 +220,14 @@ try:
         _tf.close()
         _PORTS_TMP = _tf.name
         CONFIG_PATH = _PORTS_TMP
-        print(f"[Ports] 自动解析: stereo={_stereo_port} "
+        print(f"[Ports] 相机 {_cameras[_target]['serial'] or _target} "
+              f"(usb={_target}): stereo={_stereo_port} "
               f"imu={_imu_port or '?'} rgb=NULL", file=sys.stderr)
 except Exception as _e:
+    if TARGET_SERIAL or TARGET_USB_PATH:
+        # 指定了目标相机就不能静默回退到默认 yaml（会打开错相机）
+        print(f"[Ports] 目标相机解析失败: {_e}", file=sys.stderr)
+        sys.exit(2)
     print(f"[Ports] 解析失败，沿用 yaml 端口: {_e}", file=sys.stderr)
 
 # 预加载 OpenCV：3.9.0 的 libfays_vikit.so 依赖 cv::fastFree / cv::cvtColor

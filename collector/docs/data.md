@@ -141,7 +141,8 @@
 | `id` | TEXT PK | 上传任务 ID |
 | `session_path` | TEXT | 会话目录路径 |
 | `session_name` | TEXT | 会话名 |
-| `status` | TEXT | `pending` / `uploading` / `completed` / `failed` / `skipped` |
+| `episode_index` | INTEGER | 池化 episode 全局序号（v1.1.0 起） |
+| `status` | TEXT | `pending` / `uploading` / `completed` / `failed` / `skipped`；`uploading` 在 POST 发起前写入，其 `updated_at` 即"POST 开始时刻"（启动续传的时间窗判定依赖它，程序被杀时该行会停在 `uploading`） |
 | `progress` | REAL | 进度（0.0–1.0） |
 | `retry_count` | INTEGER | 重试次数 |
 | `server_url` | TEXT | 目标服务器 |

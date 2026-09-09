@@ -11,6 +11,7 @@ from config import __version__ as APP_VERSION   # 版本号唯一定义在 confi
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 RECORDINGS_DIR = os.path.join(DATA_DIR, "recordings")
+LOGS_DIR = os.path.join(BASE_DIR, "logs")
 DB_PATH = os.path.join(DATA_DIR, "pipeline.db")
 KEYPOINTS_OUTPUT_DIR = os.path.join(BASE_DIR, "keypoints_output")
 
@@ -460,6 +461,12 @@ UPLOAD_AUTO_SYNC = load_upload_auto_sync()     # 录制完成后是否自动上�
 UPLOAD_DELETE_AFTER = load_upload_delete_after()  # 上传成功后是否删除本地文件（持久化，启动时从 server_config.json 读取）
 UPLOAD_PRECOMPRESS_VIDEO = True                # 上传前是否把 videos 重编码到低码率。开=HEVC(libx265) CRF 档再压（tools/hevc_test 实测 CRF30 体积约原录制件的 7%、SSIM 0.967；大会话必备）。关=原样上传 CRF23 录制品（无二代有损；60min 双目 ~7.6GB，上传带宽/后端超时需能承受）
 UPLOAD_VIDEO_CRF = 30                          # HEVC 目标码率档（x265 CRF 越大越小；30 实测体积约 7%；仅 UPLOAD_PRECOMPRESS_VIDEO=True 时生效）
+UPLOAD_SESSION_SNAPSHOT_LIMIT = 200            # 上传前后拉取的会话列表条数（"POST 是否已入库"的判据；服务器现有 ~26 条）
+UPLOAD_RESUME_MAX_AGE_HOURS = 24               # 启动续传窗口：更早的未完成上传不再自动重传
+UPLOAD_RESUME_SKEW_TOL_S = 60.0                # 续传判定容忍的客户端/服务器时钟差（秒）
+UPLOAD_TMP_SWEEP_AGE_HOURS = 24                # 启动清理残留上传临时文件的年龄门槛（小时）
+UPLOAD_INFLIGHT_REFRESH_MS = 1500              # 上传对话框 ⏳ 状态刷新间隔（毫秒）
+UPLOAD_LOG_THROTTLE_S = 10.0                   # 主窗口上传进度日志节流（秒）
 
 # ── 任务服务配置 ──────────────────────────────────────
 TASK_POLL_INTERVAL_MS = 30000                  # 任务轮询间隔（毫秒）
@@ -476,3 +483,15 @@ HAND_DET_DEVICE = "cuda"                         # 检测器设备 ("cuda" / "cp
 HAND_POSE_DEVICE = "cuda"                        # 关键点设备 ("cuda" / "cpu")
 HAND_TRACK_MAX_HANDS = 2                         # 最多追踪手数
 HAND_DATA_DIM = 21 * 2 * 2 + 4 * 2 + 1           # 展平后数据维度
+
+# ── UMI 夹爪（core/gripper 包；原生资源随包在 core/gripper/native/，
+#    缺失时设备隐藏）─
+GRIPPER_SLOT_STEREO_L = "gripper_stereo_left"   # s80m 左目（桥接 raw 流，仅显示不录制）
+GRIPPER_SLOT_RGB = "gripper_rgb"                # DECXIN 1280×960@30
+GRIPPER_SLOT_POSE = "gripper_pose"              # SLAM 轨迹视图槽
+GRIPPER_SLOT_FORCE_L = "gripper_force_left"     # Sightac 左（热力图+力曲线）
+GRIPPER_SLOT_FORCE_R = "gripper_force_right"    # Sightac 右（热力图+力曲线）
+GRIPPER_STEREO_DISPLAY_FPS = 15.0               # 左目显示节流（SLAM 取帧在桥接进程内保持 30fps）
+GRIPPER_SLAM_READY_TIMEOUT_S = 45.0             # wait_sdk_ready 上限（SDK 运行时重读标定）
+GRIPPER_FORCE_MATRIX_DIM = 250                  # 触觉力矩阵边长（250×250×3 int16 行差分）
+GRIPPER_TACTILE_MATRIX_MATERIALIZE = False      # 矩阵逐帧拷回主进程开关（默认子进程直写）

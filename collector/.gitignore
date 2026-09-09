@@ -51,6 +51,13 @@ pipeline.db
 
 # 手套工具包（第三方 SDK 本地参考，永远不上传）
 stouch_glove_toolkit-Stouch_Glove_Toolkit-beta/
+
+# 夹爪上位机程序及原生资源（同手套工具包策略，整个目录不上传）
+online/
+# 夹爪随包交付的原生资源（从 online/ 镜像而来：厂商 SDK/二进制/ORBvoc.txt 共 785MB，
+# ORBvoc.txt 单文件 138MB 超 GitHub 100MB 限制，且为第三方二进制，不入库）
+# 触觉 Sightac SDK 例外：core/gripper/sightac_sdk/ 已 pyarmor 加密，随包入库
+core/gripper/native/
 lite_package/*
 !lite_package/start_lite.bat
 !lite_package/start_lite.sh

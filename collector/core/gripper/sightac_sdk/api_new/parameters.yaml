@@ -1,0 +1,80 @@
+# Farneback光流参数
+params:
+  pyr_scale: 0.5     # 图像金字塔缩放比例
+  levels: 4          # 金字塔级别数
+  winsize: 61        # 搜索窗口大小
+  iterations: 7      # 迭代次数
+  poly_n: 7          # 多项式邻域大小
+  poly_sigma: 1.1    # 多项式标准差
+  flags: 4           # cv2.OPTFLOW_USE_INITIAL_FLOW  # 标志
+
+# 单元格大小
+cell_size: 1
+
+# 步长
+optical_flow_step: 35
+
+# 压力缩放系数
+pressure_scale: 4
+
+# 压力图显示模式（0=灰度，1=彩色，2=3D指尖视图，3=3D点云视图）
+pressure_form_switch: 3.0
+
+
+scale_factor: 0.5
+
+# 默认端口号
+usb_id: 2
+
+# ROI区域 (640x480分辨率)
+roi_x1: 0
+roi_x2: 640
+roi_y1: 0
+roi_y2: 480
+display_angle: -1
+
+# 触摸状态阈值
+contact_threshold: 10.0
+release_threshold: 8.0
+slide_threshold: 1.0
+slide_force_std_threshold: 0.2
+
+# 摄像头参数 windows系统平面款器件
+#camera_params:
+#  hue: 0.0           # 色调
+#  saturation: 50     # 饱和度
+#  gamma: 251         # 伽玛值:
+#  auto_exposure: 0.0 # 自动曝光
+#  exposure: -5.0     # 曝光值
+#  contrast: 50       # 对比度
+#  brightness: 0      # 亮度
+#  sharpness: 100     # 锐度
+#  auto_wb: 0.0       # 自动白平衡
+#  white_balance_blue: 4600 # 白平衡色温
+
+# 摄像头参数 windows系统fpc平面款器件
+camera_params:
+  auto_exposure: 0.0
+  auto_wb: 0.0
+  brightness: 10
+  contrast: 10
+  exposure: -5
+  gamma: 100
+  hue: 0.0
+  saturation: 64
+  sharpness: 0
+  white_balance_blue: 4600
+  gain: 18
+
+## 默认摄像头参数 (根据 v4l2-ctl -d /dev/video2 -l 输出配置)
+#camera_params:
+#  hue: 0.0           # 色调: min=-180 max=180 default=0
+#  saturation: 64     # 饱和度: min=0 max=100 default=64
+#  gamma: 300         # 伽玛值: min=100 max=500 default=300
+#  auto_exposure: 0.0 # 自动曝光: min=0 max=3 default=3 (Aperture Priority Mode)
+#  exposure: 0.0      # 曝光值: min=50 max=10000 default=166
+#  contrast: 50       # 对比度: min=0 max=100 default=50
+#  brightness: 5      # 亮度: min=-64 max=64 default=5
+#  sharpness: 50      # 锐度: min=0 max=100 default=50
+#  auto_wb: 1.0       # 自动白平衡: default=1
+#  white_balance_blue: 4600 # 白平衡色温: min=2800 max=6500 default=4600

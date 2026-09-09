@@ -35,14 +35,15 @@ from core.camera import list_v4l_devices, _is_sdk_device
 @dataclass
 class DeviceInfo:
     """已连接设备的一条描述（跨线程经信号传回主线程）。"""
-    key: str                          # "uvc:{by-id前缀或索引}" | "d435:{rs serial}" | "s80m:ftdi" | "ble:{MAC}" | "usbglove:{serial}"
-    kind: str                         # "uvc" | "d435" | "s80m" | "data_ble" | "ble" | "usb_glove"
+    key: str                          # "uvc:{by-id前缀或索引}" | "d435:{rs serial}" | "s80m:{sn}" | "ble:{MAC}" | "usbglove:{serial}" | "gripper:{serial}"
+    kind: str                         # "uvc" | "d435" | "s80m" | "data_ble" | "ble" | "usb_glove" | "gripper"
     display_name: str                 # 设备内部命名（by-id 解码 / rs 权威名 / 蓝牙广播名 / USB 手套）
     serial: str = ""                  # 设备序号（无则为空串）
     video_index: int = -1             # UVC 设备的 /dev/videoN 索引（其它为 -1）
     by_id_path: Optional[str] = None  # /dev/v4l/by-id 永久路径（有则填）
     backend: str = ""                 # 打开后端（开关打开后由 CameraWorker 决定，枚举时为空）
     address: str = ""                 # BLE MAC 地址 / USB 手套串口路径（非 BLE 为空串）
+    usb_path: str = ""                # S80 相机的 USB 设备拓扑路径（如 1-3.4.1，spawn 选相机用；其余为空）
     rssi: int = 0                     # BLE 信号强度（排序用）
     user_name: str = ""               # 用户命名（枚举后由 MainWindow 从 device_names.json 填充）
 
@@ -53,9 +54,11 @@ class DeviceInfo:
 
     @property
     def group(self) -> str:
-        """面板分组: "camera" | "glove" | "other_ble"。"""
+        """面板分组: "camera" | "glove" | "gripper" | "other_ble"。"""
         if self.kind in ("data_ble", "usb_glove"):
             return "glove"
+        if self.kind == "gripper":
+            return "gripper"
         if self.kind == "ble":
             return "other_ble"
         return "camera"
@@ -145,10 +148,11 @@ def _list_uvc_devices_windows(max_index: int) -> List[DeviceInfo]:
 
 
 def _list_uvc_devices(max_index: int = settings.DEVICE_SCAN_MAX_INDEX) -> List[DeviceInfo]:
-    """UVC 网络摄像头（排除 RealSense UVC 节点与 FTDI SDK 设备）。
+    """UVC 网络摄像头（排除 RealSense UVC 节点、FTDI SDK 设备与夹爪组件）。
 
-    Linux: sysfs 只读枚举（/dev/v4l/by-id 分组，轮询安全）。
-    Windows: pygrabber DirectShow 枚举（见 _list_uvc_devices_windows）。
+    夹爪组件的 Sightac/DECXIN/FTDI 相机由 libuvc 服务或 Fays 桥接独占，
+    绝不作为通用 UVC 相机出现。Linux: sysfs 只读枚举（/dev/v4l/by-id
+    分组，轮询安全）。Windows: pygrabber DirectShow 枚举。
     """
     if os.name == "nt":
         return _list_uvc_devices_windows(max_index)
@@ -157,6 +161,8 @@ def _list_uvc_devices(max_index: int = settings.DEVICE_SCAN_MAX_INDEX) -> List[D
         if d.get("is_sdk"):
             continue
         if d.get("is_realsense"):
+            continue
+        if _is_gripper_component_camera(d):
             continue
         # key 用 by-id 前缀（跨插拔稳定）；无 by-id 时退化为索引
         prefix = str(d["video_index"])
@@ -198,35 +204,110 @@ def _list_d435_devices() -> List[DeviceInfo]:
         return []
 
 
-def _list_s80m_devices(max_index: int = settings.DEVICE_SCAN_MAX_INDEX) -> List[DeviceInfo]:
-    """FTDI 命中一次即返回单条 S80M 条目（SDK 配置写死 video0/video2）。
+def _ftdi_camera_groups() -> List[dict]:
+    """sysfs 只读扫描 FTDI Superspeed Video Bridge 节点 → 按物理相机分组。
 
-    序号尝试从 by-id 条目解析（FT602 通常无序号 → 空串）。
+    每台 S80 相机 = 一个 FTDI USB 设备（接口 1.0 = 双目对、1.2 = IMU），
+    多台接入时按 USB 设备拓扑路径分开。返回每台
+    {"usb_path", "serial", "stereo_index"}（按节点名排序，不 open 设备，
+    轮询安全）；无 FTDI 返回 []。
     """
+    v4l_root = "/sys/class/video4linux"
+    if not os.path.isdir(v4l_root):
+        return []
+    groups: dict = {}
+    order: List[str] = []
+    for name in sorted(os.listdir(v4l_root)):
+        vp = os.path.join(v4l_root, name)
+        try:
+            with open(os.path.join(vp, "name"), encoding="utf-8") as f:
+                if "FTDI Superspeed Video Bridge" not in f.read().strip():
+                    continue
+            # device 符号链接指向 USB 接口（…/1-3.4.1:1.0），basename 即
+            # 接口名；父级 1-3.4.1 为 USB 设备节点，serial 文件在其下
+            iface = os.path.basename(os.readlink(os.path.join(vp, "device")))
+        except OSError:
+            continue
+        if not re.match(r".+:(\d+\.\d+)$", iface):
+            continue
+        usb_path = iface.rsplit(":", 1)[0]
+        serial = ""
+        try:
+            with open(os.path.join("/sys/bus/usb/devices", usb_path, "serial"),
+                      encoding="utf-8") as f:
+                serial = f.read().strip()
+        except OSError:
+            pass
+        idx = int(name[5:]) if name.startswith("video") and name[5:].isdigit() else -1
+        if usb_path not in groups:
+            groups[usb_path] = {"usb_path": usb_path, "serial": serial,
+                                "stereo_index": -1}
+            order.append(usb_path)
+        # 双目对取接口 1.0 的第一个节点（与 read_stereo_rgb.py 口径一致）
+        if iface.endswith(":1.0") and groups[usb_path]["stereo_index"] < 0:
+            groups[usb_path]["stereo_index"] = idx
+    return [groups[p] for p in order]
+
+
+def _find_s80m_by_id(video_index: int) -> Optional[str]:
+    """S80M 双目节点的 /dev/v4l/by-id 永久路径（无则 None）。"""
+    by_id_dir = "/dev/v4l/by-id"
+    if not os.path.isdir(by_id_dir):
+        return None
+    for entry in sorted(os.listdir(by_id_dir)):
+        p = os.path.join(by_id_dir, entry)
+        try:
+            if os.readlink(p) == f"../../video{video_index}":
+                return p
+        except OSError:
+            continue
+    return None
+
+
+def _list_s80m_devices(max_index: int = settings.DEVICE_SCAN_MAX_INDEX) -> List[DeviceInfo]:
+    """每台 FTDI 命中一条 S80M 条目（多台相机按 USB 序列号区分）。
+
+    序列号从 USB 设备节点 serial 文件读取（FTDI 出厂默认 000000000001，
+    可能多台同号 → key 追加 USB 拓扑路径兜底唯一）；无序列号时同样以
+    USB 路径兜底。usb_path 供 spawn 传 --device-path 精确选中该相机。
+    sysfs 扫描无果时退回旧版 _is_sdk_device 单条逻辑（老环境兜底）。
+    """
+    cams = _ftdi_camera_groups()
+    if cams:
+        # 同序列号多台 → key 用 "s80m:{sn}@{usb_path}" 兜底唯一
+        seen: dict = {}
+        for c in cams:
+            seen[c["serial"]] = seen.get(c["serial"], 0) + 1
+        infos: List[DeviceInfo] = []
+        for c in cams:
+            if not (0 <= c["stereo_index"] < max_index):
+                continue
+            sn, path = c["serial"], c["usb_path"]
+            if sn and seen[sn] == 1:
+                key = f"s80m:{sn}"
+            else:
+                key = f"s80m:{sn}@{path}" if sn else f"s80m:usb-{path}"
+            infos.append(DeviceInfo(
+                key=key,
+                kind="s80m",
+                display_name=f"FaysSense S80M ({sn or path})",
+                serial=sn,
+                video_index=c["stereo_index"],
+                by_id_path=_find_s80m_by_id(c["stereo_index"]),
+                usb_path=path,
+            ))
+        return infos
+    # 兜底：sysfs 名称不符的老环境退回旧版单条逻辑（key 保持 s80m:ftdi）
     for i in range(max_index):
         if not _is_sdk_device(i):
             continue
-        serial, by_id_path = "", None
-        by_id_dir = "/dev/v4l/by-id"
-        if os.path.isdir(by_id_dir):
-            for entry in sorted(os.listdir(by_id_dir)):
-                p = os.path.join(by_id_dir, entry)
-                try:
-                    if os.readlink(p) == f"../../video{i}":
-                        parsed = _parse_by_id_entry(entry)
-                        if parsed:
-                            serial = parsed.get("serial", "")
-                        by_id_path = p
-                        break
-                except OSError:
-                    continue
         return [DeviceInfo(
             key="s80m:ftdi",
             kind="s80m",
             display_name="FaysSense S80M",
-            serial=serial,
+            serial="",
             video_index=i,
-            by_id_path=by_id_path,
+            by_id_path=_find_s80m_by_id(i),
         )]
     return []
 
@@ -347,8 +428,13 @@ def _list_ble_devices() -> List[DeviceInfo]:
 
 
 def detect_devices(max_index: int = settings.DEVICE_SCAN_MAX_INDEX) -> List[DeviceInfo]:
-    """五段枚举（UVC + D435 + S80M + BLE + USB 手套），各自容错，整体不崩。"""
+    """六段枚举（UVC + D435 + S80M + BLE + USB 手套 + UMI 夹爪），各自容错。"""
     devices: List[DeviceInfo] = []
+    gripper_devices: List[DeviceInfo] = []
+    try:
+        gripper_devices = _list_gripper_devices()
+    except Exception:
+        gripper_devices = []
     try:
         devices += _list_uvc_devices(max_index)
     except Exception:
@@ -357,10 +443,13 @@ def detect_devices(max_index: int = settings.DEVICE_SCAN_MAX_INDEX) -> List[Devi
         devices += _list_d435_devices()
     except Exception:
         pass
-    try:
-        devices += _list_s80m_devices(max_index)
-    except Exception:
-        pass
+    if not gripper_devices:
+        # 单设备架设：夹爪在场时其 s80m 只经 ORB 桥接进程打开，
+        # 隐藏通用 S80M 条目，避免同一 FT602 被两个通道双开。
+        try:
+            devices += _list_s80m_devices(max_index)
+        except Exception:
+            pass
     try:
         devices += _list_ble_devices()
     except Exception:
@@ -369,6 +458,7 @@ def detect_devices(max_index: int = settings.DEVICE_SCAN_MAX_INDEX) -> List[Devi
         devices += _list_usb_glove_devices()
     except Exception:
         pass
+    devices += gripper_devices
     return devices
 
 
@@ -451,6 +541,63 @@ def _list_usb_glove_devices() -> List[DeviceInfo]:
             key=key,
             kind="usb_glove",
             display_name=_GLOVE_SIDE_NAMES.get(side, "USB 手套"),
+            serial=serial,
+            address=port.device,
+        ))
+    return infos
+
+
+# ── UMI 夹爪 ──────────────────────────────────────────
+
+_GRIPPER_USB_VID = 0x303A   # Espressif ESP32-S3（CDC-ACM 控制板）
+_GRIPPER_USB_PID = 0x1001
+# 夹爪组件相机（Sightac 触觉 ×2 / DECXIN RGB / Fays FT602），libuvc 服务与
+# Fays 桥接独占，绝不进通用 UVC 列表
+_GRIPPER_COMPONENT_UVC = {("0c45", "636f"), ("1bcf", "2d4f"), ("0403", "602e")}
+
+
+def _is_gripper_component_camera(d: dict) -> bool:
+    """按 VID/PID 识别夹爪组件相机；VID/PID 缺失时用 by-id 字符串兜底。"""
+    vid = str(d.get("vid") or "").lower()
+    pid = str(d.get("pid") or "").lower()
+    if vid and pid:
+        return (vid, pid) in _GRIPPER_COMPONENT_UVC
+    by_id = (d.get("by_id_path") or "").lower()
+    name = (d.get("name") or "").lower()
+    return any(
+        token in by_id or token in name
+        for token in ("0c45_636f", "1bcf_2d4f", "0403_602e",
+                      "sightac", "decxin", "ftdi superspeed")
+    )
+
+
+def _list_gripper_devices() -> List[DeviceInfo]:
+    """枚举 UMI 夹爪控制板（303A:1001）；原生资源缺失时隐藏整类。
+
+    资源缺失（core/gripper/native/ 未随包交付）返回 []，夹爪条目与组件
+    相机排除同时消失，主程序退化为纯手套模式（P0 验证：改名 native/
+    后条目消失）。
+    """
+    try:
+        from core.gripper import paths
+        if not paths.gripper_resources_available():
+            return []
+    except Exception:
+        return []
+    try:
+        import serial.tools.list_ports
+    except ImportError:
+        return []
+    infos: List[DeviceInfo] = []
+    for port in serial.tools.list_ports.comports():
+        if port.vid != _GRIPPER_USB_VID or port.pid != _GRIPPER_USB_PID:
+            continue
+        serial = (port.serial_number or "").strip()
+        key = f"gripper:{serial}" if serial else f"gripper:{port.device}"
+        infos.append(DeviceInfo(
+            key=key,
+            kind="gripper",
+            display_name="UMI 夹爪",
             serial=serial,
             address=port.device,
         ))

@@ -498,16 +498,20 @@ settings.DATA_DIR/tasks.json`）。核心设计：进度按**分账模型**持�
 | `APIClient.upload_session_zip` | `(zip_path, session_name, progress_cb: Optional[Callable[[int, int], None]] = None, name: str = "", project_id: str = "") -> dict` | POST `/api/v1/session/upload` 上传 zip（`progress_cb` 收 `(uploaded_bytes, total_bytes)`）；`name`/`project_id` 为服务器目标项目表单字段（同名项目前缀歧义时服务器返回 409，须用 `project_id` 消歧） | `{"ok": True, "session_id": …, "response": …}` 或 `{"ok": False, "error": …, "ambiguous_project": True}`（409 项目歧义时置 `ambiguous_project`；错误文本截断 300 字符） |
 | `APIClient.get_projects` | `(limit: int = 100) -> list[dict]` | GET `/api/v1/projects` 项目列表（UI 下拉框用） | 异常返回 `[]` |
 | `APIClient.get_sessions` | `(limit: int = 50) -> list[dict]` | GET `/api/v1/sessions` 查询列表 | `data["sessions"]`；异常返回 `[]` |
-| `APIClient.get_session` | `(session_id: str) -> Optional[dict]` | GET `/api/v1/session/{id}` 详情 | 异常返回 `None` |
+| `APIClient.try_get_sessions` | `(limit: int = 50) -> Optional[list[dict]]` | 同上的"可区分失败"版本 | **失败返回 `None`**（`[]` 才是"服务器上没有会话"）；上传前后的"是否已入库"判定必须用它 |
+| `APIClient.get_session` | `(session_id: str) -> Optional[dict]` | GET `/api/v1/session/{id}` 详情 | 异常返回 `None`（注：服务器当前对该端点返回 405，实际不可用） |
 | `APIClient.delete_session` | `(session_id: str) -> bool` | DELETE `/api/v1/session/{id}` | 200 为 `True` |
 | `_ProgressReader` | 内部类（文件包装） | 上传读取时回调进度 | 用完 `close()` |
+| `_PatientSendConnection` | urllib3 连接子类 | 发送阶段用读超时、建连阶段用连接超时（`connect()` 临时换回 `CONNECT_TIMEOUT`）、socket 加 TCP 保活 | 保活 60s+15s×4 ≈ 120s 内发现死连接；`socket_options` 经 `_PatientSendAdapter.init_poolmanager` 注入连接池（Windows 无 `TCP_KEEPIDLE` 时退化为仅 `SO_KEEPALIVE`） |
+| `_UPLOAD_RETRY` | `urllib3.util.Retry` | `total=2, connect=2, read=0, status=0, allowed_methods={"POST"}` | 只重试建连阶段错误（请求体未写出，不会重复发送）；发送/读阶段一律不自动重发，交由 `UploadManager` 的"查服务器"判定 |
 
 **关键数据**：
 
 | 名称 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `CONNECT_TIMEOUT` | int | 10 | 连接超时（秒） |
+| `CONNECT_TIMEOUT` | int | 10 | 连接超时（秒）；建连失败最多重试 2 次（共 3 次尝试） |
 | `READ_TIMEOUT` | int | 1800 | 读超时（秒）；大会话上传+服务器解包入库可能耗时数分钟，设 30 分钟 |
+| `_KEEPALIVE_IDLE_S` / `_KEEPALIVE_INTVL_S` / `_KEEPALIVE_CNT` | int | 60 / 15 / 4 | TCP 保活参数（对端静默消失时约 120s 内报错，而非 Linux 默认 2 小时） |
 | `User-Agent` | str | `"DAQ-SDK/1.0"` | 自建 session 时写入请求头 |
 | API 端点 | — | `POST /api/v1/session/upload`、`GET /api/v1/sessions`、`GET /api/v1/session/{id}`、`DELETE /api/v1/session/{id}`、`GET /api/v1/video/{id}/{cam}/stream`、`GET /health` | 模块 docstring 中的真实 API 清单 |
 
@@ -563,20 +567,38 @@ GET `/api/v1/device/tasks?device_name=…`。设计模式参照已移除的 `Syn
 全程通过 Qt 信号通知 UI。失败自动重试（最多 `settings.UPLOAD_RETRY_MAX`
 次），临时 zip 与预压缩产物用完即删。
 
+**"上传到底有没有入库"判定**（服务器无 `GET /session/{id}`，只能看列表）：
+POST 前拉一次会话列表快照，POST 失败/抛异常后复查——出现"新出现的同名会话"
+即判成功、不重传；程序被杀导致的遗留任务在启动续传时按"POST 开始时刻
+（`upload_task.updated_at`，仅 `status='uploading'` 的行有）↔ 下一次 POST
+开始时刻"的时间窗一对一认领（`pick_session_in_window`），避免同任务多条
+续传互相串位或重复上传。
+
 **类/函数**：
 
 | 名称 | 签名要点 | 作用 | 返回/副作用 |
 | --- | --- | --- | --- |
-| `UploadTask` | `(session_path: str, server_url: str)` | 单个上传任务数据对象（`__slots__` 11 字段） | 状态初值 `pending`，进度 0.0 |
-| `UploadTask.to_dict` / `UploadTask.from_row` | `() -> dict` / `(row: dict)`（staticmethod） | 序列化 / 从数据库行还原 | — |
+| `session_name_base` | `(name: str) -> str`（模块级） | 去掉会话名尾部 episode 标记与 `.zip` → 任务基名 | `"X_000012"`/`"X_ep000012"`/`"X_episode-12"`/`"X.zip"` → `"X"` |
+| `session_matches` | `(session_name, server_session: dict) -> bool`（模块级） | 服务器会话记录是否就是本次上传（同名或基名相等） | 服务器会给会话名加 `_%06d` 序号后缀，故用基名比较 |
+| `pick_new_session` | `(before_ids: set, sessions: list, session_name: str) -> Optional[dict]`（模块级） | 快照差集：新出现的同名会话取最新一条 | 无则 `None` |
+| `pick_session_in_window` | `(sessions, session_name, since_iso, until_iso="", tol_s=60.0) -> Optional[dict]`（模块级） | 时间窗判定：`created_at ∈ [since-tol, until]` 的最新同名会话 | `until_iso` 空 = 不限上界；时间戳不可解析 → `None` |
+| `UploadTask` | `(session_path, server_url, episode_index=0, task_id="", resumed=False, created_at="")` | 单个上传任务数据对象（`__slots__` 13 字段，含 `resumed`） | 状态初值 `pending`，进度 0.0；`task_id`/`created_at` 供续传复用 DB 行 |
+| `UploadTask.to_dict` / `UploadTask.from_row` | `() -> dict` / `(row: dict)`（staticmethod） | 序列化 / 从数据库行还原 | `from_row` 把 `resumed` 强转 `bool`；`resumed` 只在内存，不落库 |
 | `UploadManager` | `(server_url: str = "", session=None)` | 上传队列管理器；URL 缺省 `settings.SERVER_URL`，重试/并发取 `settings.UPLOAD_RETRY_MAX` / `settings.UPLOAD_MAX_CONCURRENT`；`session` 可复用已认证 `requests.Session` | 队列与活跃任务表由 `QMutex` 保护 |
 | `UploadManager.server_url` | property（可写） | 当前服务器地址 | — |
-| `UploadManager.add_task` | `(session_path: str) -> str` | 入队一个任务（先写库再入队） | 返回 `task_id` |
-| `UploadManager.add_tasks` | `(session_paths: list[str]) -> list[str]` | 批量入队 | 只收存在的目录 |
+| `UploadManager.add_task` | `(session_path: str, episode_index: int = 0, task_id: str = "", resumed: bool = False, created_at: str = "") -> str` | 入队一个任务（先写库再入队） | 返回 `task_id`；`task_id`/`created_at` 非空时复用续传的 DB 行而非新建 |
+| `UploadManager.add_tasks` | `(items: list) -> list[str]` | 批量入队 | 元素为 `(session_path, episode_index)` 或裸路径；只收存在的目录 |
 | `UploadManager.start` / `stop` | `()` | 启动 / 停止 worker 线程 | `stop` 等线程最多 10 秒 |
 | `UploadManager.pending_count` / `active_count` / `all_done` | `() -> int` / `() -> int` / `() -> bool` | 队列计数查询 | — |
+| `UploadManager.inflight` | `() -> dict` | 队列中/执行中的任务快照，键 `(session_path, episode_index)` | 值 `{"task_id", "state"（`active`/`queued`）, "progress", "elapsed"（秒，仅 active）}`；供上传对话框显示 ⏳ |
+| `UploadManager.resume_pending` | `(max_age_hours: float = 24.0) -> tuple` | 启动续传：捞 `status IN ('pending','uploading')` 且 `created_at` 在窗口内的 DB 行重新入队 | 返回 `(resumed, verified, skipped)`；`resumed` = `(task_id, path, episode_index)`，`verified` = `(task_id, path, episode_index, server_session_id)`（判定服务器已入库、直接收尾），`skipped` = `{"path", "episode_index", "reason"}`；跳过原因 `server_changed`/`already_done`/`missing_files`/`already_queued`；同一任务多行只取最新一条，服务器快照只拉一次 |
+| `UploadManager.sweep_orphan_temp_files` | `(base_dir: str, max_age_hours: float = 24.0) -> int`（staticmethod） | 清理上次异常退出遗留的临时 zip / 临时 parquet / 预压缩产物 | 返回删除数；只删 `_*_upload_*.zip`、`_episodes_*.parquet`、`_precomp_*` 且超龄的文件 |
+| `UploadManager._local_episode_exists` | `(session_path: str, episode_index: int) -> bool`（staticmethod） | 续传前确认本地 episode 文件还在 | 经 `core.helpers.list_task_episodes` 判断 |
+| `UploadManager._resume_sessions_snapshot` | `() -> Optional[list]` | 续传用的服务器会话列表快照（`settings.UPLOAD_SESSION_SNAPSHOT_LIMIT` 条） | 查询失败返回 `None` → 不做"已入库"判定，全部照常重传 |
+| `UploadManager._mark_upload_verified` | `(task, server_session: dict, reason: str, emit: bool = True)` | 复查确认服务器已入库后按成功收尾 | 落库 `completed`/进度 1.0/`server_session_id`；`emit=True` 时发 `task_progress`+`task_status`+`task_completed`，`resume_pending` 传 `emit=False`（那时调用方还没登记 `task_id`，收尾由它自己补跑） |
+| `UploadManager._verify_after_failure` | `(client, task, before_ids: set, baseline_ok: bool) -> Optional[dict]` | POST 失败/中断后复查服务器会话列表 | 无基线或查询失败返回 `None`（宁可重传）；命中 `pick_new_session` |
 | 信号 | `task_added(str)` / `task_started(str)` / `task_status(str, str)` / `task_progress(str, float)` / `task_completed(str)` / `task_failed(str, str)` / `all_completed()` | 入队 / 开始 / 状态文字 / 进度 0~1 / 完成 / 失败 / 全部完成 | — |
-| `UploadManager.get_upload_status` | `(session_path: str) -> str`（staticmethod） | 查某会话最近一条上传状态 | 无记录返回 `"pending"` |
+| `UploadManager.get_upload_status` | `(session_path: str, episode_index: int = 0) -> str`（staticmethod） | 查某会话某 episode 最近一条上传状态 | 无记录返回 `"pending"` |
 | `UploadManager.list_tasks` | `(session_path: str = "") -> list[dict]`（staticmethod） | 查上传记录（可按会话过滤） | 按 `created_at` 倒序 |
 | 内部 | `_worker_loop` / `_upload_one` / `_zip_session` / `_find_working_ffmpeg` / `_precompress_videos` / `_save_to_db` | 并发调度、单任务全流程、打包、ffmpeg 探测、视频预压缩、写库 | 打包与预压缩的临时文件名均带 `task_id`，避免同进程并发任务互相覆盖 |
 
@@ -585,7 +607,7 @@ GET `/api/v1/device/tasks?device_name=…`。设计模式参照已移除的 `Syn
 | 名称 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | 并发 / 重试 / CRF | 常量 | 取自 `settings.UPLOAD_MAX_CONCURRENT`（默认 1）、`settings.UPLOAD_RETRY_MAX`（默认 3）、`settings.UPLOAD_VIDEO_CRF`（默认 30） | 串行=1 的原因：并发时预压缩临时文件互相覆盖致视频损坏 |
-| 上传状态值 | str | `"pending"` / `"completed"` / `"failed"` | 重试期间回 `pending` 重新入队 |
+| 上传状态值 | str | `"pending"` / `"uploading"` / `"completed"` / `"failed"` | 重试期间回 `pending` 重新入队；`uploading` 在 POST 发起前落库、其 `updated_at` 即"POST 开始时刻"，续传时间窗判定依赖它（程序被杀时这一行会留在 `uploading`） |
 | `upload_task` 表字段 | — | `id, session_path, session_name, status, progress, retry_count, server_url, server_session_id, error_message, created_at, updated_at` | `INSERT OR REPLACE` 写 `core/database.py` 的 `db` |
 | 进度区间约定 | — | 预压缩 0~0.08，打包 0.08~0.12，上传 0.12~1.0 | `task_progress` 的 0~1 映射 |
 | 路径转换 | — | EgoData `chunk-0000` → LeRobot v3 `chunk_0000`；`videos/stereo_left/chunk-0000/stereo_left_aux.mp4` → `videos/stereo_left/chunk_0000/stereo_left_aux.mp4`；旧扁平结构 `videos/<file>.mp4` → `videos/<cam>/chunk_0000/file-0000.mp4` | 打包时改写 arcname |

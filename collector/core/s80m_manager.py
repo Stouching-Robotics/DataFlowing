@@ -213,14 +213,21 @@ class S80MDeviceManager(QObject):
         self.shutting_down = False
 
     @staticmethod
-    def new_entry(label: str) -> dict:
-        """注册表条目骨架（kind/slots/label 由主窗口注册，进程字段由 spawn 填充）。"""
+    def new_entry(label: str, serial: str = "", usb_path: str = "") -> dict:
+        """注册表条目骨架（kind/slots/label 由主窗口注册，进程字段由 spawn 填充）。
+
+        serial / usb_path：枚举得到的相机身份（USB 序列号 / 拓扑路径），
+        spawn 传给子进程 --device-serial / --device-path，多台 S80 接入
+        时每台只打开自己的双目对。
+        """
         return {
             "kind": "s80m",
             # 深度可用时设备 meta 多记录一路深度槽（spawn 后真实生效）
             "slots": ["stereo_left", "stereo_right"]
             + (["stereo_depth"] if s80m_depth_available() else []),
             "label": label,
+            "serial": serial,        # USB 序列号（子进程端口解析选相机）
+            "usb_path": usb_path,    # USB 拓扑路径（同号序列号兜底）
             "proc": None,
             "stdin": None,          # 曝光命令通道（close 时关闭）
             "stderr_file": None,
@@ -276,11 +283,19 @@ class S80MDeviceManager(QObject):
         cb_args = (["--cb-bridge"]
                    if settings.STEREO_CB_BRIDGE and os.path.isfile(CB_BRIDGE_LIB)
                    else [])
+        # 多台 S80 相机区分：设备身份传入子进程，端口解析只选该台
+        # （--device-serial 按序列号、--device-path 按 USB 拓扑路径，同给
+        # 时路径为准；目标找不到子进程退出码 2，绝不静默开另一台）
+        dev_args = []
+        if entry.get("serial"):
+            dev_args += ["--device-serial", entry["serial"]]
+        if entry.get("usb_path"):
+            dev_args += ["--device-path", entry["usb_path"]]
         # stdin 管道 = 曝光控制通道（行协议 "SET_EXPOSURE <float>"，
         # SDK 运行时生效无需重启；子进程句柄创建完成前命令先积在管道缓冲）
         proc = subprocess.Popen(
             [sys.executable, STEREO_DEMO, "--pipe", "-"] + cfg_args
-            + depth_args + cb_args,
+            + dev_args + depth_args + cb_args,
             cwd=SDK_ROOT,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

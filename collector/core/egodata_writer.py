@@ -158,6 +158,7 @@ class EgoDataWriter(QObject):
         self._present_sensors: set = set()
         self._present_imu: bool = False
         self._present_glove_imu: set = set()   # USB 手套 IMU 稀疏列（按传感器名）
+        self._present_gripper: set = set()     # UMI 夹爪稀疏列（slam_pose/state/force/matrix）
         # 深度多槽位（D435 第 n 台 = d435_depth[_n]；S80M 传统路径兜底
         # settings.CAMERA_DEPTH）：槽位键 → depth image_key
         self._depth_slots: Dict[str, str] = {}
@@ -349,6 +350,7 @@ class EgoDataWriter(QObject):
         self._present_sensors = set()
         self._present_imu = False
         self._present_glove_imu = set()
+        self._present_gripper = set()
         self._reset_stats()
         self._last_task = task_name
 
@@ -546,7 +548,8 @@ class EgoDataWriter(QObject):
                         hardware_ns: int = 0,
                         imu_samples: Optional[List] = None,
                         glove_imu: Optional[Dict[str, tuple]] = None,
-                        glove_kpts: Optional[Dict[str, np.ndarray]] = None):
+                        glove_kpts: Optional[Dict[str, np.ndarray]] = None,
+                        gripper: Optional[Dict] = None):
         """写入一行到 data parquet 缓冲区。
 
         Args:
@@ -565,6 +568,12 @@ class EgoDataWriter(QObject):
             glove_kpts: {传感器名: 63×f32 骨架关键点（21×3 米）}
                        USB 手套骨架快照，回填恒写的
                        observation.{left,right}_hand_pose 占位列
+            gripper: UMI 夹爪稀疏快照（P3/P4），键值：
+                       slam_pose [x,y,z,qx,qy,qz,qw]
+                       gripper_state [open_pct, gripped, fz_mn]
+                       gripper_{left,right}_force [fx,fy,fz] mN
+                       gripper_{left,right}_force_matrix int16 行差分
+                       量化变长列表（P4 泵线程预编码，无新样本不写键）
         """
         sensors = sensors or {}
         row = {
@@ -628,6 +637,32 @@ class EgoDataWriter(QObject):
                 continue
             row[f"observation.{side}_hand_pose"] = [
                 float(v) for v in k]
+
+        # UMI 夹爪稀疏列（P3/P4）：本 episode 出现过的列才建列。
+        # 键按后缀定类型（_slam_pose=7f32 / _state/_force=3f32 /
+        # _force_matrix=int16 行差分变长，P4 泵线程预编码后原样落盘）；
+        # 双夹爪 rig2 带 "gripper_2_" 前缀，rig1 旧键（slam_pose /
+        # gripper_state / gripper_left_force…）契约不变。无新样本不写键。
+        for key, value in (gripper or {}).items():
+            if value is None:
+                continue
+            if key.endswith("_force_matrix"):
+                row[f"observation.{key}"] = value
+            elif key.endswith("slam_trajectory"):
+                # 本帧窗口内全部轨迹点的扁平 8 值列表
+                # [t,x,y,z,qx,qy,qz,qw]×N（float64 原样落盘）
+                row[f"observation.{key}"] = value
+            elif key.endswith("slam_pose"):
+                # 后缀不带下划线：rig1 旧键是裸 "slam_pose"（无前缀），
+                # rig2 为 "gripper_2_slam_pose"
+                row[f"observation.{key}"] = [
+                    float(v) for v in value[:7]]
+            elif key.endswith("_state") or key.endswith("_force"):
+                row[f"observation.{key}"] = [
+                    float(v) for v in value[:3]]
+            else:
+                continue   # 未知键不落盘，防静默错型
+            self._present_gripper.add(key)
 
         cs = connection_status or {}
         for did in self._device_ids:
@@ -795,6 +830,23 @@ class EgoDataWriter(QObject):
             cols[name_v] = pa.array(
                 [r.get(name_v, [0.0] * 16) for r in rows],
                 pa.list_(pa.float32(), 16))
+        # 稀疏 UMI 夹爪列（slam_pose/state/force 定长；matrix 变长 int16）
+        for key in sorted(self._present_gripper):
+            name = f"observation.{key}"
+            if key.endswith("_force_matrix"):
+                cols[name] = pa.array(
+                    [r.get(name, []) for r in rows], pa.list_(pa.int16()))
+            elif key.endswith("slam_trajectory"):
+                cols[name] = pa.array(
+                    [r.get(name, []) for r in rows], pa.list_(pa.float64()))
+            elif key.endswith("slam_pose"):
+                cols[name] = pa.array(
+                    [r.get(name, [0.0] * 7) for r in rows],
+                    pa.list_(pa.float32(), 7))
+            else:   # _state / _force
+                cols[name] = pa.array(
+                    [r.get(name, [0.0] * 3) for r in rows],
+                    pa.list_(pa.float32(), 3))
         # 手部关键点占位列（后处理回填，恒写）
         for pose_name in [settings.HAND_POSE_LEFT, settings.HAND_POSE_RIGHT]:
             name = f"observation.{pose_name}"
@@ -906,6 +958,24 @@ class EgoDataWriter(QObject):
                 "dtype": "float32", "shape": [16, 4]}
             features[f"observation.{sn}_imu_valid"] = {
                 "dtype": "float32", "shape": [16]}
+        # UMI 夹爪（P3/P4）：定长 f32 列 + 变长 int16 行差分量化的力矩阵
+        for key in sorted(self._present_gripper):
+            if key.endswith("_force_matrix"):
+                features[f"observation.{key}"] = {
+                    "dtype": "int16",
+                    "shape": [settings.GRIPPER_FORCE_MATRIX_DIM] * 2 + [3],
+                    "encoding": "row_diff_quantized",
+                }
+            elif key.endswith("slam_trajectory"):
+                features[f"observation.{key}"] = {
+                    "dtype": "float64", "shape": [8],
+                    "encoding": "flat_points_8_txyz_qxyzw"}
+            elif key.endswith("slam_pose"):
+                features[f"observation.{key}"] = {
+                    "dtype": "float32", "shape": [7]}
+            else:   # _state / _force
+                features[f"observation.{key}"] = {
+                    "dtype": "float32", "shape": [3]}
         # 手部骨架关键点（21×3 米，恒写列；无骨架数据时为全零占位）
         features[f"observation.{settings.HAND_POSE_LEFT}"] = {
             "dtype": "float32", "shape": [21, 3]}

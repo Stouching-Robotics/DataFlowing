@@ -12,17 +12,45 @@ HTTP API 客户端 —— 对接 Data Acquisition 服务器。
 
 from __future__ import annotations
 import os
+import socket
 import time
 from typing import Optional, Callable
 
 import requests
 import urllib3
 from urllib3.util import Timeout as _Urllib3Timeout
+from urllib3.util.retry import Retry as _Retry
 from requests.adapters import HTTPAdapter
 
 
 CONNECT_TIMEOUT = 10
 READ_TIMEOUT = 1800        # 大会话（数 GB）上传 + 服务器解包入库可能耗时数分钟，设 30 分钟
+
+# TCP 保活：对端（服务器/中间网络）静默消失时，阻塞的 recv 不会自己醒。
+# 没有保活时 Linux 默认 2 小时才报错——上传线程会静默挂死（2026-09-09
+# episode-012 事故）。60+15×4 ≈ 120s 内探测到死连接并抛 ConnectionError。
+_KEEPALIVE_IDLE_S, _KEEPALIVE_INTVL_S, _KEEPALIVE_CNT = 60, 15, 4
+_TCP_LEVEL = getattr(socket, "IPPROTO_TCP", 6)
+_KEEPALIVE_OPTS = [
+    (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+    (_TCP_LEVEL, getattr(socket, "TCP_KEEPIDLE", None), _KEEPALIVE_IDLE_S),   # Linux
+    (_TCP_LEVEL, getattr(socket, "TCP_KEEPALIVE", None), _KEEPALIVE_IDLE_S),  # macOS 别名
+    (_TCP_LEVEL, getattr(socket, "TCP_KEEPINTVL", None), _KEEPALIVE_INTVL_S),
+    (_TCP_LEVEL, getattr(socket, "TCP_KEEPCNT", None), _KEEPALIVE_CNT),
+]
+# 常量在本平台不存在的项直接丢掉：Windows 旧版 SDK 无 TCP_KEEPIDLE/
+# TCP_KEEPINTVL/TCP_KEEPCNT，退化为仅 SO_KEEPALIVE（系统默认 2 小时）。
+_SOCKET_OPTIONS = [o for o in _KEEPALIVE_OPTS if o[1] is not None]
+
+# 只重试「连接阶段」错误：DNS 解析失败/连接被拒/建连超时——这些都在
+# 请求体写出任何字节之前抛出，重试不会重复发送（POST 不在 urllib3 的
+# 默认重试方法里，必须显式放行）。read=0/status=0：一旦开始发送或收到
+# 响应，绝不自动重试，交由 UploadManager 的「查服务器再决定」逻辑处理。
+_UPLOAD_RETRY = _Retry(
+    total=2, connect=2, read=0, status=0, redirect=0,
+    allowed_methods={"POST"}, backoff_factor=0,
+    respect_retry_after_header=False, raise_on_status=False,
+)
 
 
 class _PatientSendConnection(urllib3.connection.HTTPConnection):
@@ -49,6 +77,22 @@ class _PatientSendConnection(urllib3.connection.HTTPConnection):
         finally:
             self.timeout = saved
 
+    def connect(self):
+        """建连阶段固定用 CONNECT_TIMEOUT。
+
+        request() 已把 self.timeout 抬到 READ_TIMEOUT，新建连接若照它
+        建 TCP，则"连接超时"实际是 30 分钟（服务器不响应 SYN 时线程
+        静默挂死）。这里临时换回连接窗口，建连完成即恢复，发送阶段
+        的宽窗口不受影响。
+        """
+        saved = self.timeout
+        if isinstance(saved, (int, float)) and saved != CONNECT_TIMEOUT:
+            self.timeout = CONNECT_TIMEOUT
+        try:
+            super().connect()
+        finally:
+            self.timeout = saved
+
 
 class _PatientSendHTTPSConnection(_PatientSendConnection,
                                   urllib3.connection.HTTPSConnection):
@@ -67,6 +111,9 @@ class _PatientSendAdapter(HTTPAdapter):
     """把发送超时加长的连接池装入 session。"""
 
     def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        # socket_options 只能经连接池的 **conn_kw 传到 HTTPConnection，
+        # 由这里统一注入（http/https 共用本类，一处生效）。
+        pool_kwargs.setdefault("socket_options", _SOCKET_OPTIONS)
         super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
         # PoolManager 默认指向模块级 dict（多实例共享），须整体替换实例属性
         self.poolmanager.pool_classes_by_scheme = {
@@ -88,8 +135,9 @@ class APIClient:
         self._session.headers.update({"User-Agent": "DAQ-SDK/1.0"})
         # 大请求体上传时发送阶段的 socket 超时改为读超时窗口，
         # 否则服务器慢读停顿 >10s 会误杀上传（见 _PatientSendConnection）。
-        self._session.mount("http://", _PatientSendAdapter())
-        self._session.mount("https://", _PatientSendAdapter())
+        # max_retries 只放行建连阶段错误（见 _UPLOAD_RETRY）。
+        self._session.mount("http://", _PatientSendAdapter(max_retries=_UPLOAD_RETRY))
+        self._session.mount("https://", _PatientSendAdapter(max_retries=_UPLOAD_RETRY))
 
     def close(self):
         if self._own_session:
@@ -212,7 +260,14 @@ class APIClient:
 
     # ── 查询 ──────────────────────────────────────────
 
-    def get_sessions(self, limit: int = 50) -> list[dict]:
+    def try_get_sessions(self, limit: int = 50) -> Optional[list[dict]]:
+        """GET /api/v1/sessions；**失败返回 None**。
+
+        与 get_sessions 的区别：None = 查询失败（网络/认证/非 200），
+        而 [] = 服务器上确实一个会话都没有。上传前的快照必须能区分
+        这两种情况，否则查询失败会被误判成"服务器是空的"，POST 失败
+        后任何一个同名会话都会被当成"新出现"而误报成功。
+        """
         try:
             r = self._session.get(
                 f"{self.base_url}/api/v1/sessions",
@@ -221,10 +276,14 @@ class APIClient:
             )
             if r.status_code == 200:
                 data = r.json()
-                return data.get("sessions", [])
+                return data.get("sessions", []) or []
         except requests.RequestException:
             pass
-        return []
+        return None
+
+    def get_sessions(self, limit: int = 50) -> list[dict]:
+        sessions = self.try_get_sessions(limit)
+        return sessions if sessions is not None else []
 
     def get_session(self, session_id: str) -> Optional[dict]:
         try:

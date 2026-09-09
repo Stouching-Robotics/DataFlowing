@@ -6,7 +6,7 @@
 覆盖:
   - _parse_by_id_entry 各形态（纯函数）
   - _list_uvc_devices 排除 RealSense / FTDI（mock list_v4l_devices）
-  - _list_s80m_devices FTDI 单条（mock _is_sdk_device）
+  - _list_s80m_devices 多台按序列号区分（mock _ftdi_camera_groups）
   - detect_devices 子模块异常不崩（mock 抛异常）
   - DeviceScanner 信号投递（QCoreApplication 事件循环）
   - 真机段（D435 在位时）: _is_realsense_node / _list_d435_devices serial 非空
@@ -100,26 +100,114 @@ def _main():
     check(infos[0].video_index == 2 and infos[0].serial == "2024010100",
           f"webcam 索引/序号正确: idx={infos[0].video_index} serial={infos[0].serial}")
 
-    print("── 3. _list_s80m_devices FTDI 单条（mock _is_sdk_device） ──")
+    print("── 3. _list_s80m_devices 多台按序列号区分（mock _ftdi_camera_groups） ──")
+    fake_cams = [
+        {"usb_path": "1-3.4.1", "serial": "000000000001", "stereo_index": 0},
+        {"usb_path": "1-3.4.2", "serial": "000000000002", "stereo_index": 2},
+    ]
+    with patch("core.device_detector._ftdi_camera_groups", return_value=fake_cams):
+        infos = _list_s80m_devices(16)
+    check(len(infos) == 2
+          and [i.key for i in infos] == ["s80m:000000000001",
+                                         "s80m:000000000002"]
+          and all(i.kind == "s80m" for i in infos)
+          and [i.usb_path for i in infos] == ["1-3.4.1", "1-3.4.2"],
+          f"两台按序列号区分: {[(i.key, i.usb_path) for i in infos]}")
+    check(infos[0].video_index == 0 and infos[1].video_index == 2,
+          "video_index 取自各相机双目节点")
+
+    # 同序列号两台（FTDI 出厂默认号）→ key 追加 USB 路径兜底唯一
+    dup_cams = [
+        {"usb_path": "1-3.4.1", "serial": "000000000001", "stereo_index": 0},
+        {"usb_path": "1-3.4.2", "serial": "000000000001", "stereo_index": 2},
+    ]
+    with patch("core.device_detector._ftdi_camera_groups", return_value=dup_cams):
+        infos = _list_s80m_devices(16)
+    keys = [i.key for i in infos]
+    check(len(infos) == 2 and len(set(keys)) == 2
+          and any("@1-3.4.2" in k for k in keys),
+          f"同号兜底 key 唯一: {keys}")
+
+    # 无序列号 → USB 路径兜底
+    nosn_cams = [{"usb_path": "1-3.4.1", "serial": "", "stereo_index": 0}]
+    with patch("core.device_detector._ftdi_camera_groups", return_value=nosn_cams):
+        infos = _list_s80m_devices(16)
+    check(len(infos) == 1 and infos[0].key == "s80m:usb-1-3.4.1",
+          f"无序列号兜底: {[i.key for i in infos]}")
+
+    # 老环境兜底：sysfs 扫不到 → 退回旧版 _is_sdk_device 单条
     def fake_sdk(i):
         return i == 7
-    with patch("core.device_detector._is_sdk_device", side_effect=fake_sdk):
+    with patch("core.device_detector._ftdi_camera_groups", return_value=[]), \
+         patch("core.device_detector._is_sdk_device", side_effect=fake_sdk):
         infos = _list_s80m_devices(16)
     check(len(infos) == 1 and infos[0].key == "s80m:ftdi"
           and infos[0].video_index == 7,
-          f"FTDI 单条命中: {[(i.key, i.video_index) for i in infos]}")
-    with patch("core.device_detector._is_sdk_device", return_value=False):
+          f"老环境兜底单条: {[(i.key, i.video_index) for i in infos]}")
+    with patch("core.device_detector._ftdi_camera_groups", return_value=[]), \
+         patch("core.device_detector._is_sdk_device", return_value=False):
         infos = _list_s80m_devices(16)
     check(infos == [], "无 FTDI 时返回空")
 
     print("── 4. detect_devices 子模块异常不崩 ──")
-    # v1.1.3 起 detect_devices 有第五段 USB 手套枚举，同样要炸掉
+    # v1.1.3 起有第五段 USB 手套枚举；夹爪接入后有第六段 UMI 夹爪，
+    # 真机在位时同样要炸掉（夹爪枚举含 pyserial 真机扫描，必须 mock）
     with patch("core.device_detector._list_uvc_devices", side_effect=OSError("boom")), \
          patch("core.device_detector._list_d435_devices", side_effect=OSError("boom")), \
          patch("core.device_detector._list_s80m_devices", side_effect=OSError("boom")), \
          patch("core.device_detector._list_ble_devices", side_effect=OSError("boom")), \
-         patch("core.device_detector._list_usb_glove_devices", side_effect=OSError("boom")):
-        check(detect_devices() == [], "五段全炸 → 返回空列表不抛异常")
+         patch("core.device_detector._list_usb_glove_devices", side_effect=OSError("boom")), \
+         patch("core.device_detector._list_gripper_devices", side_effect=OSError("boom")):
+        check(detect_devices() == [], "六段全炸 → 返回空列表不抛异常")
+
+    print("── 4b. UMI 夹爪枚举 / 组件相机排除 ──")
+    # 组件相机按 VID/PID 排除（0c45:636f sightac / 1bcf:2d4f decxin /
+    # 0403:602e fays）；VID/PID 缺失时按 by-id 字符串兜底
+    check(det._is_gripper_component_camera(
+        {"vid": "0c45", "pid": "636f"}), "sightac VID/PID 排除")
+    check(det._is_gripper_component_camera(
+        {"vid": "1bcf", "pid": "2d4f"}), "decxin VID/PID 排除")
+    check(not det._is_gripper_component_camera(
+        {"vid": "32e4", "pid": "0416"}), "无关 VID/PID 保留")
+    check(det._is_gripper_component_camera(
+        {"by_id_path": "/dev/v4l/by-id/usb-Sightac_SN0001-video-index0",
+         "name": "Sightac"}),
+        "VID/PID 缺失时 by-id 兜底排除")
+
+    # 夹爪枚举：mock 串口枚举 + 资源可用 → 一条 gripper 条目
+    class _Port:
+        def __init__(self, vid, pid, sn, dev):
+            self.vid, self.pid = vid, pid
+            self.serial_number, self.device = sn, dev
+    fake_ports = [
+        _Port(0x303A, 0x1001, "CC:BA:97:25:B4:44", "/dev/ttyACM0"),
+        _Port(0x0483, 0x5740, "glove-sn", "/dev/ttyACM1"),
+    ]
+    with patch("core.gripper.paths.gripper_resources_available",
+               return_value=True), \
+         patch("serial.tools.list_ports.comports",
+               return_value=fake_ports):
+        infos = det._list_gripper_devices()
+    check(len(infos) == 1 and infos[0].key == "gripper:CC:BA:97:25:B4:44"
+          and infos[0].address == "/dev/ttyACM0"
+          and infos[0].group == "gripper",
+          f"夹爪枚举唯一命中: {[(i.key, i.address) for i in infos]}")
+    with patch("core.gripper.paths.gripper_resources_available",
+               return_value=False), \
+         patch("serial.tools.list_ports.comports",
+               return_value=fake_ports):
+        infos = det._list_gripper_devices()
+    check(infos == [], "资源缺失时夹爪条目隐藏")
+    with patch("core.gripper.paths.gripper_resources_available",
+               return_value=True), \
+         patch("serial.tools.list_ports.comports",
+               return_value=fake_ports), \
+         patch("core.device_detector._list_s80m_devices",
+               return_value=[DeviceInfo(key="s80m:x", kind="s80m",
+                                        display_name="x")]):
+        devs = detect_devices()
+    check(not any(d.kind == "s80m" for d in devs),
+          "夹爪在场时 s80m 条目被抑制")
 
     print("── 5. DeviceScanner 信号投递 ──")
     app = QCoreApplication.instance() or QCoreApplication(sys.argv)

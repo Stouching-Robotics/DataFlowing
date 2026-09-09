@@ -47,6 +47,14 @@ from core.helpers import (format_duration, format_size_mb,
                           hand_kpts_parquet_path, session_summary,
                           episode_file_suffix)
 
+# 启动续传跳过原因（UploadManager.resume_pending 的 reason → 用户可读文案）
+_RESUME_SKIP_TEXT = {
+    "missing_files": "本地文件不存在",
+    "server_changed": "服务器地址已变更",
+    "already_done": "已上传完成",
+    "already_queued": "已在队列中",
+}
+
 # 双目相机 —— 子进程/管道/曝光/抽帧口径已入 core/s80m_manager；
 # 路径常量 re-export 供本窗口可用性检查与离线测试 patch
 import shutil
@@ -107,6 +115,25 @@ except ImportError:
     _GLOVE_AVAILABLE = False
 
 
+def encode_gripper_force_matrix(m: np.ndarray) -> list:
+    """触觉力矩阵 int16 行差分编码（P4 泵线程，返回扁平 int16 列表）。
+
+    与 online/recording/lerobot_v3.quantize_force_matrix 一致的有符号
+    补码行差分（mod 2^16 可逆），扩展到 (250,250,3) 三力平面：每行 250×3
+    个元素横向差分；超出 ±32767 mN 饱和截断。反解按 features 的
+    shape=[250,250,3] 还原：np.frombuffer(...).reshape(-1,750) →
+    cumsum(axis=1) → reshape(250,250,3)。
+    """
+    arr = np.asarray(m, dtype=np.float32)
+    rows = int(arr.shape[0])
+    flat = arr.reshape(rows, -1)
+    q = np.clip(flat, -32767.0, 32767.0).astype(np.int16)
+    d = np.empty_like(q)
+    d[:, 0] = q[:, 0]
+    d[:, 1:] = q[:, 1:] - q[:, :-1]   # int16 mod 2^16 回绕
+    return np.frombuffer(d.tobytes(), dtype=np.int16).tolist()
+
+
 class MainWindow(QMainWindow):
     """应用程序主窗口。"""
 
@@ -148,10 +175,12 @@ class MainWindow(QMainWindow):
         self._open_fns = {"uvc": self._open_uvc, "d435": self._open_d435,
                           "s80m": self._open_s80m, "data_ble": self._open_glove,
                           "usb_glove": self._open_usb_glove,
+                          "gripper": self._open_gripper,
                           "ble": self._open_ble_placeholder}
         self._close_fns = {"uvc": self._close_uvc, "d435": self._close_d435,
                            "s80m": self._close_s80m, "data_ble": self._close_glove,
                            "usb_glove": self._close_glove,
+                           "gripper": self._close_gripper,
                            "ble": self._close_ble_placeholder}
 
         # ── 设备检测面板状态 ──────────────────────────
@@ -211,11 +240,23 @@ class MainWindow(QMainWindow):
             settings.load_server_url(),
             session=getattr(self._task_service, "_session", None),
         )
-        self._upload_task_map: dict = {}   # task_id → session_path（日志用）
+        self._upload_task_map: dict = {}   # task_id → (session_path, episode_index)
+        self._upload_log_ts: dict = {}     # task_id → 上次写日志的 monotonic 时刻
+        self._resume_done = False          # 启动续传只做一次（重登录不再跑）
         self._upload_manager.task_completed.connect(self._on_upload_task_done)
         self._upload_manager.task_failed.connect(self._on_upload_task_failed)
+        self._upload_manager.task_started.connect(self._on_upload_task_started)
+        self._upload_manager.task_status.connect(self._on_upload_task_status)
+        self._upload_manager.task_progress.connect(self._on_upload_task_progress)
         self._upload_manager.start()
         self._upload_session_deleted.connect(self._on_upload_session_deleted)
+
+        # 清理上次进程被杀留下的上传临时 zip / 切片 / 预压视频（纯文件操作，不需登录）
+        _n = UploadManager.sweep_orphan_temp_files(
+            settings.RECORDING_DIR,
+            getattr(settings, "UPLOAD_TMP_SWEEP_AGE_HOURS", 24))
+        if _n:
+            self._log(tr("🧹 已清理上传残留临时文件 {} 个", _n))
 
         # ── 监听语言切换 ──────────────────────────────
         lang_manager.language_changed.connect(self._on_language_changed)
@@ -263,6 +304,14 @@ class MainWindow(QMainWindow):
         self._log_widget.document().setMaximumBlockCount(2000)
         # 跨线程日志信号（必须在 _log_widget 创建之后连接）
         self.log_message.connect(self._log_widget.append)
+        # 日志文件留档：GUI 日志全量追加到 logs/main.log（超过 5MB 轮转
+        # 为 main.old.log），事后取证不依赖用户手动复制日志面板。
+        self._log_file_path = None
+        try:
+            os.makedirs(settings.LOGS_DIR, exist_ok=True)
+            self._log_file_path = os.path.join(settings.LOGS_DIR, "main.log")
+        except OSError:
+            pass
 
         self._log_dock = QDockWidget(tr("日志"), self)
         self._log_dock.setWidget(self._log_widget)
@@ -597,7 +646,39 @@ class MainWindow(QMainWindow):
             self._upload_manager.server_url = url
         self._task_page.set_server_display(url)
         self._task_service.start()
+        self._resume_pending_uploads()
         return True
+
+    def _resume_pending_uploads(self):
+        """启动续传：上次没传完的任务重新入队（登录后才有认证 cookie）。
+
+        只在首次登录后执行一次：切换账号/登录过期重登不重复跑，否则
+        会与正在进行的任务抢同一个 episode。
+        """
+        if self._resume_done or not hasattr(self, "_upload_manager"):
+            return
+        self._resume_done = True
+        resumed, verified, skipped = self._upload_manager.resume_pending(
+            max_age_hours=settings.UPLOAD_RESUME_MAX_AGE_HOURS)
+        for tid, path, ep, sid in verified:
+            # 入 map：完成回调据此把录制行标「已上传」/按开关删除本地件
+            self._upload_task_map[tid] = (path, ep)
+            self._log(tr("☁ {} 已在服务器上，无需重传: {}",
+                         self._upload_pair_name((path, ep), tid), sid))
+            # resume_pending 用 emit=False 收的尾（那时还没登记 task_id），
+            # 这里补跑完成回调，让录制行标「已上传」/按开关删本地件
+            self._on_upload_task_done(tid)
+        for tid, path, ep in resumed:
+            self._upload_task_map[tid] = (path, ep)
+            self._log(tr("☁ 恢复未完成的上传: {}",
+                         self._upload_pair_name((path, ep), tid)))
+        for row in skipped:
+            self._log(tr("☁ 跳过恢复 {}: {}",
+                         self._upload_pair_name(
+                             (row["path"], row["episode_index"])),
+                         tr(_RESUME_SKIP_TEXT.get(row["reason"], ""))))
+        if resumed:
+            self._log(tr("☁ 已恢复 {} 个未完成的上传任务", len(resumed)))
 
     def _on_switch_account(self):
         """任务页「切换账号」按钮 → 重开登录对话框。"""
@@ -748,6 +829,16 @@ class MainWindow(QMainWindow):
         if not _STEREO_AVAILABLE:
             self._log(tr("[错误] 双目 demo 脚本不存在"))
             return False
+        if self._device_manager.has_kind("gripper"):
+            # 夹爪 rig 的 s80m 由 ORB 桥接进程独占打开，与通用 S80M
+            # 子进程通道互斥（同一 FT602 双开必然冲突）
+            QMessageBox.warning(
+                self, tr("设备冲突"),
+                tr("UMI 夹爪已开启，其双目相机由夹爪的 SLAM 桥接独占。\n"
+                   "请先关闭夹爪，再开启独立 S80M。"))
+            self._log(tr("[设备] S80M 与 UMI 夹爪冲突，已拒绝开启: {}",
+                         self._device_label(dev)))
+            return False
         if self._device_manager.has_kind("d435"):
             QMessageBox.warning(
                 self, tr("设备冲突"),
@@ -755,6 +846,18 @@ class MainWindow(QMainWindow):
                    "两者共用 UVC 设备节点 (video0/video2)。\n"
                    "请先关闭 RealSense 设备再开启 S80M。"))
             self._log(tr("[设备] S80M 与 D435 冲突，已拒绝开启: {}",
+                         self._device_label(dev)))
+            return False
+        if self._device_manager.has_kind("s80m"):
+            # 画面槽位 stereo_left/right 是全局命名，两台 S80M 同开会
+            # 互相覆盖预览与录制；每台相机已按序列号区分，但同开仍需
+            # 先关一台（子进程端口解析已保证只开被勾选的那台）
+            QMessageBox.warning(
+                self, tr("设备冲突"),
+                tr("暂不支持同时开启两台 S80 双目相机。\n"
+                   "两台相机共用画面槽位，同时开启会串流。\n"
+                   "请先关闭已开启的 S80M，再开启另一台。"))
+            self._log(tr("[设备] S80M 仅支持单台开启，已拒绝: {}",
                          self._device_label(dev)))
             return False
 
@@ -803,7 +906,11 @@ class MainWindow(QMainWindow):
                 heatmap_smooth_k=settings.S80M_DEPTH_SMOOTH_K)
 
         # 注册表条目 + 子进程（temp 50fps yaml / stderr / watchdog / reader）
-        entry = self._s80m_manager.new_entry(self._device_label(dev))
+        # 序列号 / USB 路径随条目传给子进程，多台 S80 接入时只开被勾选
+        # 的那台相机（--device-serial / --device-path 端口解析）
+        entry = self._s80m_manager.new_entry(self._device_label(dev),
+                                             serial=dev.serial,
+                                             usb_path=dev.usb_path)
         self._workers[dev.key] = entry
         if not self._s80m_manager.spawn(dev.key, entry):
             self._workers.pop(dev.key, None)
@@ -812,6 +919,10 @@ class MainWindow(QMainWindow):
         # 曝光入口（☀ 按钮）只放左目主槽；持久化曝光随开随应用
         self._show_exposure_button("stereo_left")
         exp = settings.device_exposure(dev.key)
+        if exp is None and dev.key != "s80m:ftdi" and \
+                sum(1 for k in self._last_device_kinds if k.startswith("s80m:")) == 1:
+            # 旧版键 s80m:ftdi → 序列号键的一次性曝光迁移（仅单台无歧义）
+            exp = settings.device_exposure("s80m:ftdi")
         if exp:
             self._s80m_set_exposure(dev.key, exp["auto"], exp["value"])
         self._log(tr("双目摄像机已启动"))
@@ -1121,8 +1232,14 @@ class MainWindow(QMainWindow):
         """设备扫描结果 → 面板重建 + 插拔 diff 日志 + 激活设备丢失处理。"""
         # 枚举后统一填用户命名（device_names.json），面板行显示 user_name 优先
         names = settings.load_device_names()
+        _single_s80m = sum(1 for d in devices if d.kind == "s80m") == 1
         for dev in devices:
             entry = names.get(dev.stable_key, "")
+            if not entry and _single_s80m and dev.kind == "s80m" \
+                    and dev.stable_key != "s80m:ftdi":
+                # 旧版键 s80m:ftdi → 序列号键的一次性命名迁移（仅单台时
+                # 无歧义；多台时靠面板行尾序列号区分）
+                entry = names.get("s80m:ftdi", "")
             dev.user_name = entry["name"] if isinstance(entry, dict) else (entry or "")
 
         self._device_panel.set_devices(devices)
@@ -1173,6 +1290,8 @@ class MainWindow(QMainWindow):
             self._close_d435(key)
         elif entry and entry["kind"] == "s80m":
             self._close_s80m(key)
+        elif entry and entry["kind"] == "gripper":
+            self._close_gripper(key)
         elif entry and entry["kind"] == "uvc":
             self._close_uvc(key)
         elif entry and entry["kind"] == "data_ble":
@@ -1254,8 +1373,13 @@ class MainWindow(QMainWindow):
         """录制锁：所有已显示的曝光入口随录制状态禁用/恢复。"""
         for sid in self.grid.slot_ids():
             w = self.grid.camera_widget(sid)
-            # isHidden 语义（窗口未 show 时 isVisible 恒 False）
-            if w is not None and not w.exposure_btn.isHidden():
+            # 非相机控件（夹爪姿态/触觉面板等）没有曝光入口，跳过；
+            # 曾因 w.exposure_btn 直接 AttributeError 炸断整个录制开始
+            # 回调（力矩阵泵因此从未启动）。isHidden 语义：窗口未 show
+            # 时 isVisible 恒 False，故用 isHidden 判断。
+            if w is None or not hasattr(w, "exposure_btn"):
+                continue
+            if not w.exposure_btn.isHidden():
                 w.set_exposure_enabled(enabled)
 
     # ── 手套 / 其他蓝牙（统一体系：画面进主网格，录制走 write_sensor） ──
@@ -1353,6 +1477,398 @@ class MainWindow(QMainWindow):
             if sid in self.grid.slot_ids():
                 self.grid.remove_camera(sid)
 
+    # ── UMI 夹爪（P1 空壳占位槽；P2/P3 填充 bridge/触觉/SLAM/串口） ──
+
+    @staticmethod
+    def _gripper_slot_map(index: int) -> dict:
+        """夹爪槽位表：rig1 保持旧槽名（单夹爪数据契约不变），rig2 加序号。"""
+        mid = "" if index == 1 else f"_{index}"
+        return {
+            "stereo_l": f"gripper{mid}_stereo_left",
+            "rgb": f"gripper{mid}_rgb",
+            "pose": f"gripper{mid}_pose",
+            "force_l": f"gripper{mid}_force_left",
+            "force_r": f"gripper{mid}_force_right",
+        }
+
+    def _open_gripper(self, dev) -> bool:
+        """面板开关打开 UMI 夹爪：建 5 个网格槽 + GripperBridge 后台启动。
+
+        启动链（P2）：相机组选择 → Sightac Flash 缓存 → DECXIN RGB 线程 →
+        触觉输入/计算双进程；P3 起加 SingleFaysLease 全链 + SLAM 桥接 +
+        raw 双目流，P4 加串口。open() 在 bridge 后台线程执行，opened/
+        error 经队列信号回主线程。
+        双夹爪：打开顺序分配 rig 序号（1..2，关闭即释放）；槽名/数据列
+        rig1 保持旧契约，rig2 带 "gripper_2_" 前缀；帧信号按 dev.key
+        lambda 捕获路由，互不串台。
+        """
+        if dev.key in self._workers:
+            return True   # 已打开（幂等）
+        if self._device_manager.has_kind("s80m"):
+            QMessageBox.warning(
+                self, tr("设备冲突"),
+                tr("已开启独立 S80M，其与夹爪的双目相机互斥。\n"
+                   "请先关闭 S80M，再开启 UMI 夹爪。"))
+            self._log(tr("[设备] UMI 夹爪与 S80M 冲突，已拒绝开启: {}",
+                         self._device_label(dev)))
+            return False
+        gripper_count = sum(
+            1 for e in self._workers.values() if e.get("kind") == "gripper")
+        if gripper_count >= 2:
+            QMessageBox.warning(
+                self, tr("夹爪数量上限"),
+                tr("最多支持同时开启 2 台 UMI 夹爪。\n"
+                   "请先关闭其中一台再开启。"))
+            self._log(tr("[设备] 夹爪数量已达上限，已拒绝开启: {}",
+                         self._device_label(dev)))
+            return False
+        index = 1 if gripper_count == 0 else 2
+        try:
+            from core.gripper import paths
+            if not paths.gripper_resources_available():
+                QMessageBox.warning(
+                    self, tr("夹爪资源缺失"),
+                    tr("未找到夹爪原生资源（core/gripper/native 未随包交付），"
+                       "无法开启。"))
+                return False
+        except Exception:
+            return False
+        if not dev.serial:
+            QMessageBox.warning(
+                self, tr("夹爪无序列号"),
+                tr("未读取到夹爪 ESP32 序列号，无法唯一定位控制板。"))
+            return False
+        slot_map = self._gripper_slot_map(index)
+        tag = "" if index == 1 else str(index)
+        for sid, label in [
+                (slot_map["stereo_l"], f"UMI{tag} 左目"),
+                (slot_map["rgb"], f"UMI{tag} RGB"),
+        ]:
+            self.grid.add_camera(sid, label)
+        from ui.pose_view_qt import PoseViewQt
+        pose_view = PoseViewQt()
+        self.grid.add_widget(slot_map["pose"], pose_view)
+        from ui.gripper_widgets import GripperSideWidget
+        side_widgets = {}
+        for sid, side in [(slot_map["force_l"], "left"),
+                          (slot_map["force_r"], "right")]:
+            widget = GripperSideWidget(side)
+            side_widgets[sid] = widget
+            self.grid.add_widget(sid, widget)
+
+        from core.gripper.bridge import GripperBridge
+        bridge = GripperBridge(self, stereo_slot=slot_map["stereo_l"],
+                               rig_index=index)
+        key = dev.key
+        # 帧信号全部按 dev.key lambda 捕获路由（不再按 kind 首命中，
+        # 双夹爪帧流各自归位）
+        bridge.rgb_frame_ready.connect(
+            lambda frame, hw_ns, key=key:
+                self._on_gripper_rgb(key, frame, hw_ns))
+        bridge.stereo_frame_ready.connect(
+            lambda slot, frame, hw_ns, key=key:
+                self._on_gripper_stereo(key, slot, frame, hw_ns))
+        bridge.tactile_ready.connect(
+            lambda side, heatmap, force, matrix, key=key:
+                self._on_gripper_tactile(key, side, heatmap, force, matrix))
+        bridge.pose_ready.connect(
+            lambda position, quat, trajectory=(), timestamp=None, key=key:
+                self._on_gripper_pose(key, position, quat, trajectory,
+                                      timestamp))
+        bridge.gripper_state_ready.connect(
+            lambda payload, key=key: self._on_gripper_state(key, payload))
+        bridge.log.connect(self._log)
+        bridge.error.connect(
+            lambda msg, key=key: self._on_gripper_error(key, msg))
+        bridge.opened.connect(
+            lambda key=key: self._log(
+                tr("[夹爪] {} 相机 + 触觉 + SLAM 链路已就绪",
+                   self._workers.get(key, {}).get("label", key))))
+        entry_label = self._device_label(dev) + (f" #{index}"
+                                                 if index != 1 else "")
+        entry = self._device_manager.gripper_entry(
+            [slot_map["stereo_l"], slot_map["rgb"], slot_map["pose"],
+             slot_map["force_l"], slot_map["force_r"]],
+            entry_label, serial=dev.serial or "")
+        entry["bridge"] = bridge
+        entry["side_widgets"] = side_widgets
+        entry["pose_view"] = pose_view
+        entry["_video_registered"] = set()
+        entry["matrix_pump_stop"] = None   # 录制期力矩阵泵线程停止事件
+        entry["_stereo_last_display_ns"] = 0  # 左目显示节流（15fps）
+        entry["_stereo_display_seq"] = 0      # 每 2 帧显示 1 帧的计数
+        entry["gripper_index"] = index
+        entry["slot_map"] = slot_map
+        # 双夹爪数据列命名空间：rig1 空串（旧键 slam_pose/gripper_state/
+        # gripper_{side}_force…不变），rig2 "gripper_2_" 前缀
+        entry["snapshot_prefix"] = ("" if index == 1
+                                    else f"gripper_{index}_")
+        self._workers[dev.key] = entry
+        # 非视频槽（pose/左右触觉）单独进 status 列
+        for sid in (slot_map["pose"], slot_map["force_l"],
+                    slot_map["force_r"]):
+            self._pipeline.register_gripper_device_id(sid)
+        self._pipeline.record_event(dev.key, "connected")
+        # CPU 预留（主线程掩码收窄，让本 rig 的 SLAM 分区与 raw 专用核
+        # 不再被主进程线程/ffmpeg 子进程抢占）——必须在 open() 派生
+        # 各工作线程之前生效（子线程继承受限掩码；native SLAM 走
+        # taskset 显式设掩码不受影响）
+        from core.gripper import affinity
+        affinity.reserve(index, self._log)
+        bridge.open(dev.serial)
+        self._log(tr("[夹爪] {} 正在启动相机/触觉/SLAM 链路…",
+                     self._device_label(dev)))
+        return True
+
+    def _close_gripper(self, dev_key: str):
+        """关闭 UMI 夹爪：桥接逆序回收 → 撤 5 个网格槽 + 注销条目。
+
+        槽位全部取自本条目 slot_map（rig2 前缀不同），关闭一台
+        不碰另一台的共享命名空间。"""
+        entry = self._workers.pop(dev_key, None)
+        if not entry or entry["kind"] != "gripper":
+            return
+        rig_index = entry.get("gripper_index") or 1
+        self._stop_matrix_pump(entry)
+        bridge = entry.get("bridge")
+        if bridge is not None:
+            bridge.close()
+        # 退还本 rig 的 CPU 预留（掩码扩回；全部 rig 关闭后恢复完整掩码）
+        from core.gripper import affinity
+        affinity.release(rig_index, self._log)
+        slot_map = entry["slot_map"]
+        # 双目槽只显示不录制（从未注册外部帧源），只有 RGB 需要注销
+        self._pipeline.unregister_external_source(slot_map["rgb"])
+        for sid in (slot_map["pose"], slot_map["force_l"],
+                    slot_map["force_r"]):
+            self._pipeline.unregister_gripper_device_id(sid)
+        self._pipeline.record_event(dev_key, "disconnected")
+        pose_view = entry.get("pose_view")
+        if pose_view is not None:
+            pose_view.reset()
+        for sid in entry.get("slots", []):
+            if sid in self.grid.slot_ids():
+                self.grid.remove_camera(sid)
+
+    # ── 夹爪桥接信号（dev.key 路由，双夹爪各自归位）──
+
+    def _gripper_entry(self, dev_key: str):
+        entry = self._workers.get(dev_key)
+        if entry is None or entry.get("kind") != "gripper":
+            return None
+        return entry
+
+    def _on_gripper_rgb(self, dev_key: str, frame, hw_ns: int):
+        """DECXIN RGB 帧（bridge 线程 → 队列回主线程）。首帧惰性注册
+        外部帧源（分辨率以实际首帧为准），显示全帧直推；录制时写入
+        对应 rig 的 RGB 视频槽。"""
+        entry = self._gripper_entry(dev_key)
+        if entry is None:
+            return
+        sid = entry["slot_map"]["rgb"]
+        if sid not in entry.get("_video_registered", set()):
+            h, w = frame.shape[:2]
+            self._pipeline.register_external_source(sid, (h, w), fps=30.0)
+            entry["_video_registered"].add(sid)
+            self._log(tr("[夹爪] RGB 外部帧源已注册 {}x{}@30", w, h))
+        self._note_frame_arrival(sid)
+        widget = self.grid.camera_widget(sid)
+        if widget:
+            widget.video_widget.set_frame(frame, flip_vertical=False)
+        if self._pipeline.is_recording:
+            self._pipeline.write_external_frame(
+                sid, frame.copy(), hardware_ns=hw_ns)
+
+    def _on_gripper_stereo(self, dev_key: str, slot, frame, hw_ns):
+        """s80m 左目帧（bridge 线程 → 队列回主线程）：仅显示，节流到
+        15fps；不注册外部帧源、不入录制。SLAM 解算在桥接进程内部按
+        30fps 取帧进行，与显示节流无关；灰度视频与 IMU 原始数据均不
+        落盘，只存 SLAM 位姿/轨迹。"""
+        entry = self._gripper_entry(dev_key)
+        if entry is None or slot != entry["slot_map"]["stereo_l"]:
+            return
+        now_ns = time.monotonic_ns()
+        # 源是 30fps 抽帧流（33.3ms 间隔）：按 15fps 的墙钟闸门
+        # （66.7ms）会与 30fps 混叠成 3:1，实测只显示 ~10fps。
+        # 改成「每 2 帧显示 1 帧」= 稳定 15fps；若断流超 1.5 个
+        # 显示间隔（100ms）则立即补显，恢复后首帧不因奇偶错过。
+        entry["_stereo_display_seq"] = (
+            entry.get("_stereo_display_seq", 0) + 1)
+        interval_ns = int(1e9 / settings.GRIPPER_STEREO_DISPLAY_FPS)
+        if (
+            entry["_stereo_display_seq"] % 2 == 1
+            and now_ns - entry.get("_stereo_last_display_ns", 0)
+            < interval_ns * 3 // 2
+        ):
+            return
+        entry["_stereo_last_display_ns"] = now_ns
+        self._note_frame_arrival(slot)
+        widget = self.grid.camera_widget(slot)
+        if widget:
+            widget.video_widget.set_frame(frame, flip_vertical=False)
+
+    def _on_gripper_pose(self, dev_key: str, position, quat, trajectory=(),
+                         timestamp=None):
+        """SLAM 位姿（pos3, quat4, traj, t）：quat→3x3 驱动 PoseViewQt
+        （含轨迹） + 落盘快照（rig2 加前缀）；t 随位姿进入
+        slam_trajectory 列（轨迹并入 episode parquet，无 txt 侧车）。"""
+        entry = self._gripper_entry(dev_key)
+        if entry is None:
+            return
+        import numpy as np
+        qx, qy, qz, qw = (float(value) for value in quat)
+        rotation = np.array([
+            [1.0 - 2.0 * (qy * qy + qz * qz),
+             2.0 * (qx * qy - qz * qw),
+             2.0 * (qx * qz + qy * qw)],
+            [2.0 * (qx * qy + qz * qw),
+             1.0 - 2.0 * (qx * qx + qz * qz),
+             2.0 * (qy * qz - qx * qw)],
+            [2.0 * (qx * qz - qy * qw),
+             2.0 * (qy * qz + qx * qw),
+             1.0 - 2.0 * (qx * qx + qy * qy)],
+        ], dtype=float)
+        pose_view = entry.get("pose_view")
+        if pose_view is not None:
+            pose_view.update_pose(position, rotation, trajectory)
+        self._pipeline.write_slam_pose(
+            [float(position[0]), float(position[1]), float(position[2]),
+             qx, qy, qz, qw],
+            prefix=entry["snapshot_prefix"], timestamp=timestamp)
+
+    def _on_gripper_tactile(self, dev_key: str, side, heatmap, force,
+                            force_matrix):
+        """触觉结果（左/右）：热力图 + 力曲线显示 + 力值落盘；
+        力矩阵落盘 P4 泵线程。"""
+        entry = self._gripper_entry(dev_key)
+        if entry is None:
+            return
+        sid = (entry["slot_map"]["force_l"] if side == "left"
+               else entry["slot_map"]["force_r"])
+        widget = entry.get("side_widgets", {}).get(sid)
+        if widget:
+            # worker 输出的热力图已是 RGB（applyColorMap 后已转），而
+            # VideoWidget.set_frame 约定输入 BGR（内部再转 RGB 显示），
+            # 直接透传会红蓝互换——这里补一次反向转换。
+            display_heatmap = cv2.cvtColor(heatmap, cv2.COLOR_RGB2BGR)
+            widget.update_tactile(display_heatmap, force)
+        if force is not None and len(force) == 3:
+            self._pipeline.write_tactile_force(
+                side, force, prefix=entry["snapshot_prefix"])
+
+    def _on_gripper_state(self, dev_key: str, payload):
+        """串口夹爪状态 {pct,gripped,fz,event,board}：PoseView 开合板 +
+        gripper_state 稀疏列快照（录制期随帧行落盘）。"""
+        entry = self._gripper_entry(dev_key)
+        if entry is None:
+            return
+        pct = payload.get("pct")
+        gripped = bool(payload.get("gripped", False))
+        pose_view = entry.get("pose_view")
+        if pose_view is not None:
+            pose_view.set_grip_state(pct, gripped)
+        if pct is None:
+            return   # 板状态尚未到来：不写列（write 侧要求有限数值）
+        fz = payload.get("fz", 0.0)
+        self._pipeline.write_gripper_state(
+            [float(pct), float(gripped), float(fz)],
+            prefix=entry["snapshot_prefix"])
+
+    # ── 力矩阵泵线程（录制期）──────────────────────────
+
+    def _gripper_entries(self):
+        """全部已开启夹爪条目（双夹爪录制时逐台处理）。"""
+        return [e for e in self._workers.values()
+                if e.get("kind") == "gripper"]
+
+    def _start_matrix_pump(self):
+        """录制开始：为每台已开启的夹爪各起一个 30ms 力矩阵泵线程。"""
+        started = 0
+        for entry in self._gripper_entries():
+            bridge = entry.get("bridge")
+            if bridge is None or entry.get("matrix_pump_stop") is not None:
+                continue
+            stop = threading.Event()
+            entry["matrix_pump_stop"] = stop
+            entry["matrix_wrote"] = {"left": 0, "right": 0}
+            thread = threading.Thread(
+                target=self._matrix_pump_loop,
+                args=(bridge, stop, entry),
+                name="gripper-matrix-pump-{}".format(
+                    entry.get("gripper_index", "")),
+                daemon=True,
+            )
+            thread.start()
+            entry["matrix_pump_thread"] = thread
+            started += 1
+        if not started:
+            self._log(tr("[夹爪] 力矩阵泵未启动：无夹爪设备条目"))
+
+    def _matrix_pump_loop(self, bridge, stop, entry):
+        """泵线程体：仅在有新矩阵时编码（int16 行差分）+ 快照写入。"""
+        last_seq = {"left": 0, "right": 0}
+        first_logged = {"left": False, "right": False}
+        wrote = entry["matrix_wrote"]
+        started = time.monotonic()
+        self._log(tr("[夹爪] 力矩阵泵已启动 (L seq={} R seq={})",
+                     bridge.matrix_seq("left"),
+                     bridge.matrix_seq("right")))
+        while not stop.is_set():
+            for side in ("left", "right"):
+                seq = bridge.matrix_seq(side)
+                if seq == last_seq[side]:
+                    continue
+                last_seq[side] = seq
+                matrix = bridge.latest_matrix(side)
+                if matrix is None:
+                    continue
+                try:
+                    encoded = encode_gripper_force_matrix(matrix)
+                except Exception as exc:
+                    self._log(tr("[夹爪] 力矩阵编码失败 ({}): {}",
+                                 side, exc))
+                    continue
+                self._pipeline.write_tactile_force_matrix(
+                    side, encoded, prefix=entry["snapshot_prefix"])
+                wrote[side] += 1
+                if not first_logged[side]:
+                    first_logged[side] = True
+                    self._log(tr("[夹爪] {} 侧力矩阵首帧落盘 ({} 元素)",
+                                 "左" if side == "left" else "右",
+                                 len(encoded)))
+            if (time.monotonic() - started >= 10.0
+                    and not first_logged["left"]
+                    and not first_logged["right"]):
+                self._log(tr(
+                    "[夹爪] 力矩阵泵 10s 无新样本 (L seq={} R seq={})",
+                    bridge.matrix_seq("left"), bridge.matrix_seq("right")))
+                started = time.monotonic()
+            stop.wait(0.03)
+
+    def _stop_matrix_pump(self, entry):
+        """录制结束/设备关闭：停泵线程并等待退出。"""
+        stop = entry.get("matrix_pump_stop")
+        if stop is not None:
+            stop.set()
+            entry["matrix_pump_stop"] = None
+        thread = entry.pop("matrix_pump_thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+        wrote = entry.pop("matrix_wrote", None)
+        if wrote is not None:
+            self._log(tr("[夹爪] 力矩阵泵停止：L 写 {} 帧 R 写 {} 帧",
+                         wrote["left"], wrote["right"]))
+
+    def _on_gripper_error(self, dev_key: str, msg: str):
+        """桥接启动失败：弹窗 + 回收槽位 + 面板回退勾选。"""
+        self._log(tr("[夹爪] 启动失败: {}", msg))
+        QMessageBox.critical(self, tr("夹爪启动失败"), msg)
+        self._close_gripper(dev_key)
+        self._active_device_keys.discard(dev_key)
+        self._device_panel.set_checked(dev_key, False)
+        self._device_panel.set_active_keys(self._active_device_keys)
+        self._update_status()
+
     def _on_device_toggled(self, dev, on: bool):
         """面板开关 → 打开/关闭设备（多路并发：只动自己，不互拆）。
 
@@ -1428,6 +1944,19 @@ class MainWindow(QMainWindow):
                              w["dropped"],
                              w["dropped"] / w["elapsed"] * 100))
 
+    def _gripper_drop_summary(self):
+        """录制结束汇总夹爪双目空桶统计（30fps 口径，有丢才打日志）。"""
+        for entry in self._gripper_entries():
+            bridge = entry.get("bridge")
+            if bridge is None:
+                continue
+            dropped, elapsed = bridge.stereo_drop_snapshot()
+            if dropped > 0 and elapsed > 0:
+                self._log(tr("[夹爪] {} 本次录制双目空桶 {} 个（{:.0f}%）"
+                             "——SLAM 取帧未达 30fps，轨迹存在缺帧",
+                             entry.get("label", "UMI"),
+                             dropped, dropped / elapsed * 100))
+
     def _build_device_meta(self) -> list:
         """按注册表构建录制设备信息（口径在 core.device_manager）。"""
         return self._device_manager.build_device_meta()
@@ -1471,6 +2000,17 @@ class MainWindow(QMainWindow):
                     batch_index = completed + 1
 
             self._reset_s80m_record_state()
+            # 夹爪双目 30fps 空桶看门狗随录制段重置（口径与 s80m 一致）；
+            # 同时清空录制前累积的 GUI 轨迹（显示只画本段录制的点，
+            # parquet slam_trajectory 列由 writer 录制期独立累积不受影响）
+            for entry in self._gripper_entries():
+                bridge = entry.get("bridge")
+                if bridge is not None:
+                    bridge.reset_stereo_drop_watch()
+                    bridge.clear_trajectory()
+                pose_view = entry.get("pose_view")
+                if pose_view is not None:
+                    pose_view.reset()
             self._pipeline.start_recording(self.grid.slot_ids()[0],
                                            task_name=task_name,
                                            batch_index=batch_index,
@@ -1480,6 +2020,7 @@ class MainWindow(QMainWindow):
         """停止录制（正常完成）。"""
         if self._pipeline.is_recording:
             self._s80m_drop_summary()
+            self._gripper_drop_summary()
             self._pipeline.finish_recording("")
             self._reset_s80m_record_state()
 
@@ -1541,6 +2082,9 @@ class MainWindow(QMainWindow):
 
     def _on_recording_started(self, slot_id: str):
         """录制开始——更新状态栏 + 锁死设备开关。"""
+        # 力矩阵泵最先启动：后续任何 UI 锁调用即使异常也不影响落盘
+        # （夹爪在场时启动泵线程，录制期才落 force_matrix 列）
+        self._start_matrix_pump()
         self._device_panel.set_locked(True)
         # 录制期间停设备轮询：detect_devices() 全量枚举（DShow/S80M/BLE 主动
         # 发现，150-210ms）在扫描线程挤占采集线程，帧以「空洞+突发」到达、
@@ -1560,6 +2104,12 @@ class MainWindow(QMainWindow):
     def _on_recording_finished(self, slot_id: str, session_path: str):
         """录制完成——保存历史记录并更新任务进度。"""
         self._device_panel.set_locked(False)
+        episode_index = getattr(
+            self._pipeline, "last_episode_index", 0) or 0
+        for entry in self._gripper_entries():
+            self._stop_matrix_pump(entry)
+            # 轨迹已随 slam_trajectory 列并入本次 episode parquet，
+            # 不再归档 txt 侧车
         # 恢复设备轮询（_on_recording_started 停掉的；request_scan 有
         # _busy 守卫，扫描在途时忽略，不会堆积）。若录制期间已返回任务
         # 选择页（中止后切页），_on_page_changed(0) 已停轮询，这里不抢
@@ -1569,8 +2119,6 @@ class MainWindow(QMainWindow):
             self._device_timer.start()
         self._set_exposure_buttons_enabled(True)
         if session_path:
-            episode_index = getattr(
-                self._pipeline, "last_episode_index", 0) or 0
             cam_list, duration, size_mb = session_summary(
                 session_path, self._pipeline.last_recording_frames,
                 episode_index=episode_index)
@@ -1656,6 +2204,8 @@ class MainWindow(QMainWindow):
     def _on_recording_aborted(self, slot_id: str):
         """异常停止。"""
         self._device_panel.set_locked(False)
+        for entry in self._gripper_entries():
+            self._stop_matrix_pump(entry)
         # 中止走独立信号 recording_aborted，不经过 _on_recording_finished——
         # 必须单独恢复轮询，否则设备面板轮询永久停止。但中止后可能已切回
         # 任务选择页（轮询应停），守卫同 _on_recording_finished。
@@ -2046,9 +2596,30 @@ class MainWindow(QMainWindow):
     #  日志
     # ═══════════════════════════════════════════════════
 
+    _log_lock = threading.Lock()
+
     def _log(self, msg: str):
         stamp = datetime.now().strftime("%H:%M:%S")
         text = f"[{stamp}] {msg}"
+        if self._log_file_path is not None:
+            try:
+                with self._log_lock:
+                    _log_size = (
+                        os.path.getsize(self._log_file_path)
+                        if os.path.isfile(self._log_file_path) else 0)
+                    if _log_size > 5 * 1024 * 1024:
+                        try:
+                            os.replace(
+                                self._log_file_path,
+                                self._log_file_path + ".old")
+                        except OSError:
+                            pass
+                    with open(
+                            self._log_file_path, "a",
+                            encoding="utf-8") as handle:
+                        handle.write(text + "\n")
+            except OSError:
+                pass
         # 主线程直接写，后台线程通过信号安全投递
         if QThread.currentThread() is QApplication.instance().thread():
             self._log_widget.append(text)
@@ -2066,9 +2637,56 @@ class MainWindow(QMainWindow):
         # 对话框内删除会话可能改变历史状态（如标「已上传，本地已删」）
         self._refresh_history()
 
+    @staticmethod
+    def _upload_pair_name(pair, task_id: str = "") -> str:
+        """(path, episode_index) → 日志用短名（任务目录/episode-xxx）。"""
+        path = pair[0] if isinstance(pair, tuple) else (pair or "")
+        episode_index = pair[1] if isinstance(pair, tuple) else 0
+        if not path:
+            return task_id
+        name = os.path.basename(path)
+        if episode_index > 0:
+            name = f"{name}/episode-{episode_file_suffix(episode_index):03d}"
+        return name
+
+    def _on_upload_task_started(self, task_id: str):
+        """上传开始——写主窗口日志（此前打包/上传全程静默，用户只能干等）。"""
+        if task_id not in self._upload_task_map:
+            return
+        self._upload_log_ts[task_id] = time.monotonic()
+        self._log(tr("☁ 开始上传: {}",
+                     self._upload_pair_name(self._upload_task_map[task_id],
+                                            task_id)))
+
+    def _on_upload_task_status(self, task_id: str, msg: str):
+        """上传阶段变化/进度文字——节流写日志（阶段变化立即写）。"""
+        if task_id not in self._upload_task_map:
+            return
+        now = time.monotonic()
+        urgent = any(k in msg for k in ("重试", "完成", "出错", "失败"))
+        if not urgent and now - self._upload_log_ts.get(task_id, 0.0) < \
+                settings.UPLOAD_LOG_THROTTLE_S:
+            return
+        self._upload_log_ts[task_id] = now
+        self._log(tr("☁ [{}] {}", self._upload_pair_name(
+            self._upload_task_map[task_id], task_id), msg))
+
+    def _on_upload_task_progress(self, task_id: str, ratio: float):
+        """进度心跳——POST 无响应时也要有日志，否则看起来像卡死。"""
+        if task_id not in self._upload_task_map:
+            return
+        now = time.monotonic()
+        if now - self._upload_log_ts.get(task_id, 0.0) < \
+                settings.UPLOAD_LOG_THROTTLE_S:
+            return
+        self._upload_log_ts[task_id] = now
+        self._log(tr("☁ [{}] 上传中… {}%", self._upload_pair_name(
+            self._upload_task_map[task_id], task_id), int(ratio * 100)))
+
     def _on_upload_task_done(self, task_id: str):
         """自动上传完成——记录日志；"上传后自动删除"开启时删除本地会话目录，
         否则把录制行标为「已上传」（本地保留）并刷新历史。"""
+        self._upload_log_ts.pop(task_id, None)
         pair = self._upload_task_map.pop(task_id, ("", 0))
         path = pair[0] if isinstance(pair, tuple) else pair
         episode_index = pair[1] if isinstance(pair, tuple) else 0
@@ -2151,6 +2769,7 @@ class MainWindow(QMainWindow):
 
     def _on_upload_task_failed(self, task_id: str, error: str):
         """自动上传失败——记录日志（重试 3 次后仍失败才触发）。"""
+        self._upload_log_ts.pop(task_id, None)
         pair = self._upload_task_map.pop(task_id, ("", 0))
         path = pair[0] if isinstance(pair, tuple) else pair
         episode_index = pair[1] if isinstance(pair, tuple) else 0
@@ -2212,6 +2831,18 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """关闭窗口前停止录制、释放资源。"""
+        # 上传还没跑完就退出：上传线程是 daemon，进程一退就断在半路
+        # （2026-09-09 episode-012 事故）。先问一句，选"否"则整个退出取消。
+        if hasattr(self, "_upload_manager"):
+            n = (self._upload_manager.pending_count()
+                 + self._upload_manager.active_count())
+            if n and QMessageBox.question(
+                    self, tr("确认"),
+                    tr("有 {} 个上传任务未完成，确定退出？"
+                       "未完成的任务将在下次启动时自动恢复。", n)
+            ) != QMessageBox.Yes:
+                event.ignore()
+                return
         self._shutting_down = True
         self._s80m_manager.shutting_down = True
         self._device_timer.stop()

@@ -137,6 +137,9 @@ class CameraPipeline(QObject):
         self._pending_imu: Dict[str, list] = {}  # slot → 队列满暂存的 IMU 样本
         self._pending_imu_lock = threading.Lock()
         self._imu_overflow_count = 0  # 防丢缓冲超限次数（每 episode 告警一次）
+        # IMU 批只随主槽位写入的槽位集合（S80M 独立双目左右目共享同一份
+        # 样本；夹爪链路不存 IMU/双目视频，只落盘 SLAM 位姿/轨迹）
+        self._imu_external_slots = {"stereo_left"}
 
         # 已注册的传感器名称列表（决定 parquet 中 observation.<name> 列）
         self._sensor_names: List[str] = []
@@ -153,6 +156,18 @@ class CameraPipeline(QObject):
         # USB 手套骨架关键点：sensor_name → 63×f32（21×3 米），同节奏快照
         self._glove_kpts: Dict[str, np.ndarray] = {}
         self._glove_kpts_lock = threading.Lock()
+        # UMI 夹爪稀疏列快照（P3/P4）：latest-wins，写入线程每帧取走清空
+        # 键：slam_pose / gripper_state / gripper_{left,right}_force /
+        #     gripper_{left,right}_force_matrix（P4 泵线程预编码 int16 列表）
+        # 双夹爪 rig2 加 "gripper_2_" 前缀（rig1 旧键不变，见 write_*）
+        self._gripper_snapshots: Dict[str, object] = {}
+        self._gripper_snapshots_lock = threading.Lock()
+        # SLAM 轨迹点按帧窗口累积（每点 8 值 [t,x,y,z,qx,qy,qz,qw] 扁平），
+        # 行写入时并入 snapshot——轨迹 txt 侧车由此废弃（并入 episode parquet）
+        self._gripper_traj: Dict[str, list] = {}
+        # 夹爪非视频槽设备 ID（pose/force 槽不走 register_external_source，
+        # 单独进 status 列）
+        self._gripper_device_ids: set = set()
 
         # 外部帧源（如双目子进程），不经过 CameraWorker
         # 帧通过队列传入写入线程，以固定帧率均匀消费，避免 GIL 导致的写入抖动
@@ -296,7 +311,7 @@ class CameraPipeline(QObject):
                 # 的 IMU 批次转入防丢缓冲，随后续帧按时间戳挂靠落盘 ——
                 # 丢帧只损失视频帧，不损失 IMU 样本
                 self._drop_stats.inc(f"ext:{slot_id}")
-                if slot_id == "stereo_left" and imu_samples:
+                if slot_id in self._imu_external_slots and imu_samples:
                     with self._pending_imu_lock:
                         buf = self._pending_imu.setdefault(slot_id, [])
                         buf.extend(imu_samples)
@@ -427,6 +442,14 @@ class CameraPipeline(QObject):
         if sensor_name in self._sensor_names:
             self._sensor_names.remove(sensor_name)
 
+    def register_gripper_device_id(self, device_id: str):
+        """UMI 夹爪非视频槽进 status 列（pose/force 槽，开关时实时调用）。"""
+        self._gripper_device_ids.add(device_id)
+
+    def unregister_gripper_device_id(self, device_id: str):
+        """注销夹爪非视频槽设备 ID（开关 OFF）。"""
+        self._gripper_device_ids.discard(device_id)
+
     # ── 录制控制 ──────────────────────────────────────
 
     def start_recording(self, slot_id: str, task_name: str = "",
@@ -478,7 +501,9 @@ class CameraPipeline(QObject):
         w = EgoDataWriter()
         # 探针日志在 start_episode 内 emit → connect 必须在调用之前
         w.log_occurred.connect(self.recording_log)
-        all_device_ids = list(self._slots.keys()) + list(self._sensor_names)
+        all_device_ids = (list(self._slots.keys())
+                          + list(self._sensor_names)
+                          + sorted(self._gripper_device_ids))
         # 设备标定（多路）：set_device_calibration 注册的按 key 传入；
         # 旧 set_external_calibration 单值路径存 "_default" 键
         calibrations = dict(self._external_calibrations)
@@ -540,6 +565,9 @@ class CameraPipeline(QObject):
         while not self._sensor_queue.empty():
             try: self._sensor_queue.get_nowait()
             except queue.Empty: break
+        with self._gripper_snapshots_lock:
+            self._gripper_snapshots.clear()
+            self._gripper_traj.clear()
 
         # B+ 方案: 启动独立写入线程（精确 30fps，完全不受主线程 UI 影响）
         self._write_thread = threading.Thread(
@@ -584,6 +612,8 @@ class CameraPipeline(QObject):
                 # 手套 IMU/骨架快照随本帧行写入（USB 手套；空 dict 无影响）
                 glove_imu = self._pop_glove_imu()
                 glove_kpts = self._pop_glove_keypoints()
+                # 夹爪稀疏列快照（P3/P4；空 dict 无影响）
+                gripper = self._pop_gripper_snapshots()
 
                 # 处理 CameraSlot 队列（排空取最新帧）
                 for sid, sl in self._slots.items():
@@ -603,7 +633,8 @@ class CameraPipeline(QObject):
 
                     self._write_one_frame(sid, frame, sensor_data,
                                           glove_imu=glove_imu,
-                                          glove_kpts=glove_kpts)
+                                          glove_kpts=glove_kpts,
+                                          gripper=gripper)
 
                 # 处理外部帧源队列（取一帧不排空，保证输出均匀无抖动）
                 # 双目帧已在 _on_stereo_frame 完成垂直翻转，此处不再重复翻转
@@ -616,9 +647,9 @@ class CameraPipeline(QObject):
                         frame, hw_ns, imu_s = item
                     else:  # 兼容旧格式（仅帧）
                         frame, hw_ns, imu_s = item, 0, None
-                    # IMU 样本只随 stereo_left 写入（左右目共享同一份，
-                    # 避免 data/imu/ 出现重复行）
-                    if sid != "stereo_left":
+                    # IMU 样本只随主槽位写入（左右目共享同一份，
+                    # 避免 data/imu/ 出现重复行；S80M/夹爪各自的主槽）
+                    if sid not in self._imu_external_slots:
                         imu_s = None
                     else:
                         # v1.0.9：队列满时暂存的 IMU 批次随后续帧挂靠。
@@ -643,7 +674,8 @@ class CameraPipeline(QObject):
                                           hardware_ns=hw_ns,
                                           imu_samples=imu_s,
                                           glove_imu=glove_imu,
-                                          glove_kpts=glove_kpts)
+                                          glove_kpts=glove_kpts,
+                                          gripper=gripper)
 
             except Exception:
                 pass
@@ -654,7 +686,8 @@ class CameraPipeline(QObject):
                          hardware_ns: int = 0,
                          imu_samples: Optional[List] = None,
                          glove_imu: Optional[Dict[str, tuple]] = None,
-                         glove_kpts: Optional[Dict[str, np.ndarray]] = None):
+                         glove_kpts: Optional[Dict[str, np.ndarray]] = None,
+                         gripper: Optional[Dict] = None):
         """写入单帧到 MP4 + Parquet。
 
         Args:
@@ -665,6 +698,7 @@ class CameraPipeline(QObject):
             imu_samples: 本帧窗口的 IMU 样本列表（双目，随 stereo_left 携带）
             glove_imu: {传感器名: (quats 64×f32, valid 16×f32)} USB 手套 IMU 快照
             glove_kpts: {传感器名: 63×f32 骨架关键点} USB 手套骨架快照
+            gripper: UMI 夹爪稀疏列快照（P3/P4，见 write_gripper_*）
         """
         cam_frame_idx = self._per_cam_frame.get(sid, 0)
         rel_ts = time.time() - self._episode_start_s
@@ -677,6 +711,7 @@ class CameraPipeline(QObject):
             imu_samples=imu_samples,
             glove_imu=glove_imu,
             glove_kpts=glove_kpts,
+            gripper=gripper,
         )
         self._per_cam_frame[sid] = cam_frame_idx + 1
         self._frame_count += 1
@@ -772,6 +807,84 @@ class CameraPipeline(QObject):
             return
         with self._glove_kpts_lock:
             self._glove_kpts[sensor_name] = k
+
+    # ── UMI 夹爪稀疏列快照（P3/P4；latest-wins，写入线程每帧取走）──
+    def _put_gripper_snapshot(self, key: str, value):
+        if self._writer is None or not self._recording:
+            return
+        with self._gripper_snapshots_lock:
+            self._gripper_snapshots[key] = value
+
+    def write_slam_pose(self, pose7, prefix: str = "", timestamp=None):
+        """SLAM 位姿快照 [x,y,z,qx,qy,qz,qw]（P3；桥接 pose_ready 回调）。
+
+        prefix 为双夹爪命名空间：rig1 空串（旧键 slam_pose 不变），
+        rig2 "gripper_2_" → gripper_2_slam_pose。
+
+        同时把完整轨迹点 [t,x,y,z,qx,qy,qz,qw] 累积进本帧窗口的
+        {prefix}slam_trajectory（行写入时取走）——轨迹不再单独落
+        txt 侧车，全部信息都在一条 episode parquet 里。
+        """
+        if pose7 is None:
+            return
+        values = [float(value) for value in pose7[:7]]
+        if len(values) != 7 or not all(np.isfinite(values)):
+            return
+        self._put_gripper_snapshot(f"{prefix}slam_pose", values)
+        if timestamp is not None:
+            try:
+                t = float(timestamp)
+            except (TypeError, ValueError):
+                return
+            if not np.isfinite(t):
+                return
+            with self._gripper_snapshots_lock:
+                if self._writer is None or not self._recording:
+                    return
+                self._gripper_traj.setdefault(
+                    f"{prefix}slam_trajectory", []).extend([t, *values])
+
+    def write_gripper_state(self, state3, prefix: str = ""):
+        """夹爪状态快照 [open_pct, gripped, fz_mn]（P4；GripState 输出）。"""
+        if state3 is None:
+            return
+        values = [float(value) for value in state3[:3]]
+        if len(values) != 3 or not all(np.isfinite(values)):
+            return
+        self._put_gripper_snapshot(f"{prefix}gripper_state", values)
+
+    def write_tactile_force(self, side: str, force3, prefix: str = ""):
+        """触觉力快照 [fx,fy,fz] mN（P2/P3；tactile_ready 回调）。"""
+        if force3 is None or side not in ("left", "right"):
+            return
+        values = [float(value) for value in force3[:3]]
+        if len(values) != 3 or not all(np.isfinite(values)):
+            return
+        self._put_gripper_snapshot(
+            f"{prefix}gripper_{side}_force", values)
+
+    def write_tactile_force_matrix(self, side: str, encoded,
+                                   prefix: str = ""):
+        """触觉力矩阵快照（P4 泵线程预编码的 int16 行差分列表）。"""
+        if encoded is None or side not in ("left", "right"):
+            return
+        self._put_gripper_snapshot(
+            f"{prefix}gripper_{side}_force_matrix", encoded)
+
+    def _pop_gripper_snapshots(self) -> Dict[str, object]:
+        """取走并清空本帧窗口内的夹爪快照（写入线程调用）。
+
+        轨迹点在此并入：{prefix}slam_trajectory = 本窗口内全部点的
+        扁平 8 值列表（无点则不写键）。
+        """
+        with self._gripper_snapshots_lock:
+            snapshot = dict(self._gripper_snapshots)
+            self._gripper_snapshots.clear()
+            for key, points in self._gripper_traj.items():
+                if points:
+                    snapshot[key] = points
+            self._gripper_traj.clear()
+        return snapshot
 
     def _pop_glove_keypoints(self) -> Dict[str, np.ndarray]:
         """取走并清空本帧窗口内的手套骨架快照（写入线程调用）。"""

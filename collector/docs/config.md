@@ -99,6 +99,10 @@ config/ 是应用全局配置、国际化与版本号所在的配置包。版本
 | 上传 | `UPLOAD_ENABLED` / `UPLOAD_MAX_CONCURRENT` / `UPLOAD_RETRY_MAX` | bool / int / int | `True` / 1 / 3 | 串行=1（并发时预压缩临时文件会互相覆盖致视频损坏） |
 | 上传 | `UPLOAD_AUTO_SYNC` / `UPLOAD_DELETE_AFTER` | bool | 启动时从 `server_config.json` 读取（默认 `True` / `False`） | 录制后自动上传 / 上传后删本地 |
 | 上传 | `UPLOAD_PRECOMPRESS_VIDEO` / `UPLOAD_VIDEO_CRF` | bool / int | `True` / 30 | 上传前视频重编码低码率 / CRF 档（v1.0.9 起 HEVC 录制件自动跳过） |
+| 上传 | `UPLOAD_SESSION_SNAPSHOT_LIMIT` | int | 200 | 上传前后拉取的会话列表条数（"POST 是否已入库"的判据） |
+| 上传 | `UPLOAD_RESUME_MAX_AGE_HOURS` / `UPLOAD_RESUME_SKEW_TOL_S` | float / float | 24 / 60.0 | 启动续传窗口（更早的未完成上传不再自动重传）/ 续传判定容忍的客户端-服务器时钟差（秒） |
+| 上传 | `UPLOAD_TMP_SWEEP_AGE_HOURS` | float | 24 | 启动清理残留上传临时文件的年龄门槛（小时） |
+| 上传 | `UPLOAD_INFLIGHT_REFRESH_MS` / `UPLOAD_LOG_THROTTLE_S` | int / float | 1500 / 10.0 | 上传对话框 ⏳ 状态刷新间隔（毫秒）/ 主窗口上传进度日志节流（秒） |
 | 录制编码 | `RECORD_VIDEO_ENCODER` | str | `"auto"` | 录制编码器：`"auto"` 自动探测（nvenc→x265→x264）/ `"nvenc"` / `"x265"` / `"x264"` 显式指定 |
 | 录制编码 | `RECORD_VIDEO_CRF` / `RECORD_VIDEO_X264_CRF` | int / int | 30 / 23 | HEVC 直出 CRF 档 / x264 回退 CRF 档（与 v1.0.8 现状一致） |
 | 录制编码 | `ENCODER_PROBE_ENABLED` / `ENCODER_PROBE_FRAME_COUNT` / `ENCODER_PROBE_MAX_STREAMS` / `ENCODER_PROBE_TIMEOUT_S` | bool / int / int / int | `True` / 45 / 4 / 15 | 录前编码器速度探针开关 / 每探针合成帧数 / 并行流上限 / 单进程超时秒 |

@@ -16,7 +16,7 @@ import time
 import zipfile
 import threading
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from PyQt5.QtCore import QObject, pyqtSignal, QMutex, QMutexLocker
@@ -28,6 +28,95 @@ from core.helpers import episode_file_suffix
 
 
 # ═══════════════════════════════════════════════════════
+#  会话名校验（上传后确认服务器是否已入库）
+# ═══════════════════════════════════════════════════════
+
+# 尾部 episode 标记：_ep000012 / _episode-12 / _000013
+_EP_SUFFIX_RE = re.compile(
+    r"^(?P<base>.+?)(?:[_-]ep(?:isode)?[_-]?\d{1,6}|[_-]\d{6,})$", re.I)
+
+
+def session_name_base(name: str) -> str:
+    """会话名去掉尾部 episode 标记与 .zip 后缀 → 任务基名。
+
+    "UMIGripper_AI" / "UMIGripper_AI_000012" / "UMIGripper_AI_ep000012"
+    / "UMIGripper_AI_episode-12" / "UMIGripper_AI.zip" → "UMIGripper_AI"
+    """
+    n = (name or "").strip()
+    if n.lower().endswith(".zip"):
+        n = n[:-4]
+    m = _EP_SUFFIX_RE.match(n)
+    return (m.group("base") if m else n).strip()
+
+
+def session_matches(session_name: str, server_session: dict) -> bool:
+    """服务器会话记录是否就是本次上传产生的会话（名字相等或基名相等）。"""
+    srv = str((server_session or {}).get("name", "") or "").strip()
+    if not srv or not session_name:
+        return False
+    if srv == session_name.strip():
+        return True
+    base = session_name_base(session_name)
+    return bool(base) and session_name_base(srv) == base
+
+
+def _parse_iso(value) -> Optional[datetime]:
+    """宽松解析时间戳为 naive 本地时间；失败返回 None。"""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
+
+
+def pick_new_session(before_ids: set, sessions: list,
+                     session_name: str) -> Optional[dict]:
+    """在快照 before_ids 之后新出现的同名会话里取最新一条（无则 None）。"""
+    best = None
+    for s in sessions or []:
+        if str(s.get("id", "")) in before_ids:
+            continue
+        if not session_matches(session_name, s):
+            continue
+        key = str(s.get("created_at", "") or "")
+        if best is None or key >= best[0]:
+            best = (key, s)
+    return best[1] if best else None
+
+
+def pick_session_in_window(sessions: list, session_name: str, since_iso: str,
+                           until_iso: str = "", tol_s: float = 60.0
+                           ) -> Optional[dict]:
+    """名字匹配且 created_at ∈ [since_iso - tol_s, until_iso] 的最新一条。
+
+    续传判据：上次进程被杀时 POST 可能已入库而客户端没收到响应。窗口下界
+    是那次 POST 的开始时刻（tol_s 吸收客户端/服务器时钟差），上界是下一个
+    POST 的开始时刻——否则"同任务上一条已入库的会话"会被误判成本条的。
+    until_iso 为空 = 不限上界。时间戳缺失/不可解析 → None（照常重传）。
+    """
+    since = _parse_iso(since_iso)
+    if since is None:
+        return None
+    until = _parse_iso(until_iso) if until_iso else None
+    best = None
+    for s in sessions or []:
+        if not session_matches(session_name, s):
+            continue
+        dt = _parse_iso(s.get("created_at"))
+        if dt is None or (since - dt).total_seconds() > tol_s:
+            continue
+        if until is not None and dt > until:
+            continue
+        if best is None or dt >= best[0]:
+            best = (dt, s)
+    return best[1] if best else None
+
+
+# ═══════════════════════════════════════════════════════
 #  上传任务
 # ═══════════════════════════════════════════════════════
 
@@ -36,11 +125,13 @@ class UploadTask:
 
     __slots__ = ("id", "session_path", "session_name", "episode_index",
                  "status", "progress", "retry_count", "server_url",
-                 "server_session_id", "error_message", "created_at", "updated_at")
+                 "server_session_id", "error_message", "created_at", "updated_at",
+                 "resumed")
 
-    def __init__(self, session_path: str, server_url: str, episode_index: int = 0):
+    def __init__(self, session_path: str, server_url: str, episode_index: int = 0,
+                 task_id: str = "", resumed: bool = False, created_at: str = ""):
         import uuid
-        self.id = uuid.uuid4().hex[:12]
+        self.id = task_id or uuid.uuid4().hex[:12]
         self.session_path = session_path
         # v1.1.0 池化：session_path = 任务目录，session_name 即任务名
         self.session_name = os.path.basename(session_path)
@@ -52,8 +143,11 @@ class UploadTask:
         self.server_session_id = ""
         self.error_message = ""
         now = datetime.now().isoformat()
-        self.created_at = now
+        # 续传复用原行的 created_at —— 它是"上次尝试是否已入库"的时间基准
+        self.created_at = created_at or now
         self.updated_at = now
+        # True = 由启动续传从 DB 恢复（上传前多一道"服务器是否已入库"检查）
+        self.resumed = bool(resumed)
 
     def to_dict(self) -> dict:
         return {k: getattr(self, k, "") for k in self.__slots__}
@@ -63,6 +157,7 @@ class UploadTask:
         t = UploadTask.__new__(UploadTask)
         for k in UploadTask.__slots__:
             setattr(t, k, row.get(k, ""))
+        t.resumed = bool(row.get("resumed", False))
         return t
 
 
@@ -103,6 +198,7 @@ class UploadManager(QObject):
         self._queue: list[UploadTask] = []
         self._active: dict[str, threading.Thread] = {}
         self._active_tasks: dict[str, UploadTask] = {}  # task_id → 任务对象（防重查询用）
+        self._started_at: dict[str, float] = {}         # task_id → 开始时刻（monotonic）
         self._mutex = QMutex()
         self._running = False
         self._worker_thread: Optional[threading.Thread] = None
@@ -126,18 +222,24 @@ class UploadManager(QObject):
     def project_id(self, value: str):
         self._project_id = (value or "").strip()
 
-    def add_task(self, session_path: str, episode_index: int = 0) -> str:
+    def add_task(self, session_path: str, episode_index: int = 0,
+                 task_id: str = "", resumed: bool = False,
+                 created_at: str = "") -> str:
         """添加一个上传任务，返回 task_id。
 
         v1.1.0 池化：防重键 (task_dir, episode_index)——同一 episode 已在队列/
         执行中时返回既有任务 id，不重复入队（自动上传与手动上传互防）。
+
+        task_id/resumed：启动续传时复用 DB 里那行的 id 与创建时间，
+        临时文件名随之复用（顺带覆盖上次被杀进程的残留临时文件）。
         """
         with QMutexLocker(self._mutex):
             for t in self._queue + list(self._active_tasks.values()):
                 if (t.session_path == session_path
                         and t.episode_index == episode_index):
                     return t.id
-        task = UploadTask(session_path, self._server_url, episode_index)
+        task = UploadTask(session_path, self._server_url, episode_index,
+                          task_id=task_id, resumed=resumed, created_at=created_at)
         self._save_to_db(task)
         with QMutexLocker(self._mutex):
             self._queue.append(task)
@@ -194,6 +296,187 @@ class UploadManager(QObject):
     def all_done(self) -> bool:
         return self.pending_count() == 0 and self.active_count() == 0
 
+    def inflight(self) -> dict:
+        """{(session_path, episode_index): {task_id, state, progress, elapsed}}。
+
+        state = "active"（正在打包/上传）| "queued"（排队中）。供上传
+        对话框显示 ⏳ 用——DB 状态只在任务结束时才写，实时状态只能问
+        管理器。线程安全。
+        """
+        now = time.monotonic()
+        out = {}
+        with QMutexLocker(self._mutex):
+            for t in self._queue + list(self._active_tasks.values()):
+                out[(t.session_path, t.episode_index)] = {
+                    "task_id": t.id,
+                    "state": "active" if t.id in self._active_tasks else "queued",
+                    "progress": float(t.progress or 0.0),
+                    "elapsed": max(0.0, now - self._started_at.get(t.id, now)),
+                }
+        return out
+
+    # ── 启动清理与续传 ────────────────────────────────
+
+    # 上传临时文件（打包 zip / episodes 单行切片 / 预压缩视频）都落在
+    # 录制根目录，命名前缀见 _zip_session/_zip_episode/_episode_slice_parquet/
+    # _precompress_videos。
+    _TMP_RE = re.compile(
+        r"^_(?:.+_upload_[0-9a-zA-Z]+\.zip|episodes_.+\.parquet|precomp_.+)$")
+
+    @staticmethod
+    def sweep_orphan_temp_files(base_dir: str, max_age_hours: float = 24.0) -> int:
+        """删除被杀死进程遗留的上传临时文件，返回删除个数。
+
+        只删 mtime 超过 max_age_hours 的：正在上传的进程可能正在写这些
+        文件（另一实例/另一个版本），年龄门槛保证不会误删。
+        """
+        if not base_dir or not os.path.isdir(base_dir):
+            return 0
+        cutoff = time.time() - max_age_hours * 3600
+        removed = 0
+        try:
+            names = os.listdir(base_dir)
+        except OSError:
+            return 0
+        for name in names:
+            if not UploadManager._TMP_RE.match(name):
+                continue
+            p = os.path.join(base_dir, name)
+            try:
+                if not os.path.isfile(p) or os.path.getmtime(p) > cutoff:
+                    continue
+                os.remove(p)
+                removed += 1
+            except OSError:
+                continue
+        return removed
+
+    @staticmethod
+    def _local_episode_exists(session_path: str, episode_index: int) -> bool:
+        """episode 数据文件是否仍在本地（续传前的存在性检查）。
+
+        文件已被 UPLOAD_DELETE_AFTER 或手动删除时不能再续传：_zip_episode
+        会打出一个缺数据的包。
+        """
+        if not os.path.isdir(session_path):
+            return False
+        if episode_index <= 0:
+            try:
+                return bool(os.listdir(session_path))
+            except OSError:
+                return False
+        from core.helpers import list_task_episodes
+        return episode_index in list_task_episodes(session_path)
+
+    def _resume_sessions_snapshot(self) -> Optional[list]:
+        """续传判据用的服务器会话列表；查询失败返回 None（照常重传）。"""
+        try:
+            client = APIClient(self._server_url, session=self._shared_session)
+        except Exception:
+            return None
+        try:
+            return client.try_get_sessions(
+                limit=getattr(settings, "UPLOAD_SESSION_SNAPSHOT_LIMIT", 200))
+        finally:
+            client.close()
+
+    def resume_pending(self, max_age_hours: float = 24.0) -> tuple:
+        """启动续传：把上次进程未完成的上传重新入队。
+
+        Returns:
+            (resumed, verified, skipped)
+            resumed  = [(task_id, session_path, episode_index), ...]  已重新入队
+            verified = [(task_id, session_path, episode_index, session_id), ...]
+                       服务器上已存在 → 直接按成功收尾，不再上传
+            skipped  = [{"path", "episode_index", "reason"}, ...]
+            reason ∈ missing_files | server_changed | already_done | already_queued
+
+        只取每个 (session_path, episode_index) 最近一次尝试：更早的 pending
+        行已被后来的行取代，否则每次启动都会重复入队。
+
+        已入库判定（避免"上次 POST 其实成功了"被重复上传）：只有上次
+        **POST 已经开始**（行状态 uploading，updated_at = POST 开始时刻）的
+        才做预判——打包阶段被杀的肯定没入库，直接重传。判定按时间顺序
+        做"一对一分配"：一条服务器会话只认领一次，且必须落在该次 POST 的
+        开始时刻与下一次 POST 开始时刻之间（同任务多条续传时防串位）。
+        """
+        cutoff = (datetime.now() - timedelta(hours=max_age_hours)).isoformat()
+        try:
+            # 最新在前 → 每个键只保留最近一次尝试（更早的 pending 行已被
+            # 后来的行取代；用旧行会拿错 POST 时刻、重复上传已入库的件）
+            rows = db.conn.execute(
+                "SELECT * FROM upload_task WHERE status IN ('pending', 'uploading') "
+                "AND created_at >= ? ORDER BY created_at DESC", (cutoff,)
+            ).fetchall()
+        except Exception:
+            return [], [], []
+
+        cands, skipped, seen = [], [], set()
+        for row in rows:
+            row = dict(row)
+            key = (row.get("session_path", ""), row.get("episode_index", 0))
+            if key in seen:
+                continue
+            seen.add(key)
+            path, ep = key
+            if str(row.get("server_url", "")).rstrip("/") != \
+                    self._server_url.rstrip("/"):
+                skipped.append({"path": path, "episode_index": ep,
+                                "reason": "server_changed"})
+                continue
+            if self.get_upload_status(path, ep) == "completed":
+                skipped.append({"path": path, "episode_index": ep,
+                                "reason": "already_done"})
+                continue
+            if not self._local_episode_exists(path, ep):
+                skipped.append({"path": path, "episode_index": ep,
+                                "reason": "missing_files"})
+                continue
+            if self.has_task(path, ep):
+                skipped.append({"path": path, "episode_index": ep,
+                                "reason": "already_queued"})
+                continue
+            cands.append({
+                "row": row, "path": path, "episode_index": ep,
+                # POST 开始时刻（仅 status=uploading 的行有）
+                "anchor": (str(row.get("updated_at", "") or "")
+                           if row.get("status") == "uploading" else ""),
+            })
+
+        cands.reverse()          # 回到时间正序（一对一分配按 POST 先后）
+
+        sessions = None
+        if any(c["anchor"] for c in cands):
+            sessions = self._resume_sessions_snapshot()
+
+        resumed, verified, claimed = [], [], set()
+        for i, c in enumerate(cands):
+            anchor, path, ep = c["anchor"], c["path"], c["episode_index"]
+            if sessions is not None and anchor:
+                # 上界 = 下一条"POST 已开始"的续传行的开始时刻（没有则不限）
+                until = next((c2["anchor"] for c2 in cands[i + 1:]
+                              if c2["anchor"]), "")
+                hit = pick_session_in_window(
+                    sessions, os.path.basename(path), anchor, until,
+                    tol_s=getattr(settings, "UPLOAD_RESUME_SKEW_TOL_S", 60.0))
+                sid = str((hit or {}).get("id", ""))
+                if hit is not None and sid not in claimed:
+                    claimed.add(sid)
+                    task = UploadTask(
+                        path, self._server_url, ep,
+                        task_id=str(c["row"].get("id", "")), resumed=True,
+                        created_at=str(c["row"].get("created_at", "") or ""))
+                    # emit=False：调用方还没登记 task_id → 收尾由它自己做
+                    self._mark_upload_verified(task, hit, "上次进程中断前已入库",
+                                               emit=False)
+                    verified.append((task.id, path, ep, sid))
+                    continue
+            tid = self.add_task(
+                path, ep, task_id=str(c["row"].get("id", "")), resumed=True,
+                created_at=str(c["row"].get("created_at", "") or ""))
+            resumed.append((tid, path, ep))
+        return resumed, verified, skipped
+
     # ── 工作循环 ──────────────────────────────────────
 
     def _worker_loop(self):
@@ -219,11 +502,14 @@ class UploadManager(QObject):
     def _upload_one(self, task: UploadTask):
         """执行单个任务的完整上传流程。"""
         task_id = task.id
+        with QMutexLocker(self._mutex):
+            self._started_at[task_id] = time.monotonic()
         self.task_started.emit(task_id)
 
         client = APIClient(self._server_url, session=self._shared_session)
         zip_path = None
         precomp = {}
+        post_started = False     # POST 是否已发出（打包/预压失败不必查服务器）
 
         try:
             # ── 步骤 1: 视频预压缩（大会话必备）──
@@ -270,6 +556,23 @@ class UploadManager(QObject):
             if project_id and not self._project_id:
                 self.task_status.emit(task_id, f"已匹配目标项目 {project_id[:8]}…")
 
+            # ── 上传前：记录服务器会话列表快照 ──
+            # 快照 + 失败后复查 = "POST 到底有没有入库"的唯一判据
+            # （服务器不提供 GET /session/{id}，只能看列表）。
+            baseline_ok, before_ids = False, set()
+            snap = client.try_get_sessions(
+                limit=getattr(settings, "UPLOAD_SESSION_SNAPSHOT_LIMIT", 200))
+            if snap is not None:
+                baseline_ok = True
+                before_ids = {str(s.get("id", "")) for s in snap}
+
+            # 标记"POST 已开始"并落库：进程被杀后，续传（resume_pending）
+            # 凭 status=uploading + updated_at 判断服务器上是否已有本次会话
+            task.status = "uploading"
+            task.updated_at = datetime.now().isoformat()
+            self._save_to_db(task)
+
+            post_started = True          # 之后的异常才需要"查服务器"判定
             result = client.upload_session_zip(
                 zip_path, task.session_name, progress_cb=_progress,
                 name=task.session_name, project_id=project_id,
@@ -279,6 +582,14 @@ class UploadManager(QObject):
             )
 
             if not result.get("ok"):
+                hit = self._verify_after_failure(client, task, before_ids,
+                                                 baseline_ok)
+                if hit:
+                    self._mark_upload_verified(task, hit, "POST 返回失败但服务器已入库")
+                    return
+                # 已复查过 → 不让 except 分支再查一遍（省一次 GET，
+                # 也避免两次判定之间新出现的会话造成误判）
+                post_started = False
                 raise RuntimeError(result.get("error", "上传失败"))
 
             # ── 完成 ──
@@ -295,8 +606,19 @@ class UploadManager(QObject):
 
         except Exception as e:
             task.error_message = str(e)[:500]
-            task.retry_count += 1
             task.updated_at = datetime.now().isoformat()
+
+            # POST 已发出却抛异常（读超时/连接断开/进程被杀）——服务器可能
+            # 其实已经入库，只是响应没回来。先复查会话列表：是本次的会话
+            # 就按成功收尾，绝不重传（重传会在服务器上多出一条重复会话）。
+            if post_started:
+                hit = self._verify_after_failure(client, task, before_ids,
+                                                 baseline_ok)
+                if hit:
+                    self._mark_upload_verified(task, hit, "上传中断但服务器已入库")
+                    return
+
+            task.retry_count += 1
 
             if task.retry_count < self._retry_max:
                 task.status = "pending"
@@ -328,9 +650,48 @@ class UploadManager(QObject):
             with QMutexLocker(self._mutex):
                 self._active.pop(task_id, None)
                 self._active_tasks.pop(task_id, None)
+                self._started_at.pop(task_id, None)
 
             if self.all_done():
                 self.all_completed.emit()
+
+    # ── 上传结果校验（查服务器）────────────────────────
+
+    def _mark_upload_verified(self, task: UploadTask, server_session: dict,
+                              reason: str, emit: bool = True):
+        """服务器上已存在本次上传的会话 → 按成功收尾（不再重复上传）。
+
+        emit=False 供 resume_pending 用：启动续传时调用方还没拿到 task_id，
+        提前发 task_completed 会让主窗口查不到该任务的 session_path（无法
+        标记录制行 / 按开关删本地件），故由调用方拿到返回值后自行收尾。
+        """
+        task.status = "completed"
+        task.progress = 1.0
+        task.server_session_id = str((server_session or {}).get("id", "") or "")
+        task.error_message = ""
+        task.retry_count = 0
+        task.updated_at = datetime.now().isoformat()
+        self._save_to_db(task)
+        if not emit:
+            return
+        self.task_progress.emit(task.id, 1.0)
+        self.task_status.emit(task.id, f"服务器上已存在本次会话，按成功处理（{reason}）")
+        self.task_completed.emit(task.id)
+
+    def _verify_after_failure(self, client: APIClient, task: UploadTask,
+                              before_ids: set,
+                              baseline_ok: bool) -> Optional[dict]:
+        """POST 失败/异常后重查会话列表：出现新的同名会话 → 判定已入库。
+
+        快照或复查失败时返回 None（区分不了新旧，宁可照常重试）。
+        """
+        if not baseline_ok:
+            return None
+        sessions = client.try_get_sessions(
+            limit=getattr(settings, "UPLOAD_SESSION_SNAPSHOT_LIMIT", 200))
+        if sessions is None:
+            return None
+        return pick_new_session(before_ids, sessions, task.session_name)
 
     # ── 项目消歧 ──────────────────────────────────────
 

@@ -1,6 +1,6 @@
 # collector — Multimodal Data Acquisition SDK · 多模态数据采集 SDK
 
-![Version](https://img.shields.io/badge/version-1.2.0-blue)
+![Version](https://img.shields.io/badge/version-1.3.0-blue)
 ![Python](https://img.shields.io/badge/python-3.12-blue)
 ![License](https://img.shields.io/badge/license-TBD-lightgrey)
 
@@ -361,6 +361,27 @@ are documented in [docs/index.md](docs/index.md#开发约定).
 
 ### Changelog
 
+- **v1.3.0** — UMI gripper support (Fays S80M stereo SLAM pose/trajectory
+  + Sightac left/right tactile force with 250×250 force matrix + DECXIN
+  RGB; gripper group in the device panel, hidden when native resources
+  are absent), dual-gripper recording (rig1 keeps the legacy slot/column
+  contract, rig2 is prefixed `gripper_2_`; per-rig CPU affinity
+  partitions with zero shared physical cores + dedicated raw-stream core
+  + 30 fps empty-bucket watchdog). SLAM pose convention corrected for
+  the new ORB core (X=right / Y=forward / Z=up, pose relativized to the
+  origin — no first-frame jump). Stereo preview steady at 15 fps with
+  automatic raw-stream reconnect; trajectory merged into the episode
+  parquet instead of a txt sidecar. The gripper no longer depends on
+  `online/`: native resources mirrored to `core/gripper/native/` (not
+  committed), Sightac SDK shipped pyarmor-encrypted,
+  `tools/import_gripper_calibration.py` imports per-serial calibration
+  for a new gripper. Multiple S80M cameras distinguished by serial /
+  USB topology path
+- **v1.2.1** — large-file upload no longer killed by the 10 s timeout
+  (the send-body phase used the connect timeout; now uses a read-timeout
+  window); closing the upload dialog lets the task finish in the
+  background (manual uploads share the main window queue, duplicates
+  skipped)
 - **v1.2.0** — minimal one-click deployment edition (`start_lite.bat/.sh`
   + `venv_lite` whitelist env, ~750 MB): connect devices → record → upload
   only — no login/playback/task page/skeleton solving. Devices: D435
@@ -699,6 +720,20 @@ i18n 文案经 `tr()` 翻译、PyQt5 信号参数用 `object` 封送大整数、
 
 ### 更新记录
 
+- **v1.3.0** — 新增 UMI 夹爪全链接入（Fays S80M 双目 SLAM 位姿/轨迹 +
+  Sightac 左右触觉力与 250×250 力矩阵 + DECXIN RGB；设备面板夹爪分组，
+  原生资源缺失时自动隐藏），支持双臂双夹爪同录（rig1 旧槽位/数据列契约
+  不变，rig2 加 `gripper_2_` 前缀；两 rig 独立 CPU 亲和分区零共享物理核 +
+  raw 流专用核 + 30fps 空桶看门狗）。SLAM 位姿坐标约定按新 ORB 核修正
+  （X=右 / Y=正对 / Z=上，原点后姿态相对化，起始不跳变）。左目显示稳
+  15fps（奇偶抽帧）且 raw 流断线自动重连；轨迹并入 episode parquet 列，
+  不再落 txt 侧车。夹爪脱离 `online/` 自持：原生资源镜像到
+  `core/gripper/native/`（不入库），Sightac SDK pyarmor 加密随包，
+  新增 `tools/import_gripper_calibration.py` 搬入新夹爪 per-serial 标定。
+  多台 S80M 按序列号 / USB 拓扑路径区分
+- **v1.2.1** — 修复大文件上传被 10 秒误杀（发送阶段 socket 超时错用连接
+  超时，现改用读超时窗口）；上传对话框关闭后任务在后台继续完成（手动上传
+  并入主窗口共享队列，重复提交自动跳过）
 - **v1.2.0** — 新增极简一键部署采集版（`start_lite.bat/.sh` + `venv_lite`
   白名单依赖，约 750MB）：只做连接设备→采集→上传，无登录/回放/任务页/
   骨架解算。设备：D435（1280×720@30 RGB / 848×480@30 深度）、UVC 摄像头

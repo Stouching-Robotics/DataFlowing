@@ -23,9 +23,11 @@ from config.i18n import tr
 from config.settings import save_device_name
 
 _ICON = {"uvc": "📹", "d435": "🔭", "s80m": "👁",
-         "data_ble": "🧤", "usb_glove": "🧤", "ble": "🎧"}
-_GROUP_ORDER = ["camera", "glove", "other_ble"]
+         "data_ble": "🧤", "usb_glove": "🧤", "ble": "🎧",
+         "gripper": "🤖"}
+_GROUP_ORDER = ["camera", "glove", "gripper", "other_ble"]
 _GROUP_TITLE = {"camera": "📷 相机", "glove": "🧤 手套",
+                "gripper": "🤖 夹爪",
                 "other_ble": "🎧 其他蓝牙"}
 
 
@@ -67,6 +69,7 @@ class DevicePanel(QWidget):
         self._items: dict = {}            # device key → QTreeWidgetItem
         self._last_check: dict = {}       # device key → 上次勾选状态（挡文字类变化）
         self._group_expanded = {"camera": True, "glove": True,
+                                "gripper": True,
                                 "other_ble": False}   # 组展开状态（重建保留）
         self._locked = False              # 录制中锁死开关
 

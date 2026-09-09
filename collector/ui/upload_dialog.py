@@ -20,11 +20,14 @@ from config.i18n import tr
 from core.uploader import UploadManager
 from core.recording_repository import RecordingRepo
 from core.session_catalog import list_recordings
-from core.helpers import episode_file_suffix
+from core.helpers import episode_file_suffix, format_duration
 
 
 class UploadDialog(QDialog):
     """录制数据一键上传对话框。"""
+
+    # 状态图标（DB 状态 → 列表前缀）
+    _ICONS = {"completed": "✅", "failed": "❌", "pending": "⬜"}
 
     # 后台删除线程 → 主线程（队列投递）
     _session_deleted = pyqtSignal(str, str, int)   # (session_path, error, episode_index)
@@ -59,8 +62,21 @@ class UploadDialog(QDialog):
         self._setup_ui()
         self._refresh_list()
 
+        # ⏳ 实时状态轮询：DB 只在任务结束时写状态，进行中的任务只能问管理器
+        self._inflight_timer = QTimer(self)
+        self._inflight_timer.setInterval(settings.UPLOAD_INFLIGHT_REFRESH_MS)
+        self._inflight_timer.timeout.connect(self._refresh_inflight)
+
         QTimer.singleShot(50, self._init_manager)
         QTimer.singleShot(200, self._refresh_projects)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._inflight_timer.start()
+
+    def hideEvent(self, event):
+        self._inflight_timer.stop()
+        super().hideEvent(event)
 
     def _init_manager(self):
         url = self._url_edit.text().strip()
@@ -216,8 +232,7 @@ class UploadDialog(QDialog):
                             reverse=True):
                 n = s.get("episode_index", 0)
                 status = UploadManager.get_upload_status(s["path"], n)
-                icon = {"completed": "✅", "failed": "❌",
-                        "pending": "⬜"}.get(status, "⬜")
+                icon = self._ICONS.get(status, "⬜")
                 child = QTreeWidgetItem(
                     [f"{icon} episode-{episode_file_suffix(n):03d}"])
                 child.setFlags(child.flags() | Qt.ItemIsUserCheckable)
@@ -230,6 +245,35 @@ class UploadDialog(QDialog):
         self._select_all_cb.blockSignals(True)
         self._select_all_cb.setChecked(False)
         self._select_all_cb.blockSignals(False)
+        # 打开对话框时可能已有自动上传在跑 → 立即补上 ⏳
+        self._refresh_inflight()
+
+    def _refresh_inflight(self):
+        """就地更新进行中/排队中的行（不重建列表，勾选状态不受影响）。"""
+        if not self._manager:
+            return
+        state = self._manager.inflight()
+        for i in range(self._list.topLevelItemCount()):
+            parent = self._list.topLevelItem(i)
+            for j in range(parent.childCount()):
+                item = parent.child(j)
+                s = item.data(0, Qt.UserRole)
+                if not s:
+                    continue
+                n = s.get("episode_index", 0)
+                label = f"episode-{episode_file_suffix(n):03d}"
+                info = state.get((s["path"], n))
+                if info and info["state"] == "active":
+                    item.setText(0, tr("⏳ {}（上传中 {}% · {}）", label,
+                                       int(info["progress"] * 100),
+                                       format_duration(info["elapsed"])))
+                elif info:
+                    item.setText(0, tr("⏳ {}（排队中）", label))
+                elif item.text(0).startswith("⏳"):
+                    # 任务已结束（或换了管理器）→ 恢复 DB 状态图标
+                    status = UploadManager.get_upload_status(s["path"], n)
+                    item.setText(
+                        0, f"{self._ICONS.get(status, '⬜')} {label}")
 
     def _on_item_clicked(self, item: QTreeWidgetItem, _col: int = 0):
         """点击任务目录行 = 展开/收起该目录下的数据；点击 episode 行 =
@@ -523,6 +567,7 @@ class UploadDialog(QDialog):
         # 复用主窗口共享管理器时：关闭对话框只是收起界面，任务继续在
         # 后台完成（进度/结果见主窗口日志）；自有管理器（无主窗口父级
         # 的独立使用）保持原行为：关闭即停止。
+        self._inflight_timer.stop()
         if self._owns_manager:
             if self._manager:
                 self._manager.stop()

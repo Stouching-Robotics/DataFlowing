@@ -10,9 +10,10 @@
                      注册表级纯口径（离线测试直接注入假条目即可）
 
 注册表条目形状（与旧主窗口 _workers 口径一致）：
-  kind ∈ {"uvc", "d435", "s80m", "data_ble", "ble"}
+  kind ∈ {"uvc", "d435", "s80m", "data_ble", "ble", "gripper"}
   d435/s80m 条目由各自 manager 的 new_entry 构造
-  （core.d435_manager / core.s80m_manager），uvc/ble/glove 骨架由本类构造。
+  （core.d435_manager / core.s80m_manager），uvc/ble/glove/gripper
+  骨架由本类构造。
 """
 
 from __future__ import annotations
@@ -48,6 +49,13 @@ class DeviceManager:
         return {"kind": "data_ble", "slots": [slot],
                 "sensor_column": role, "glove": glove_widget,
                 "label": label}
+
+    @staticmethod
+    def gripper_entry(slots, label: str, serial: str = "") -> dict:
+        """UMI 夹爪条目：6 个网格槽 + ESP 序列号（fays_serial 开链后回填）。"""
+        return {"kind": "gripper", "slots": list(slots),
+                "label": label, "serial": serial,
+                "fays_serial": "", "sensor_columns": []}
 
     # ── 查询 ──
     def get(self, dev_key: str) -> dict | None:
@@ -90,13 +98,18 @@ def build_device_meta(entries: dict) -> list:
                 "slots": [],
                 "sensor_column": e.get("sensor_column", "")})
             continue
-        if e["kind"] not in ("uvc", "d435", "s80m"):
+        if e["kind"] not in ("uvc", "d435", "s80m", "gripper"):
             continue
         d = {"key": key, "kind": e["kind"],
              "name": settings.device_name(key) or e.get("label", ""),
              "slots": list(e.get("slots", []))}
         if e.get("serial"):
             d["serial"] = str(e["serial"])
+        if e["kind"] == "gripper":
+            if e.get("fays_serial"):
+                d["fays_serial"] = str(e["fays_serial"])
+            if e.get("sensor_columns"):
+                d["sensor_columns"] = list(e["sensor_columns"])
         meta.append(d)
     return meta
 

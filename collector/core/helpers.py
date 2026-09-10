@@ -458,7 +458,8 @@ def pooled_data_parquet_path(task_dir: str, episode_index: int) -> str:
 
 def pooled_episodes_path(task_dir: str, episode_index: int) -> str:
     """meta/episodes/chunk-NNN/episode-NNN.parquet（每 episode 一个文件，
-    与 data/videos 同编号：episode-000 = episode 1；单行 10 列）。"""
+    与 data/videos 同编号：episode-000 = episode 1；单行 11 列，末列
+    force_matrix_specs 为该段力矩阵规格的权威来源）。"""
     c, f = episode_chunk_file(episode_index)
     return os.path.join(task_dir, "meta", "episodes", chunk_dir(c),
                         pooled_file_stem(f, ".parquet"))

@@ -157,8 +157,9 @@ class CameraPipeline(QObject):
         self._glove_kpts: Dict[str, np.ndarray] = {}
         self._glove_kpts_lock = threading.Lock()
         # UMI 夹爪稀疏列快照（P3/P4）：latest-wins，写入线程每帧取走清空
-        # 键：slam_pose / gripper_state / gripper_{left,right}_force /
+        # 键：gripper_state / gripper_{left,right}_force /
         #     gripper_{left,right}_force_matrix（P4 泵线程预编码 int16 列表）
+        # （slam_pose 已于 2026-09-10 停止落盘，位姿只走 _gripper_traj）
         # 双夹爪 rig2 加 "gripper_2_" 前缀（rig1 旧键不变，见 write_*）
         self._gripper_snapshots: Dict[str, object] = {}
         self._gripper_snapshots_lock = threading.Lock()
@@ -815,22 +816,23 @@ class CameraPipeline(QObject):
         with self._gripper_snapshots_lock:
             self._gripper_snapshots[key] = value
 
-    def write_slam_pose(self, pose7, prefix: str = "", timestamp=None):
-        """SLAM 位姿快照 [x,y,z,qx,qy,qz,qw]（P3；桥接 pose_ready 回调）。
+    def write_slam_trajectory(self, pose7, prefix: str = "", timestamp=None):
+        """SLAM 轨迹点 [t,x,y,z,qx,qy,qz,qw] 累积（P3；桥接 pose_ready 回调）。
 
-        prefix 为双夹爪命名空间：rig1 空串（旧键 slam_pose 不变），
-        rig2 "gripper_2_" → gripper_2_slam_pose。
+        prefix 为双夹爪命名空间：rig1 空串（旧键 slam_trajectory 不变），
+        rig2 "gripper_2_" → gripper_2_slam_trajectory。
 
-        同时把完整轨迹点 [t,x,y,z,qx,qy,qz,qw] 累积进本帧窗口的
-        {prefix}slam_trajectory（行写入时取走）——轨迹不再单独落
-        txt 侧车，全部信息都在一条 episode parquet 里。
+        只累积轨迹、不再落 slam_pose 快照列（2026-09-10 定案）：位姿流是
+        20/20/60ms 突发而 parquet 行是 1/30s 均匀网格，定长 7 值列填不满，
+        缺位姿的行会被填成 [0]*7 被下游当真实位姿读；轨迹点带真实时间戳、
+        信息严格更多，是 SLAM 位姿的唯一落盘形态。轨迹不再单独落 txt
+        侧车，全部信息都在一条 episode parquet 里。
         """
         if pose7 is None:
             return
         values = [float(value) for value in pose7[:7]]
         if len(values) != 7 or not all(np.isfinite(values)):
             return
-        self._put_gripper_snapshot(f"{prefix}slam_pose", values)
         if timestamp is not None:
             try:
                 t = float(timestamp)
@@ -865,11 +867,24 @@ class CameraPipeline(QObject):
 
     def write_tactile_force_matrix(self, side: str, encoded,
                                    prefix: str = ""):
-        """触觉力矩阵快照（P4 泵线程预编码的 int16 行差分列表）。"""
+        """触觉力矩阵快照（P4 泵线程预编码的行差分/原值列表）。"""
         if encoded is None or side not in ("left", "right"):
             return
         self._put_gripper_snapshot(
             f"{prefix}gripper_{side}_force_matrix", encoded)
+
+    def set_force_matrix_spec(self, prefix: str, spec: str) -> None:
+        """登记本段录制的力矩阵规格（录制开始时调一次，须在 start_episode 后）。
+
+        只有 writer 需要知道倍率——×10/×100/×1000 的落盘类型都是 int16，
+        元素类型分辨不出倍率，倍率得随 info.json features.scale 落盘，
+        训练侧才知道该 ÷N 还是 ÷M。
+        """
+        if self._writer is None:
+            return
+        for side in ("left", "right"):
+            self._writer.set_force_matrix_spec(
+                f"{prefix}gripper_{side}_force_matrix", spec)
 
     def _pop_gripper_snapshots(self) -> Dict[str, object]:
         """取走并清空本帧窗口内的夹爪快照（写入线程调用）。

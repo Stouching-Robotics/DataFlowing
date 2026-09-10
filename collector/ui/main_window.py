@@ -115,23 +115,74 @@ except ImportError:
     _GLOVE_AVAILABLE = False
 
 
-def encode_gripper_force_matrix(m: np.ndarray) -> list:
-    """触觉力矩阵 int16 行差分编码（P4 泵线程，返回扁平 int16 列表）。
+def encode_gripper_force_matrix(m: np.ndarray, spec: str = "int16") -> list:
+    """触觉力矩阵编码（P4 泵线程，返回扁平数值列表）。
 
-    与 online/recording/lerobot_v3.quantize_force_matrix 一致的有符号
-    补码行差分（mod 2^16 可逆），扩展到 (250,250,3) 三力平面：每行 250×3
-    个元素横向差分；超出 ±32767 mN 饱和截断。反解按 features 的
-    shape=[250,250,3] 还原：np.frombuffer(...).reshape(-1,750) →
-    cumsum(axis=1) → reshape(250,250,3)。
+    spec 取 settings.GRIPPER_FORCE_MATRIX_SPECS 之一。
+
+    **注意**：省略 spec 时走的是函数签名默认 "int16"（兼容历史调用的冻结
+    契约），**不跟随工具栏的默认档**；生产路径（P4 泵）一律显式传入录制
+    开始时锁定的 spec，绝不省略。
+
+    "int16"（既有契约）：不缩放，与
+      online/recording/lerobot_v3.quantize_force_matrix 一致的有符号补码行
+      差分（mod 2^16 可逆），扩展到 (250,250,3) 三力平面：每行 250×3 个
+      元素横向差分；超出 ±32767 mN 饱和截断。**逐点 astype(int16) 是向零
+      截断，小数部分全部丢失**——实测真实录制里逐点值只剩 -3…8 的整数电平，
+      亚毫牛梯度（接触形状）不可恢复。保留向零截断是为了与历史录制逐位一致。
+
+    "int16xN"（N=10/100/1000，定标量化）：先 ×N 再四舍五入到整数存 int16，
+      解码端除以 N 还原，分辨率 1/N mN。饱和上限相应变为 ±32767/N mN
+      （×1000 即 ±32.767 mN）。定标档用 rint 而非截断：没有历史包袱，且
+      四舍五入把最大误差减半、不留系统性偏零。行差分与 int16 档完全相同，
+      所以仍然压得很小（×10 实测 0.122 字节/点，float32 的 1/6.5）。
+
+    "float32"（原值直存）：不做任何量化，把 (250,250,3) 按行展平成 250×750
+      的 float32 列表。无截断、无饱和，误差为 float32 本身的 ~1e-7 相对精度。
+      体积换精度：实测 0.797 字节/点（本段数据约为 int16 档的 119 倍）。
+
+    反解：整数档 reshape(-1,750) → cumsum(axis=1) → reshape(250,250,3)
+          （cumsum 走 int32 再截断回 int16 恢复 mod 2^16 回绕），
+          再按倍率 ÷N；float32 档 reshape(-1,750) → (250,250,3)。
+
+    ★ 返回的 Python 元素类型只区分「家族」：int = int16 系（**倍率无法从
+      元素类型看出**，×10 和 ×1000 都是 int），float = float32。
+      倍率必须由 info.json features.scale 携带，writer 与 demo 都按
+      scale + 列类型共同判别，不要只看元素类型。
     """
+    if spec not in settings.GRIPPER_FORCE_MATRIX_SPECS:
+        raise ValueError(f"未知力矩阵规格 {spec!r}")
     arr = np.asarray(m, dtype=np.float32)
+    if spec == "float32":
+        # 与整数档同为「扁平 250×750 列表」，只有元素类型不同：
+        # 读取端统一 reshape(-1,750) 后再按 dtype 决定是否 cumsum
+        return arr.reshape(-1).tolist()
+    scale = settings.GRIPPER_FORCE_MATRIX_SCALES[spec]
     rows = int(arr.shape[0])
     flat = arr.reshape(rows, -1)
-    q = np.clip(flat, -32767.0, 32767.0).astype(np.int16)
+    if scale == 1:
+        q = np.clip(flat, -32767.0, 32767.0).astype(np.int16)
+    else:
+        # rint 后已是整数值，astype 的向零截断不再丢任何东西
+        q = np.clip(np.rint(flat * np.float32(scale)),
+                    -32767.0, 32767.0).astype(np.int16)
     d = np.empty_like(q)
     d[:, 0] = q[:, 0]
     d[:, 1:] = q[:, 1:] - q[:, :-1]   # int16 mod 2^16 回绕
     return np.frombuffer(d.tobytes(), dtype=np.int16).tolist()
+
+
+def describe_gripper_matrix_spec(spec: str) -> str:
+    """规格 → 人话（工具栏提示与日志共用，别在两处各写一份）。"""
+    if spec not in settings.GRIPPER_FORCE_MATRIX_SPECS:
+        return tr("未知规格 {}", spec)
+    scale = settings.GRIPPER_FORCE_MATRIX_SCALES.get(spec)
+    if scale is None:
+        return tr("float32 原值直存（无截断无饱和，体积最大）")
+    if scale == 1:
+        return tr("int16 行差分量化（1 mN 台阶、向零截断，体积最小）")
+    return tr("int16 定标 ×{}（分辨率 {} mN，饱和上限 ±{} mN）",
+              scale, 1.0 / scale, 32767.0 / scale)
 
 
 class MainWindow(QMainWindow):
@@ -509,6 +560,33 @@ class MainWindow(QMainWindow):
         self._upload_delete_action.toggled.connect(self._on_upload_delete_toggled)
         tb.addAction(self._upload_delete_action)
         self._style_toolbar_toggle(self._upload_delete_action)
+
+        # 力矩阵保存规格（5 档下拉；持久化到 server_config.json）。
+        # 档位只决定落盘，实时显示一直走 float32 原值。
+        # 倍率无法从列类型看出（×10 与 ×1000 都是 int16），所以 info.json
+        # features.scale 是对外契约的一部分，改名等于改数据格式。
+        tb.addWidget(QLabel(tr("  🎚 力矩阵精度: ")))
+        self._matrix_fmt_combo = QComboBox(self)
+        for spec in settings.GRIPPER_FORCE_MATRIX_SPECS:
+            self._matrix_fmt_combo.addItem(spec, spec)
+        cur = settings.GRIPPER_FORCE_MATRIX_SPEC
+        self._matrix_fmt_combo.setCurrentIndex(
+            settings.GRIPPER_FORCE_MATRIX_SPECS.index(cur)
+            if cur in settings.GRIPPER_FORCE_MATRIX_SPECS else 0)
+        self._matrix_fmt_combo.setToolTip(tr(
+            "力矩阵落盘规格（与实时显示无关），改动在下次开始录制时锁定生效：\n"
+            "  int16       1 mN 台阶、向零截断，体积最小（0.007 字节/点）\n"
+            "  int16×10    0.1 mN，13.95MB/段 —— 量程 ±3276.7 mN，重压场景用\n"
+            "  int16×100   0.01 mN，34.78MB/段 —— 默认档；量程 ±327.67 mN\n"
+            "  int16×1000  0.001 mN，53.84MB/段\n"
+            "  float32     原值直存，91.26MB/段\n"
+            "（体积为 episode-016 左列 611 帧单列实测，ZSTD 后）\n"
+            "训练侧按 meta/info.json 的 features.scale 还原，×10 与 ×1000 "
+            "的列类型相同、只能靠 scale 区分"))
+        self._matrix_fmt_combo.currentIndexChanged.connect(
+            self._on_matrix_fmt_changed)
+        tb.addWidget(self._matrix_fmt_combo)
+        self._style_toolbar_combo(self._matrix_fmt_combo)
 
         self.addToolBar(tb)
 
@@ -1599,8 +1677,8 @@ class MainWindow(QMainWindow):
         entry["_stereo_display_seq"] = 0      # 每 2 帧显示 1 帧的计数
         entry["gripper_index"] = index
         entry["slot_map"] = slot_map
-        # 双夹爪数据列命名空间：rig1 空串（旧键 slam_pose/gripper_state/
-        # gripper_{side}_force…不变），rig2 "gripper_2_" 前缀
+        # 双夹爪数据列命名空间：rig1 空串（旧键 slam_trajectory/
+        # gripper_state/gripper_{side}_force…不变），rig2 "gripper_2_" 前缀
         entry["snapshot_prefix"] = ("" if index == 1
                                     else f"gripper_{index}_")
         self._workers[dev.key] = entry
@@ -1710,8 +1788,9 @@ class MainWindow(QMainWindow):
     def _on_gripper_pose(self, dev_key: str, position, quat, trajectory=(),
                          timestamp=None):
         """SLAM 位姿（pos3, quat4, traj, t）：quat→3x3 驱动 PoseViewQt
-        （含轨迹） + 落盘快照（rig2 加前缀）；t 随位姿进入
-        slam_trajectory 列（轨迹并入 episode parquet，无 txt 侧车）。"""
+        （含轨迹） + 轨迹点落盘（rig2 加前缀）；t 随位姿进入
+        slam_trajectory 列（轨迹并入 episode parquet，无 txt 侧车）。
+        位姿本身不再落 slam_pose 列（2026-09-10 定案）。"""
         entry = self._gripper_entry(dev_key)
         if entry is None:
             return
@@ -1731,7 +1810,7 @@ class MainWindow(QMainWindow):
         pose_view = entry.get("pose_view")
         if pose_view is not None:
             pose_view.update_pose(position, rotation, trajectory)
-        self._pipeline.write_slam_pose(
+        self._pipeline.write_slam_trajectory(
             [float(position[0]), float(position[1]), float(position[2]),
              qx, qy, qz, qw],
             prefix=entry["snapshot_prefix"], timestamp=timestamp)
@@ -1791,6 +1870,18 @@ class MainWindow(QMainWindow):
             stop = threading.Event()
             entry["matrix_pump_stop"] = stop
             entry["matrix_wrote"] = {"left": 0, "right": 0}
+            # 规格在录制开始锁定：parquet 一列只有一种类型，录制中切换会
+            # 让同一列出现 int/float 混型（write 侧直接报错，整段录制废掉）。
+            # 工具栏档位只在录制开始/结束之间生效，录制中改动留到下一次。
+            spec = settings.GRIPPER_FORCE_MATRIX_SPEC
+            entry["matrix_spec"] = spec
+            # 倍率登记到 writer：×10/×100/×1000 落盘类型都是 int16，元素
+            # 类型分辨不出倍率，info.json features.scale 是唯一的对外凭据。
+            # 此处 writer 已 start_episode 完毕（recording_started 在
+            # start_episode 之后 emit），登记不会被清掉。
+            self._pipeline.set_force_matrix_spec(
+                entry["snapshot_prefix"], spec)
+            self._log(tr("[夹爪] 力矩阵保存规格：{}", describe_gripper_matrix_spec(spec)))
             thread = threading.Thread(
                 target=self._matrix_pump_loop,
                 args=(bridge, stop, entry),
@@ -1805,10 +1896,11 @@ class MainWindow(QMainWindow):
             self._log(tr("[夹爪] 力矩阵泵未启动：无夹爪设备条目"))
 
     def _matrix_pump_loop(self, bridge, stop, entry):
-        """泵线程体：仅在有新矩阵时编码（int16 行差分）+ 快照写入。"""
+        """泵线程体：仅在有新矩阵时编码（按本次录制锁定的规格）+ 快照写入。"""
         last_seq = {"left": 0, "right": 0}
         first_logged = {"left": False, "right": False}
         wrote = entry["matrix_wrote"]
+        spec = entry.get("matrix_spec", settings.GRIPPER_FORCE_MATRIX_SPEC_DEFAULT)
         started = time.monotonic()
         self._log(tr("[夹爪] 力矩阵泵已启动 (L seq={} R seq={})",
                      bridge.matrix_seq("left"),
@@ -1823,7 +1915,7 @@ class MainWindow(QMainWindow):
                 if matrix is None:
                     continue
                 try:
-                    encoded = encode_gripper_force_matrix(matrix)
+                    encoded = encode_gripper_force_matrix(matrix, spec)
                 except Exception as exc:
                     self._log(tr("[夹爪] 力矩阵编码失败 ({}): {}",
                                  side, exc))
@@ -2753,6 +2845,13 @@ class MainWindow(QMainWindow):
                 " font-weight:bold; border-color:#2E7D32; }"
             )
 
+    def _style_toolbar_combo(self, combo: QComboBox):
+        """工具栏下拉样式：与 _style_toolbar_toggle 的按钮同一边框/圆角。"""
+        combo.setStyleSheet(
+            "QComboBox { border:1px solid #555; border-radius:3px;"
+            " padding:2px 6px; }"
+        )
+
     def _on_upload_auto_toggled(self, on: bool):
         """"自动上传"开关——持久化，重启后保持；按钮文字同步开/关状态。"""
         settings.save_upload_auto_sync(bool(on))
@@ -2766,6 +2865,30 @@ class MainWindow(QMainWindow):
         settings.UPLOAD_DELETE_AFTER = bool(on)   # 运行时立即生效（上传完成回调读此值）
         self._upload_delete_action.setText(
             tr("🗑 上传后自动删除: {}", tr("开") if on else tr("关")))
+
+    def _on_matrix_fmt_changed(self, index: int):
+        """"力矩阵精度"档位——持久化，重启后保持；录制开始时锁定生效。"""
+        spec = self._matrix_fmt_combo.itemData(index)
+        if not spec or spec == settings.GRIPPER_FORCE_MATRIX_SPEC:
+            return
+        try:
+            settings.save_gripper_force_matrix_spec(spec)
+        except ValueError as exc:
+            self._log(tr("[夹爪] 力矩阵规格保存失败：{}", exc))
+            return
+        settings.GRIPPER_FORCE_MATRIX_SPEC = spec
+        # 泵在跑 = 正在录制，其规格已在 _start_matrix_pump 锁进 entry。
+        # 报实际在用的那个（而不是切换前的设置值），否则用户看到的
+        # 「当前录制已在用 X」可能是上一段甚至更早的档位。
+        running = sorted({e.get("matrix_spec") for e in self._gripper_entries()
+                          if e.get("matrix_pump_stop") is not None
+                          and e.get("matrix_spec")})
+        if running:
+            self._log(tr("[夹爪] 力矩阵规格已切到 {}，但当前录制已在用 {}，"
+                         "下次录制生效", spec, "/".join(running)))
+        else:
+            self._log(tr("[夹爪] 力矩阵保存规格：{}（下次录制生效）",
+                         describe_gripper_matrix_spec(spec)))
 
     def _on_upload_task_failed(self, task_id: str, error: str):
         """自动上传失败——记录日志（重试 3 次后仍失败才触发）。"""

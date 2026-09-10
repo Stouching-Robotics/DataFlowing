@@ -22,21 +22,54 @@
     力总值列（float32 mN，SDK 同帧输出，可选）:
         observation.{prefix}gripper_{left,right}_force  [fx, fy, fz]
 
-显示什么（与主程序触觉面板一致）:
+显示什么（与主程序触觉面板同源）:
     每侧 = 热力图（上，可滚轮缩放/拖拽/双击复位）+ 力曲线（下）
     热力图 = core/gripper/tactile_process_worker.pressure_to_heatmap 原样移植:
-        fz 平面 → max(0) → 3×3 高斯(σ=0.8) → p10/p98 百分位归一化
-        → JET → resize(320, 240)；无接触帧全零 → JET 深蓝
+        fz 平面 → clip(0) → ×增益 → JET → resize(320, 240)
+        函数默认（scale=None）仍是 0902 固定量程 ×50（bevel）/ ×200（curved），
+        滑块拖到 ×50 与该路径逐像素一致；主程序实时链路已改走自适应增益
+        （见下「为什么要自适应」），默认满量程参考值 3.0 → ×85
+        本 demo 默认「自适应量程」：按整段录制非零 fz 的 p99.5 定标
+        （钳 ×8~×128），左右各自独立 —— 与主程序的差别是这里能看到整段
+        数据、一次性定标，主程序在线上只能逐帧慢速跟随
     力曲线 = ui/gripper_widgets.ForceCurveWidget 原样移植:
         ±3000mN 对称量程、Fx/Fy/Fz 三线、300 点滚动窗口
-    只显示 fz 平面（主程序口径）。矩阵里的 fx/fy 平面在现有录制中逐点值
-    均 < 1，int16 取整后整平面为全零，切过去只会是空画面，故不提供切换。
+    只显示 fz 平面（主程序口径）。矩阵里的 fx/fy 平面在 int16 规格的现有
+    录制中逐点值均 < 1，取整后整平面为全零，切过去只会是空画面，故不提供
+    切换；float32 规格的录制里 fx/fy 有真实值（见下），本 demo 仍只画 fz。
 
-注意（编码有损，回放热力图比实时画面粗）:
-    encode_gripper_force_matrix 把 float32 矩阵 clip 到 ±32767 后直接
-    astype(int16)（截断取整，无缩放因子）。SDK 逐点力值多为小数，
-    落盘只保留整数部分 —— 空间分布与录制时一致，梯度细节是台阶状。
-    力总值列（float32）不受影响，曲线与录制时一致。
+落盘规格（主程序工具栏「🎚 力矩阵精度」下拉，5 档）:
+    int16（默认）encode_gripper_force_matrix 把 float32 矩阵 clip 到
+        ±32767 后直接 astype(int16)（**向零截断，无缩放因子**）再做行差分。
+        SDK 逐点力值多为小数，落盘只保留整数部分（1 mN 台阶）。
+    int16×10 / ×100 / ×1000  定标档：先 ×N 再 rint 到整数存 int16，
+        解码后 ÷N 还原，分辨率 1/N mN。
+    float32       原值直存，小数位完整保留（列类型 list<float32>）。
+    ★ 前四档的列类型都是 list<int16>、元素都是 int，**倍率分辨不出来**，
+      唯一凭据是倍率记录本身。本 demo 按三级优先取（见 matrix_scale）：
+        ① meta/episodes/chunk-NNN/episode-NNN.parquet 的 force_matrix_specs
+           列（JSON，**每段一份、跟着数据走**，权威来源）
+        ② meta/info.json 的 features[列名]["scale"]（任务级回退：单档跑
+           到底的任务里它是对的，混档任务里它只反映最后一段）
+        ③ 1（老 episode 无记录 = 未定标，正是当年那批录制的真实倍率）
+      漏读倍率只会让数值整体放大 N 倍——画面形状还是对的，属于最难发现
+      的静默错。为什么需要①：info.json 是任务级的，值以最新 episode 为准，
+      同一任务里换过档位就会把早先几段覆盖掉。
+    读取端按列类型自动分派（decode_force_matrix / _list_column_to_numpy），
+    各档 episode 都能打开；**不要硬转 int16**，那会把 float32 列静默截断。
+
+为什么要自适应（实测 episode-014，int16 规格）:
+    逐点值普遍只有 1~3（episode-014 左：1×23.4 万、2×1.3 万；右：
+    1×39.5 万、2×9.7 万、3×2.3 万，峰值 7）。固定 ×50 时 1→50/255，
+    整幅图停在深蓝区，用力大小只剩接触面积在变，颜色几乎不动。
+    按数据定标后同样的用力会走到青/绿/红，颜色才随力变。主程序同样出于
+    这个原因改成「下限固定（bevel 参考 3.0 → ×85）+ 慢速自适应」，只是
+    它逐帧在线、参考值以 τ≈8s 跟随；量程开关与参考值见
+    config/settings.py 的 GRIPPER_TACTILE_HEATMAP_AUTO / _REF / _REF_MAX。
+    float32 规格下逐点带小数、分布更连续，同一段数据定标出来的增益会略有
+    不同（见 auto_gain），梯度也更明显。
+    力总值列（float32）不受截断影响，曲线与录制时一致 —— 判断用力大小
+    看曲线，看空间分布看热力图。
 
 内存: 打开一份 episode 会把两侧矩阵列整体读进内存（≈ 帧数 × 375KB/侧，
     696 帧双触觉约 490MB）；逐帧解码后只保留当帧矩阵。
@@ -46,12 +79,14 @@
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
 
 import cv2
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from PyQt5.QtCore import QLibraryInfo, QPointF, QRectF, Qt, QTimer
@@ -83,6 +118,12 @@ FZ_PLANE = 2                     # 显示平面 = fz（主程序触觉面板口�
 
 _FORCE_RANGE_MN = 3000.0         # 力曲线量程（主程序同值）
 _CURVE_POINTS = 300              # 力曲线滚动窗口点数（主程序同值）
+
+_DEFAULT_GAIN = 50.0             # 主程序固定量程（bevel 传感器 ×50）
+_GAIN_MIN, _GAIN_MAX = 8.0, 256.0    # 手动增益滑块的对数范围
+_AUTO_GAIN_PCT = 99.5            # 自适应定标：整段非零 fz 的 p99.5 → 255
+_AUTO_GAIN_CLAMP = (8.0, 128.0)  # 自适应增益上下限（避免空录制被推到爆红）
+_AUTO_GAIN_SAMPLES = 150         # 定标采样帧数上限（够估百分位，解码不拖慢加载）
 _CURVE_COLORS = {
     "fx": QColor("#4fc3f7"),     # 蓝
     "fy": QColor("#aed581"),     # 绿
@@ -98,19 +139,41 @@ _EPISODE_RE = re.compile(r"^episode-(\d+)\.parquet$")
 # 1. 力矩阵反解 + 热力图（与主程序逐行一致）
 # ══════════════════════════════════════════════════════════════════
 
-def decode_force_matrix(encoded) -> np.ndarray | None:
-    """int16 行差分 → (250,250,3) 三力平面。
+def decode_force_matrix(encoded, scale: int = 1) -> np.ndarray | None:
+    """力矩阵 → (250,250,3) 三力平面（单位 mN）。按数值 dtype 自动分派。
 
     与 ui/main_window.encode_gripper_force_matrix 的反解口径一致：
-    reshape(-1,750) → cumsum(axis=1) → reshape(250,250,3)。
-    cumsum 走 int32 再截断回 int16（mod 2^16 补码回绕），与编码端
-    的 int16 差分算术可逆。
+
+    整数（int16 行差分量化）：
+       reshape(-1,750) → cumsum(axis=1) → reshape(250,250,3)。
+       cumsum 走 int32 再截断回 int16（mod 2^16 补码回绕），与编码端
+       的 int16 差分算术可逆。再 ÷scale 还原 mN——scale=1（默认档）
+       时**逐点已被截断到整数**，小数位不可恢复。
+    浮点（float32 原值）：
+       reshape(-1,750) → reshape(250,250,3)，无量化、无回绕、无定标。
+
+    scale 必须来自 meta/info.json 的 features[...]["scale"]，**不能从数据
+    推断**：×10 与 ×1000 的列类型都是 list<int16>、元素也都是 int，猜不出来。
+    漏传 scale 只会让数值整体放大 N 倍（画面形状仍对，是那种「看着有数据
+    但数值全错」的静默错），所以 TactileStream 一律显式传。
+
+    dtype 由入参决定，不要假设一定是 int16：float32 列若被硬转 int16
+    会静默截断（画面看着「有数据」但精度已丢），所以先判 dtype 再解码。
     """
-    arr = np.asarray(encoded, dtype=np.int16).ravel()
+    arr = np.asarray(encoded)
     if arr.size == 0 or arr.size % ROW_LEN:
         return None                      # 空样本或长度不符（损坏行）
+    if np.issubdtype(arr.dtype, np.floating):
+        return arr.astype(np.float32, copy=False).reshape(
+            MATRIX_DIM, MATRIX_DIM, 3)
+    arr = arr.astype(np.int16, copy=False).ravel()
     rows = np.cumsum(arr.reshape(-1, ROW_LEN).astype(np.int32), axis=1)
-    return rows.astype(np.int16).reshape(MATRIX_DIM, MATRIX_DIM, 3)
+    rows = rows.astype(np.int16).reshape(MATRIX_DIM, MATRIX_DIM, 3)
+    if scale and scale != 1:
+        # 定标档返 float32：0.1 mN 分辨率必须用小数值表达，
+        # int16 装不下（÷10 后仍有小数位）
+        return rows.astype(np.float32) / np.float32(scale)
+    return rows
 
 
 def pressure_to_heatmap(pressure_matrix, device_type="bevel", scale=None):
@@ -254,7 +317,10 @@ class HeatmapView(QWidget):
         cx = self.width() / 2 + self._offset.x()
         cy = self.height() / 2 + self._offset.y()
         target = QRectF(cx - w / 2, cy - h / 2, w, h)
-        painter.setRenderHint(QPainter.SmoothPixmapTransform, self._zoom > 1.5)
+        # 与主程序 ZoomableVideoWidget 一致：始终平滑缩放。热力图源只有
+        # 320×240，铺满面板要放大 2 倍左右，最近邻会把它插成马赛克块，
+        # 看着比主程序"粗"——平滑插值才是实时画面那种柔和效果。
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         painter.drawPixmap(target, self._pixmap, QRectF(self._pixmap.rect()))
         painter.end()
 
@@ -335,23 +401,28 @@ class TactileSidePanel(QWidget):
 # ══════════════════════════════════════════════════════════════════
 
 def _list_column_to_numpy(column):
-    """list<int16> 列 → (offsets int64[n+1], values int16[flat])。
+    """list<数值> 列 → (offsets int64[n+1], values[flat])。
 
-    走 pyarrow 缓冲区转 numpy：整段矩阵是上亿个 int16，走 to_pylist
+    走 pyarrow 缓冲区转 numpy：整段矩阵是上亿个元素，走 to_pylist
     会生成同等数量的 Python 对象（几 GB），必须绕开。
+
+    元素类型按 parquet schema 取（int16 行差分 / float32 原值），
+    **不能硬转 int16**——float32 列硬转会把小数位静默截掉，画面和
+    力值都还在，只是精度没了，属于最难发现的一类错。
     """
+    dtype = (np.float32 if pa.types.is_floating(column.type.value_type)
+             else np.int16)
     offsets, values, base = [], [], 0
     for chunk in column.chunks:
         offs = np.asarray(chunk.offsets, dtype=np.int64)
-        vals = np.asarray(chunk.values, dtype=np.int16)
+        vals = np.asarray(chunk.values, dtype=dtype)
         offsets.append(offs[:-1] + base)
         values.append(vals)
         base += int(vals.size)
     if not offsets:
-        return np.zeros(1, np.int64), np.zeros(0, np.int16)
+        return np.zeros(1, np.int64), np.zeros(0, dtype)
     all_offsets = np.concatenate(offsets + [np.array([base], np.int64)])
-    all_values = (np.concatenate(values) if values
-                  else np.zeros(0, np.int16))
+    all_values = np.concatenate(values) if values else np.zeros(0, dtype)
     return all_offsets, all_values
 
 
@@ -366,13 +437,63 @@ def _read_fps(parquet_path: str) -> float:
         return 30.0
 
 
+def _read_episode_matrix_specs(parquet_path: str) -> dict:
+    """读同编号 meta/episodes/chunk-NNN/episode-NNN.parquet 的力矩阵规格。
+
+    这是**每段一份**的权威来源（列 force_matrix_specs，JSON 字符串）：
+    主程序工具栏可选 int16 / int16×10 / int16×100 / int16×1000 / float32，
+    前四档的落盘类型都是 list<int16>、元素也都是 int，**倍率从数据上完全
+    分辨不出**，只有这里记的 scale 能决定该 ÷10 还是 ÷1000。
+
+    为什么不信 meta/info.json：那是**任务级**、值以最新 episode 为准，
+    同一任务里换过档位就会把早先几段覆盖掉（实测 ×10/×100/×1000 三段
+    连录、再录一段 float32 之后，info.json 里三段的 scale 全变成 1）。
+    读不到（老数据/非池化布局）返回 {}，由调用方回退 info.json。
+    """
+    parquet_path = os.path.abspath(parquet_path)
+    chunk_dir = os.path.dirname(parquet_path)                    # …/data/chunk-NNN
+    task_dir = os.path.dirname(os.path.dirname(chunk_dir))
+    meta_path = os.path.join(task_dir, "meta", "episodes",
+                             os.path.basename(chunk_dir),
+                             os.path.basename(parquet_path))
+    try:
+        if "force_matrix_specs" not in pq.read_schema(meta_path).names:
+            return {}
+        raw = pq.read_table(
+            meta_path, columns=["force_matrix_specs"]
+        ).column("force_matrix_specs")[0].as_py()
+        specs = json.loads(raw) if raw else {}
+        return specs if isinstance(specs, dict) else {}
+    except Exception:       # 老任务/非池化布局/单文件副本：当作没有
+        return {}
+
+
+def _read_info_features(parquet_path: str) -> dict:
+    """读 <task>/meta/info.json 的 features（任务级回退来源）；缺失回 {}。
+
+    只在每段元数据读不到时兜底：单档跑到底的任务里它是对的，混档任务里
+    它只反映最后一段。含 scale 的列（力矩阵）才用得上，其余键忽略。
+    """
+    task_dir = os.path.dirname(os.path.dirname(os.path.dirname(parquet_path)))
+    try:
+        with open(os.path.join(task_dir, "meta", "info.json"),
+                  "r", encoding="utf-8") as fh:
+            feats = json.load(fh).get("features") or {}
+        return feats if isinstance(feats, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
 class TactileStream:
     """单侧触觉流：力矩阵稀疏列（保持上一帧）+ 力总值列。"""
 
-    def __init__(self, table, prefix: str, side: str, n_frames: int):
+    def __init__(self, table, prefix: str, side: str, n_frames: int,
+                 scale: int = 1):
         self.prefix = prefix
         self.side = side
         name = f"observation.{prefix}gripper_{side}_force_matrix"
+        # 倍率随 episode 走（每段录制在开始时锁定），不是全局设置
+        self.scale = scale
         self.offsets, self.values = _list_column_to_numpy(table.column(name))
         lengths = np.diff(self.offsets)
         # 稀疏列 → 每帧实际显示的样本行：本帧无新样本则沿用上一帧
@@ -388,7 +509,12 @@ class TactileStream:
         self._cache_matrix = None
 
     def matrix(self, idx: int):
-        """第 idx 帧显示的三力平面 (250,250,3) int16；无数据返回 None。"""
+        """第 idx 帧显示的三力平面 (250,250,3)（单位 mN）；无数据返回 None。
+
+        dtype 随录制规格：int16（行差分量化、倍率 1）或 float32
+        （原值，含所有 int16×N 定标档——定标档要 ÷N，返 float32）。
+        数值已按 self.scale 还原到 mN，可直接参与量程/曲线计算。
+        """
         if not 0 <= idx < self.hold.size:
             return None
         row = int(self.hold[idx])
@@ -397,7 +523,7 @@ class TactileStream:
         if row == self._cache_row:
             return self._cache_matrix
         start, end = int(self.offsets[row]), int(self.offsets[row + 1])
-        matrix = decode_force_matrix(self.values[start:end])
+        matrix = decode_force_matrix(self.values[start:end], self.scale)
         self._cache_row, self._cache_matrix = row, matrix
         return matrix
 
@@ -412,11 +538,46 @@ class TactileStream:
                      matrix.astype(np.float32).sum(axis=(0, 1)))
 
 
+def auto_gain(stream: "TactileStream", n_frames: int) -> float:
+    """按整段录制的非零 fz 分布定显示增益：p99.5 → 255，钳到 ×8~×128。
+
+    逐点力值普遍只有个位数（int16 规格下更是只剩 1~3 的整数，见文件头
+    「为什么要自适应」），主程序固定 ×50 时整幅图停在深蓝区，用力大小
+    只剩接触面积在变。按整段数据定标后同样的用力会走到青/绿/红。
+    float32 规格保留小数位，同一段数据的 p99.5 会更细（梯度可见）。
+    采样解码（上限 _AUTO_GAIN_SAMPLES 帧）估计百分位，不逐帧扫全片。
+    整段无样本（全零/空列）时回退主程序量程。
+    """
+    if n_frames <= 0:
+        return _DEFAULT_GAIN
+    step = max(1, n_frames // _AUTO_GAIN_SAMPLES)
+    chunks = []
+    for index in range(0, n_frames, step):
+        matrix = stream.matrix(index)
+        if matrix is None:
+            continue
+        plane = matrix[:, :, FZ_PLANE]
+        nonzero = plane[plane > 0]
+        if nonzero.size:
+            chunks.append(nonzero)
+    if not chunks:
+        return _DEFAULT_GAIN
+    peak = float(np.percentile(np.concatenate(chunks), _AUTO_GAIN_PCT))
+    if peak <= 0:
+        return _DEFAULT_GAIN
+    return float(min(_AUTO_GAIN_CLAMP[1],
+                     max(_AUTO_GAIN_CLAMP[0], 255.0 / peak)))
+
+
 class TactileEpisode:
     """一份 episode parquet：发现全部夹爪/左右触觉流并提供逐帧取数。"""
 
     def __init__(self, parquet_path: str):
         self.path = os.path.abspath(parquet_path)
+        # 力矩阵规格：每段 meta 优先（权威），info.json 兜底（任务级、
+        # 只反映最后一段），都没有则按未定标 ÷1 —— 老 episode 正是如此
+        self.matrix_specs = _read_episode_matrix_specs(self.path)
+        self.info_features = _read_info_features(self.path)
         # 只读触觉相关列：整段矩阵本就占内存，别再捎带手套/骨架等列
         schema = pq.read_schema(parquet_path)
         matrix_names = [name for name in schema.names
@@ -441,7 +602,27 @@ class TactileEpisode:
             prefix = match.group("prefix")
             side = match.group("side")
             self.rigs.setdefault(prefix, {})[side] = TactileStream(
-                self.table, prefix, side, self.n_frames)
+                self.table, prefix, side, self.n_frames,
+                self.matrix_scale(name))
+
+    def matrix_scale(self, column: str) -> int:
+        """该力矩阵列的定标倍率：每段 meta → info.json → 1（未定标）。
+
+        每段 meta 一旦给出可用倍率就到此为止——它对该段是权威的，
+        哪怕值恰好是 1（float32 档、或真的没定标），也不能被任务级
+        info.json 里别的段的倍率顶掉。
+        """
+        for source in (self.matrix_specs, self.info_features):
+            feat = source.get(column)
+            if not isinstance(feat, dict):
+                continue
+            try:
+                scale = int(feat["scale"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if scale > 0:
+                return scale
+        return 1
 
     def rig_label(self, prefix: str) -> str:
         match = re.match(r"^gripper_(\d+)_$", prefix or "")
@@ -488,6 +669,18 @@ def _resolve_episodes(path: str):
 # 4. 窗口
 # ══════════════════════════════════════════════════════════════════
 
+def _slider_to_gain(value: int) -> float:
+    """增益滑块 0~100 → 对数映射 ×8~×256（低端手感更细）。"""
+    ratio = _GAIN_MAX / _GAIN_MIN
+    return _GAIN_MIN * ratio ** (float(value) / 100.0)
+
+
+def _gain_to_slider(gain: float) -> int:
+    gain = min(_GAIN_MAX, max(_GAIN_MIN, float(gain)))
+    ratio = _GAIN_MAX / _GAIN_MIN
+    return int(round(100.0 * math.log(gain / _GAIN_MIN) / math.log(ratio)))
+
+
 class DemoWindow(QMainWindow):
 
     def __init__(self, path=None):
@@ -498,6 +691,8 @@ class DemoWindow(QMainWindow):
         self.idx = 0
         self.playing = False
         self._prefix = ""
+        self._gain = _DEFAULT_GAIN      # 手动增益（关掉自适应时生效）
+        self._auto_gains = {}           # 当前夹爪各侧的自适应增益
 
         central = QWidget()
         # 暗色底：面板未出图时空区域不露白色窗口背景（调色板填充，
@@ -525,8 +720,14 @@ class DemoWindow(QMainWindow):
         bar_palette.setColor(bar_widget.backgroundRole(), QColor("#d9d9d9"))
         bar_widget.setPalette(bar_palette)
         bar_widget.setAutoFillBackground(True)
-        bar = QHBoxLayout(bar_widget)
-        bar.setContentsMargins(6, 4, 6, 4)
+        # 两行控制条：第一行文件/播放（进度条要够宽），第二行夹爪/显示增益
+        bar_box = QVBoxLayout(bar_widget)
+        bar_box.setContentsMargins(6, 4, 6, 4)
+        bar_box.setSpacing(4)
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+        gain_bar = QHBoxLayout()
+        gain_bar.setSpacing(6)
 
         self.btn_open = QPushButton("打开 Parquet")
         self.btn_play = QPushButton("播放")
@@ -541,6 +742,19 @@ class DemoWindow(QMainWindow):
         self.combo_episode.setEnabled(False)
         self.combo_rig = QComboBox()
         self.combo_rig.setEnabled(False)
+        self.chk_auto = QCheckBox("自适应")
+        self.chk_auto.setChecked(True)      # 默认按录制数据定标，颜色才随力变
+        self.chk_auto.setEnabled(False)
+        self.chk_auto.setToolTip(
+            "按整段录制的非零 fz 定标（每侧独立），颜色随力变化明显；\n"
+            "关掉后用下面的滑块固定增益，拖到 ×50 与主程序逐像素一致")
+        self.slider_gain = QSlider(Qt.Horizontal)
+        self.slider_gain.setRange(0, 100)
+        self.slider_gain.setValue(_gain_to_slider(_DEFAULT_GAIN))
+        self.slider_gain.setFixedWidth(110)
+        self.slider_gain.setEnabled(False)
+        self.lbl_gain = QLabel("增益 ×50")
+        self.lbl_gain.setMinimumWidth(112)      # 容得下「增益 ×128 / ×64」
         self.chk_loop = QCheckBox("循环")
         self.chk_loop.setChecked(True)
         self.lbl_frame = QLabel("- / -")
@@ -551,9 +765,17 @@ class DemoWindow(QMainWindow):
         bar.addWidget(self.btn_prev)
         bar.addWidget(self.slider, 1)
         bar.addWidget(self.btn_next)
-        bar.addWidget(self.combo_rig)
         bar.addWidget(self.chk_loop)
         bar.addWidget(self.lbl_frame)
+
+        gain_bar.addWidget(self.combo_rig)
+        gain_bar.addWidget(self.chk_auto)
+        gain_bar.addWidget(self.slider_gain)
+        gain_bar.addWidget(self.lbl_gain)
+        gain_bar.addStretch(1)
+
+        bar_box.addLayout(bar)
+        bar_box.addLayout(gain_bar)
         root.addWidget(bar_widget)
 
         self.btn_open.clicked.connect(self.open_file_dialog)
@@ -564,6 +786,8 @@ class DemoWindow(QMainWindow):
         self.slider.sliderReleased.connect(self._on_slider_released)
         self.combo_episode.activated.connect(self._on_episode_chosen)
         self.combo_rig.activated.connect(self._on_rig_chosen)
+        self.chk_auto.toggled.connect(self._on_auto_toggled)
+        self.slider_gain.valueChanged.connect(self._on_gain_changed)
 
         self.timer = QTimer(self)
         self.timer.setTimerType(Qt.PreciseTimer)   # 节奏计时器要精确节拍
@@ -622,6 +846,10 @@ class DemoWindow(QMainWindow):
         for side, panel in self.panels.items():
             panel.setVisible(side in sides)
             panel.reset()
+        self.chk_auto.setEnabled(bool(sides))
+        self.slider_gain.setEnabled(bool(sides)
+                                    and not self.chk_auto.isChecked())
+        self._recompute_auto_gains()
 
         self.slider.blockSignals(True)
         self.slider.setRange(0, max(0, data.n_frames - 1))
@@ -637,6 +865,7 @@ class DemoWindow(QMainWindow):
                 os.path.basename(data.path), data.fps, data.n_frames))
         print("[力矩阵] {} 帧 {} 台夹爪，矩阵列常驻 {:.0f} MB".format(
             data.n_frames, len(data.rigs), data.matrix_bytes() / 1e6))
+        self._update_gain_label()
         self.render_frame(0)
 
     def _on_episode_chosen(self, index):
@@ -651,6 +880,54 @@ class DemoWindow(QMainWindow):
         for side, panel in self.panels.items():
             panel.setVisible(side in sides)
             panel.reset()
+        self._recompute_auto_gains()
+        self._update_gain_label()
+        self.render_frame(self.idx)
+
+    # ── 显示增益（自适应 / 手动）──────────────────────
+
+    def _recompute_auto_gains(self):
+        """按当前夹爪各侧的整段数据重算自适应增益（采样解码，加载时才做）。"""
+        sides = self.data.rigs.get(self._prefix, {}) if self.data else {}
+        self._auto_gains = {
+            side: auto_gain(stream, self.data.n_frames)
+            for side, stream in sides.items()}
+
+    def _effective_gains(self):
+        """本帧每侧实际使用的增益：自适应按侧给，手动则两侧同一个值。"""
+        sides = self.data.rigs.get(self._prefix, {}) if self.data else {}
+        if self.chk_auto.isChecked():
+            return {side: self._auto_gains.get(side, _DEFAULT_GAIN)
+                    for side in sides}
+        return {side: self._gain for side in sides}
+
+    def _update_gain_label(self):
+        if self.data is None:
+            self.lbl_gain.setText("增益 ×{:.0f}".format(self._gain))
+            return
+        if self.chk_auto.isChecked():
+            gains = self._effective_gains()
+            text = " / ".join("×{:.0f}".format(gains[side])
+                              for side in sorted(gains))
+            self.lbl_gain.setText("增益 {}".format(text))
+        else:
+            self.lbl_gain.setText("增益 ×{:.0f}".format(self._gain))
+
+    def _on_auto_toggled(self, checked):
+        self.slider_gain.setEnabled(self.data is not None and not checked)
+        if not checked:
+            # 取消自适应时把滑块挪到当前自适应值，画面不会突然变暗
+            gains = list(self._auto_gains.values()) or [_DEFAULT_GAIN]
+            self.slider_gain.blockSignals(True)
+            self.slider_gain.setValue(_gain_to_slider(max(gains)))
+            self.slider_gain.blockSignals(False)
+            self._gain = _slider_to_gain(self.slider_gain.value())
+        self._update_gain_label()
+        self.render_frame(self.idx)
+
+    def _on_gain_changed(self, value):
+        self._gain = _slider_to_gain(value)
+        self._update_gain_label()
         self.render_frame(self.idx)
 
     # ── 播放控制 ──────────────────────────────────────
@@ -695,6 +972,7 @@ class DemoWindow(QMainWindow):
             return
         index = max(0, min(index, self.data.n_frames - 1))
         self.idx = index
+        gains = self._effective_gains()
         for side, panel in self.panels.items():
             stream = self.data.rigs.get(self._prefix, {}).get(side)
             if stream is None:
@@ -703,7 +981,8 @@ class DemoWindow(QMainWindow):
             if matrix is not None:
                 # 稀疏帧返回 None 时不动画面：与实时画面保持上一次结果一致
                 panel.show_tactile(
-                    pressure_to_heatmap(matrix[:, :, FZ_PLANE]),
+                    pressure_to_heatmap(matrix[:, :, FZ_PLANE],
+                                        scale=gains.get(side, _DEFAULT_GAIN)),
                     stream.force_at(index))
         self.slider.blockSignals(True)
         self.slider.setValue(index)

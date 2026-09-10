@@ -551,9 +551,10 @@ GET `/api/v1/device/tasks?device_name=…`。设计模式参照已移除的 `Syn
 | 名称 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `CONNECT_TIMEOUT` | int | 10 | HTTP 请求超时（秒） |
+| `PROGRESS_RETRY_INTERVAL_S` | float | 600 | 进度端点 404 后进入降级，冷却期满再探一次（见 `_progress_retry_at`） |
 | 轮询间隔 | int | `settings.TASK_POLL_INTERVAL_MS`（默认 30000） | 读不到时 `getattr` 兜底 5000 毫秒（代码兜底值，非配置默认） |
 | 设备认领名 | str | `settings.DEVICE_NAME` | 读不到时回退 `"EGO_001"`；作为 `device_name` 查询参数 |
-| API 端点 | — | `POST /api/v1/auth/login`、`GET /api/v1/device/tasks`、`POST /api/v1/device/tasks/progress` | 登录 body 含 `username/password/remember_me`；进度上报 body 含 `task_id/session_id/increment/device_name`，`session_id = "{device}:{task_id}:{水位}"` 幂等（后端按 `(device_name, session_id)` 去重，重复请求返回当前全局数不重复加；游客上报公共任务应放行）；404 → `_progress_supported=False` 静默降级本地口径 |
+| API 端点 | — | `POST /api/v1/auth/login`、`GET /api/v1/device/tasks`、`POST /api/v1/device/tasks/progress` | 登录 body 含 `username/password/remember_me`；进度上报 body 含 `task_id/session_id/increment/device_name`，`session_id = "{device}:{task_id}:{水位}"` 幂等（后端按 `(device_name, session_id)` 去重，重复请求返回当前全局数不重复加；游客上报公共任务应放行）；404 → `_progress_supported=False` 降级本地口径，冷却期过后自动重探恢复（不必重启）；`set_server_url` 立即解除降级 |
 | `User-Agent` | str | `"DAQ-SDK/1.0"` | — |
 
 **调用关系**：被 `ui/main_window.py` 实例化。依赖 `requests` 与 `PyQt5.QtCore`。
@@ -967,7 +968,13 @@ rows/cols 映射，点击"选择"弹出子级 `MatrixConfigDialog` 逐部位编�
 `increment_task_completed` 本机 `local_count` +1 → 显示值重算，与本地会话
 文件是否被删无关），随后 `TaskService._flush_progress` 把本机未上报增量
 以水位合并方式 POST `/api/v1/device/tasks/progress`（幂等键
-`{device}:{task_id}:{水位}`，断网/失败由下个轮询 tick 兜底重试）。
+`{device}:{task_id}:{水位}`，断网/失败由下个轮询 tick 兜底重试；端点不存在
+时降级 10 分钟后再探，服务端升级后自动恢复上报，无需重启采集端）。
+
+**进度口径**：进度只由「录制完成」推动 —— 上传不改变任务进度。后端
+`GET /api/v1/device/tasks` 的 `current_count` 取各设备上报录制数之和
+（从未收到上报的历史项目才回退到项目目录下的 session 数），`progress_source`
+字段标明该项目当前用的是 `"reported"` 还是 `"sessions"`。
 
 **上传链路**：`ui/upload_dialog.py` 经 `core/uploader.py`
 （`UploadManager`：ffmpeg 预压缩 → zip 打包 → `core/api_client.py` 上传 →

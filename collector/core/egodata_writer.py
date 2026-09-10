@@ -86,6 +86,12 @@ _EPISODE_COLUMNS = [
     ("drop_stats",          pa.string(),   "{}"),
     ("video_codec",         pa.string(),   "{}"),
     ("calibration",         pa.string(),   "{}"),
+    # v1.3.x 新增：本段力矩阵列的规格（列名 → dtype/shape/encoding/scale）。
+    # 必须每段一份 —— 倍率是「每段录制」的事实，而 info.json 是任务级、
+    # 值以最新 episode 为准，同任务里换了档位会把上一段的覆盖掉（实测
+    # ×10/×100/×1000 三段连录后 scale 全被最后一段顶成 1）。读取端应以
+    # 本列为准，info.json 只作回退。
+    ("force_matrix_specs",  pa.string(),   "{}"),
 ]
 _EPISODE_SCHEMA = pa.schema([(n, t) for n, t, _d in _EPISODE_COLUMNS])
 
@@ -158,7 +164,15 @@ class EgoDataWriter(QObject):
         self._present_sensors: set = set()
         self._present_imu: bool = False
         self._present_glove_imu: set = set()   # USB 手套 IMU 稀疏列（按传感器名）
-        self._present_gripper: set = set()     # UMI 夹爪稀疏列（slam_pose/state/force/matrix）
+        self._present_gripper: set = set()     # UMI 夹爪稀疏列（state/force/matrix/trajectory）
+        # 力矩阵键 → 落盘家族（"int16" 行差分量化 / "float32" 原值）。
+        # 由首帧实际元素类型判定（见 _note_matrix_dtype），不用全局开关推断——
+        # 历史 episode 与录制中改开关都不会串型。
+        self._matrix_dtype: Dict[str, str] = {}
+        # 力矩阵键 → 定标倍率（1/10/100/1000），录制开始时由采集侧登记
+        # （set_force_matrix_spec）。**落盘类型看不出倍率**：×10 与 ×1000
+        # 都是 list<int16>，只能靠 info.json features.scale 区分，缺省 1。
+        self._matrix_scale: Dict[str, int] = {}
         # 深度多槽位（D435 第 n 台 = d435_depth[_n]；S80M 传统路径兜底
         # settings.CAMERA_DEPTH）：槽位键 → depth image_key
         self._depth_slots: Dict[str, str] = {}
@@ -351,6 +365,8 @@ class EgoDataWriter(QObject):
         self._present_imu = False
         self._present_glove_imu = set()
         self._present_gripper = set()
+        self._matrix_dtype = {}
+        self._matrix_scale = {}          # 倍率由采集侧重新登记；防上一段残留
         self._reset_stats()
         self._last_task = task_name
 
@@ -542,6 +558,60 @@ class EgoDataWriter(QObject):
 
     # ── 数据行写入 (LeRobot v3 兼容 Parquet) ────────────
 
+    def set_force_matrix_spec(self, key: str, spec: str) -> None:
+        """登记某力矩阵列的落盘规格（录制开始时由采集侧调一次）。
+
+        倍率只影响 info.json features.scale 与读取端还原，**不影响 parquet
+        列类型**——列类型仍由首帧元素类型定型（见 _note_matrix_dtype），
+        所以不登记也只是丢失倍率信息、默认按 1 还原，历史 episode 行为不变。
+        """
+        scale = settings.GRIPPER_FORCE_MATRIX_SCALES.get(spec)
+        self._matrix_scale[key] = int(scale) if scale else 1
+
+    def _force_matrix_features(self) -> Dict[str, dict]:
+        """本 episode 各力矩阵列的规格描述：列名 → dtype/shape/encoding/scale。
+
+        **scale 是读取端的必需信息**：×10 与 ×1000 的列类型都是
+        list<int16>、元素也都是 int，从数据上分辨不出倍率，只有 scale 能
+        决定该 ÷10 还是 ÷1000。float32 恒为 1（无定标，÷1 是恒等）。
+
+        单一来源：info.json 的 features 与 meta/episodes 行的
+        force_matrix_specs 都取这份，避免两处各写一份而后漂移。
+        """
+        features = {}
+        for key in sorted(self._present_gripper):
+            if not key.endswith("_force_matrix"):
+                continue
+            float32 = self._matrix_dtype.get(key) == "float32"
+            features[f"observation.{key}"] = {
+                "dtype": "float32" if float32 else "int16",
+                "shape": [settings.GRIPPER_FORCE_MATRIX_DIM] * 2 + [3],
+                "encoding": ("row_flat_raw" if float32
+                             else "row_diff_quantized"),
+                "scale": 1 if float32 else self._matrix_scale.get(key, 1),
+            }
+        return features
+
+    def _note_matrix_dtype(self, key: str, value) -> None:
+        """按首帧实际元素类型锁定该力矩阵列的落盘规格。
+
+        int16 行差分编码走 np.int16.tolist() → Python int；
+        float32 原值走 np.float32.tolist() → Python float。
+        首帧空样本时不定型（后续有样本再定）；定型后若类型变了说明
+        录制中切了开关——parquet 一列只能一种类型，这里显式报错而不是
+        让 pyarrow 抛难懂的转换异常。
+        """
+        if not value:
+            return                            # 空样本：不定型
+        dtype = "float32" if isinstance(value[0], float) else "int16"
+        prev = self._matrix_dtype.get(key)
+        if prev is None:
+            self._matrix_dtype[key] = dtype
+        elif prev != dtype:
+            raise ValueError(
+                f"力矩阵列 {key} 在录制中改变了规格（{prev} → {dtype}）；"
+                f"parquet 一列只能一种类型，请一段录制只用一种规格")
+
     def write_frame_row(self, frame_index: int, timestamp_s: float,
                         sensors: Optional[Dict[str, np.ndarray]] = None,
                         connection_status: Optional[Dict[str, str]] = None,
@@ -569,11 +639,19 @@ class EgoDataWriter(QObject):
                        USB 手套骨架快照，回填恒写的
                        observation.{left,right}_hand_pose 占位列
             gripper: UMI 夹爪稀疏快照（P3/P4），键值：
-                       slam_pose [x,y,z,qx,qy,qz,qw]
+                       slam_trajectory [t,x,y,z,qx,qy,qz,qw]×N 变长
                        gripper_state [open_pct, gripped, fz_mn]
                        gripper_{left,right}_force [fx,fy,fz] mN
-                       gripper_{left,right}_force_matrix int16 行差分
-                       量化变长列表（P4 泵线程预编码，无新样本不写键）
+                       gripper_{left,right}_force_matrix 力矩阵变长
+                       列表（P4 泵线程预编码，无新样本不写键）。元素
+                       类型只能区分「家族」，**倍率要另看 info.json
+                       features.scale**：
+                         int   = int16 行差分量化（250×750 展平，cumsum
+                                 反解，再 ÷scale 还原 mN）。scale=1 是
+                                 向零截断的既有契约；scale=10/100/1000
+                                 为定标档（分辨率 1/scale mN）
+                         float = float32 原值直存（250×750 展平，
+                                 reshape 反解；精度完整，scale 恒 1）
         """
         sensors = sensors or {}
         row = {
@@ -639,24 +717,21 @@ class EgoDataWriter(QObject):
                 float(v) for v in k]
 
         # UMI 夹爪稀疏列（P3/P4）：本 episode 出现过的列才建列。
-        # 键按后缀定类型（_slam_pose=7f32 / _state/_force=3f32 /
+        # 键按后缀定类型（_slam_trajectory=变长 f64 / _state/_force=3f32 /
         # _force_matrix=int16 行差分变长，P4 泵线程预编码后原样落盘）；
-        # 双夹爪 rig2 带 "gripper_2_" 前缀，rig1 旧键（slam_pose /
-        # gripper_state / gripper_left_force…）契约不变。无新样本不写键。
+        # 双夹爪 rig2 带 "gripper_2_" 前缀，rig1 旧键（gripper_state /
+        # gripper_left_force…）契约不变。无新样本不写键。
+        # 不认识的键（含 2026-09-10 起停落的 slam_pose）落到 else 静默忽略。
         for key, value in (gripper or {}).items():
             if value is None:
                 continue
             if key.endswith("_force_matrix"):
                 row[f"observation.{key}"] = value
+                self._note_matrix_dtype(key, value)
             elif key.endswith("slam_trajectory"):
                 # 本帧窗口内全部轨迹点的扁平 8 值列表
                 # [t,x,y,z,qx,qy,qz,qw]×N（float64 原样落盘）
                 row[f"observation.{key}"] = value
-            elif key.endswith("slam_pose"):
-                # 后缀不带下划线：rig1 旧键是裸 "slam_pose"（无前缀），
-                # rig2 为 "gripper_2_slam_pose"
-                row[f"observation.{key}"] = [
-                    float(v) for v in value[:7]]
             elif key.endswith("_state") or key.endswith("_force"):
                 row[f"observation.{key}"] = [
                     float(v) for v in value[:3]]
@@ -830,19 +905,18 @@ class EgoDataWriter(QObject):
             cols[name_v] = pa.array(
                 [r.get(name_v, [0.0] * 16) for r in rows],
                 pa.list_(pa.float32(), 16))
-        # 稀疏 UMI 夹爪列（slam_pose/state/force 定长；matrix 变长 int16）
+        # 稀疏 UMI 夹爪列（state/force 定长；slam_trajectory 与 matrix 变长，
+        # 后者类型按本 episode 实际规格：int16 行差分 / float32 原值）
         for key in sorted(self._present_gripper):
             name = f"observation.{key}"
             if key.endswith("_force_matrix"):
+                item = (pa.float32() if self._matrix_dtype.get(key) == "float32"
+                        else pa.int16())
                 cols[name] = pa.array(
-                    [r.get(name, []) for r in rows], pa.list_(pa.int16()))
+                    [r.get(name, []) for r in rows], pa.list_(item))
             elif key.endswith("slam_trajectory"):
                 cols[name] = pa.array(
                     [r.get(name, []) for r in rows], pa.list_(pa.float64()))
-            elif key.endswith("slam_pose"):
-                cols[name] = pa.array(
-                    [r.get(name, [0.0] * 7) for r in rows],
-                    pa.list_(pa.float32(), 7))
             else:   # _state / _force
                 cols[name] = pa.array(
                     [r.get(name, [0.0] * 3) for r in rows],
@@ -870,6 +944,8 @@ class EgoDataWriter(QObject):
         与 data/videos 同编号（episode-000 = episode 1）：每采一条新任务
         就多一个 episode 文件。重录同 episode_index = 覆盖该文件。旧分片
         （每 chunk 一个多行文件）里的同号行一并删除，避免双份。
+        本行的 force_matrix_specs 是该段力矩阵规格的**唯一权威**来源
+        （info.json 同名信息是任务级的，会被后一段录制覆盖）。
         跨进程安全：fcntl.flock 锁 meta/episodes/.lock（Windows 无
         fcntl 退化为无锁，多机共享须 POSIX）；写入走临时文件 +
         os.replace 原子替换。
@@ -889,6 +965,8 @@ class EgoDataWriter(QObject):
             "video_codec": json.dumps(self._video_codec_meta(),
                                       ensure_ascii=False),
             "calibration": json.dumps(self._calib_dict, ensure_ascii=False),
+            "force_matrix_specs": json.dumps(self._force_matrix_features(),
+                                             ensure_ascii=False),
         }
         with self._task_lock():
             _atomic_write_parquet(_episode_rows_table([row]), path)
@@ -958,21 +1036,18 @@ class EgoDataWriter(QObject):
                 "dtype": "float32", "shape": [16, 4]}
             features[f"observation.{sn}_imu_valid"] = {
                 "dtype": "float32", "shape": [16]}
-        # UMI 夹爪（P3/P4）：定长 f32 列 + 变长 int16 行差分量化的力矩阵
+        # UMI 夹爪（P3/P4）：定长 f32 列 + 变长轨迹/力矩阵（力矩阵规格见
+        # _force_matrix_features —— 同一份描述也进 meta/episodes 行，
+        # 这里不重写一遍以免两处漂移）
+        matrix_features = self._force_matrix_features()
         for key in sorted(self._present_gripper):
             if key.endswith("_force_matrix"):
-                features[f"observation.{key}"] = {
-                    "dtype": "int16",
-                    "shape": [settings.GRIPPER_FORCE_MATRIX_DIM] * 2 + [3],
-                    "encoding": "row_diff_quantized",
-                }
+                features[f"observation.{key}"] = matrix_features[
+                    f"observation.{key}"]
             elif key.endswith("slam_trajectory"):
                 features[f"observation.{key}"] = {
                     "dtype": "float64", "shape": [8],
                     "encoding": "flat_points_8_txyz_qxyzw"}
-            elif key.endswith("slam_pose"):
-                features[f"observation.{key}"] = {
-                    "dtype": "float32", "shape": [7]}
             else:   # _state / _force
                 features[f"observation.{key}"] = {
                     "dtype": "float32", "shape": [3]}

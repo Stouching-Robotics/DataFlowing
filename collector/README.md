@@ -1,6 +1,6 @@
 # collector — Multimodal Data Acquisition SDK · 多模态数据采集 SDK
 
-![Version](https://img.shields.io/badge/version-1.3.0-blue)
+![Version](https://img.shields.io/badge/version-1.3.1-blue)
 ![Python](https://img.shields.io/badge/python-3.12-blue)
 ![License](https://img.shields.io/badge/license-TBD-lightgrey)
 
@@ -361,6 +361,20 @@ are documented in [docs/index.md](docs/index.md#开发约定).
 
 ### Changelog
 
+- **v1.3.1** — force-matrix storage spec is now a five-way choice
+  (int16 / int16×10 / ×100 / ×1000 / float32) switchable from the
+  toolbar, defaulting to ×100 — quantisation error down to 0.9 % of the
+  sensor's own noise floor while staying at 38 % of float32 size; the
+  scale is recorded per episode in the `meta/episodes` row. Tactile
+  heat-map display range is now floor-anchored with slow adaptation
+  (τ≈8 s), so pressing harder actually changes the colour instead of
+  only the contact area. Task-progress reporting retries after a 404 on
+  a 10-minute cooldown, recovering without a restart once the backend
+  implements the endpoint. The `slam_pose` column is no longer written:
+  a fixed 7-value per-frame column cannot be filled by the 20/20/60 ms
+  pose burst, and 26.5 % of rows were landing as `[0]*7`, which
+  downstream reads as real poses — `slam_trajectory` is now the only
+  SLAM pose on disk
 - **v1.3.0** — UMI gripper support (Fays S80M stereo SLAM pose/trajectory
   + Sightac left/right tactile force with 250×250 force matrix + DECXIN
   RGB; gripper group in the device panel, hidden when native resources
@@ -376,7 +390,13 @@ are documented in [docs/index.md](docs/index.md#开发约定).
   committed), Sightac SDK shipped pyarmor-encrypted,
   `tools/import_gripper_calibration.py` imports per-serial calibration
   for a new gripper. Multiple S80M cameras distinguished by serial /
-  USB topology path
+  USB topology path. Force-matrix scale (int16×10/×100/×1000 / float32)
+  is now recorded **per episode** in the `meta/episodes` row
+  (`force_matrix_specs`); previously it lived only in the task-level
+  `meta/info.json`, where the next recording overwrote it and made
+  replay/training read ×10/×100/×1000 values at face value.
+  `scripts/repair_force_matrix_scale.py` back-fills the scale of
+  already-recorded episodes (meta rows only, data bytes untouched)
 - **v1.2.1** — large-file upload no longer killed by the 10 s timeout
   (the send-body phase used the connect timeout; now uses a read-timeout
   window); closing the upload dialog lets the task finish in the
@@ -539,7 +559,7 @@ data/recordings/<任务>/
     ├── info.json                                # 任务级头部；format="pooled_episodes_v1" 为判别键
     ├── stats.json                               # 全任务统计累加器（每列 count/mean/std/min/max）
     ├── tasks.jsonl                              # 任务描述（单行 JSONL 是格式契约）
-    └── episodes/chunk-NNN/episode-NNN.parquet   # 每段一行元数据（10 列）
+    └── episodes/chunk-NNN/episode-NNN.parquet   # 每段一行元数据（11 列）
 ```
 
 - **编号规则**：episode 全局从 N=1 递增，`chunk = (N-1) // 1000`、
@@ -720,6 +740,16 @@ i18n 文案经 `tr()` 翻译、PyQt5 信号参数用 `object` 封送大整数、
 
 ### 更新记录
 
+- **v1.3.1** — 力矩阵落盘规格改为 5 档可选（int16 / int16×10 / ×100 /
+  ×1000 / float32），工具栏「🎚 力矩阵精度」可切、默认 ×100——量化误差降到
+  传感器自身噪声的 0.9%，体积仍是 float32 的 38%；倍率记在每段一份的
+  `meta/episodes` 行。触觉热力图显示量程改「下限固定 + 慢速自适应」
+  （τ≈8s）：此前固定量程下量化把梯度压平，用力大小只剩接触面积在变、
+  颜色几乎不动。任务进度上报 404 后带 10 分钟冷却期重探，服务端补上端点后
+  无需重启自动恢复。不再落 `slam_pose` 列——定长 7 值列填不满 20/20/60ms
+  的位姿突发，实测 26.5% 的行被填成 `[0]*7` 且会被下游当真实位姿读；
+  `slam_trajectory` 成为位姿唯一落盘形态，新增
+  `tools/tests/test_gripper_slam_columns.py` 守住该契约
 - **v1.3.0** — 新增 UMI 夹爪全链接入（Fays S80M 双目 SLAM 位姿/轨迹 +
   Sightac 左右触觉力与 250×250 力矩阵 + DECXIN RGB；设备面板夹爪分组，
   原生资源缺失时自动隐藏），支持双臂双夹爪同录（rig1 旧槽位/数据列契约
@@ -730,7 +760,11 @@ i18n 文案经 `tr()` 翻译、PyQt5 信号参数用 `object` 封送大整数、
   不再落 txt 侧车。夹爪脱离 `online/` 自持：原生资源镜像到
   `core/gripper/native/`（不入库），Sightac SDK pyarmor 加密随包，
   新增 `tools/import_gripper_calibration.py` 搬入新夹爪 per-serial 标定。
-  多台 S80M 按序列号 / USB 拓扑路径区分
+  多台 S80M 按序列号 / USB 拓扑路径区分。力矩阵倍率（int16×10/×100/×1000 /
+  float32）改记在**每段一份**的 `meta/episodes` 行（`force_matrix_specs`）——
+  此前只写在任务级 `meta/info.json`，会被同任务后一段录制覆盖，回放与训练
+  按面值读放大 10/100/1000 倍的数；`scripts/repair_force_matrix_scale.py`
+  可按实测比值给已录段补写倍率（只补 meta 行，不碰 data 字节）
 - **v1.2.1** — 修复大文件上传被 10 秒误杀（发送阶段 socket 超时错用连接
   超时，现改用读超时窗口）；上传对话框关闭后任务在后台继续完成（手动上传
   并入主窗口共享队列，重复提交自动跳过）

@@ -285,6 +285,22 @@ def save_upload_delete_after(on: bool):
     """持久化"上传成功后自动删除本地文件"开关。"""
     _save_server_config({"upload_delete_after": bool(on)})
 
+def load_gripper_force_matrix_spec() -> str:
+    """读取力矩阵落盘规格（server_config.json，默认 "int16x100"）。
+
+    取值见 GRIPPER_FORCE_MATRIX_SPECS；非法值/缺失一律回默认档。
+    """
+    raw = _load_server_config().get("gripper_force_matrix_spec")
+    if isinstance(raw, str) and raw in GRIPPER_FORCE_MATRIX_SPECS:
+        return raw
+    return GRIPPER_FORCE_MATRIX_SPEC_DEFAULT
+
+def save_gripper_force_matrix_spec(spec: str):
+    """持久化力矩阵落盘规格（非法值直接拒绝，不写坏配置）。"""
+    if spec not in GRIPPER_FORCE_MATRIX_SPECS:
+        raise ValueError(f"未知力矩阵规格 {spec!r}，可选 {GRIPPER_FORCE_MATRIX_SPECS}")
+    _save_server_config({"gripper_force_matrix_spec": str(spec)})
+
 def load_upload_project_id() -> str:
     """读取上传目标项目 ID（server_config.json）。
 
@@ -493,5 +509,41 @@ GRIPPER_SLOT_FORCE_L = "gripper_force_left"     # Sightac 左（热力图+力曲
 GRIPPER_SLOT_FORCE_R = "gripper_force_right"    # Sightac 右（热力图+力曲线）
 GRIPPER_STEREO_DISPLAY_FPS = 15.0               # 左目显示节流（SLAM 取帧在桥接进程内保持 30fps）
 GRIPPER_SLAM_READY_TIMEOUT_S = 45.0             # wait_sdk_ready 上限（SDK 运行时重读标定）
-GRIPPER_FORCE_MATRIX_DIM = 250                  # 触觉力矩阵边长（250×250×3 int16 行差分）
+GRIPPER_FORCE_MATRIX_DIM = 250                  # 触觉力矩阵边长（250×250×3）
+# 力矩阵落盘规格（工具栏可切换，持久化到 server_config.json）。
+# 与实时显示无关：显示一直走 float32 原值，本档位只决定落盘规格。
+# 录制开始时锁定，避免同一列出现两种类型（parquet 一列只有一种类型）。
+#
+# 命名：int16xN = 先乘 N 再取整存 int16，解码后除以 N 还原，分辨率 1/N mN。
+# 落盘类型只有 int16 / float32 两种，倍率记在 info.json features.scale，
+# 所以读取端（writer 定型、demo 反解）必须看 scale，不能只看列类型。
+#
+# 实测代价（episode-016 左列 611 帧，单列 ZSTD；右列同量级、倍数更高）：
+#   int16      0.77MB  0.007 B/点  1 mN     —— 既有契约，向零截断
+#   int16x10   13.95MB 0.122 B/点  0.1 mN   —— 量程 ±3276.7 mN，重压场景用这个
+#   int16x100  34.78MB 0.304 B/点  0.01 mN  —— 默认档
+#   int16x1000 53.84MB 0.470 B/点  0.001 mN —— 再往上不如直接 float32
+#   float32    91.26MB 0.797 B/点  原值
+# 注：int16x1000 与 int32x1000 体积逐字节相同（差分后 delta 很小，int32
+# 多出的 2 个零字节被 ZSTD 免费吃掉），但 int32 无精度收益，故不提供。
+# 默认档为什么是 x100（2026-09-10 实测定档，样本=016/021 两段 float32 原值）：
+# 逐点误差约为传感器自身时间噪声（0.28 mN）的 0.9%，已在显示端（一级灰
+# 0.0058 mN）之下；再降档没有物理收益，而体积是 float32 的 38%。代价是
+# 量程只有 ±327.67 mN（SDK 力曲线量程 ±3000 mN），真按到几百 mN 会削平。
+GRIPPER_FORCE_MATRIX_SPECS = ("int16", "int16x10", "int16x100",
+                              "int16x1000", "float32")
+GRIPPER_FORCE_MATRIX_SPEC_DEFAULT = "int16x100"
+# 倍率表；float32 不在表内（无定标，编码器按此判定走原值分支）
+GRIPPER_FORCE_MATRIX_SCALES = {"int16": 1, "int16x10": 10,
+                               "int16x100": 100, "int16x1000": 1000}
+GRIPPER_FORCE_MATRIX_SPEC = load_gripper_force_matrix_spec()
 GRIPPER_TACTILE_MATRIX_MATERIALIZE = False      # 矩阵逐帧拷回主进程开关（默认子进程直写）
+# 触觉热力图显示量程（只影响显示，落盘力矩阵不受影响）
+#   True  = 下限固定 + 慢速自适应：满量程取 REF 下限，非零像素 p99 明显更高时
+#           才慢速抬高（换 SDK/硬件量级变化不会整片糊红）
+#   False = 用 0902 固定量程（bevel ×50 / curved ×200），与 online 上位机一致
+GRIPPER_TACTILE_HEATMAP_AUTO = True
+# 满量程参考值（矩阵单位，越小越灵敏）。bevel 3.0 → ×85：实测非零像素多为
+# 1~3，正好铺满 JET 的青→橙→红；嫌不灵敏就调小，嫌噪点太亮就调大。
+GRIPPER_TACTILE_HEATMAP_REF = {"bevel": 3.0, "curved": 12.0}
+GRIPPER_TACTILE_HEATMAP_REF_MAX = {"bevel": 20.0, "curved": 80.0}    # 自适应上限

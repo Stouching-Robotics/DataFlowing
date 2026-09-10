@@ -701,7 +701,7 @@ class GripperBridge(QObject):
         """录制开始清空 GUI 轨迹滚动窗口（只显示本段录制的点）。
 
         parquet 的 slam_trajectory 列由 writer 在录制期独立累积
-        （见 pipeline.write_slam_pose），不受此窗口影响；这里只管
+        （见 pipeline.write_slam_trajectory），不受此窗口影响；这里只管
         显示侧。UI 侧配合 pose_view.reset() 同步清空渲染缓存。
         """
         self._trajectory_points = []

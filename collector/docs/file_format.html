@@ -337,12 +337,12 @@ fnum  = (N - 1) % 1000      <span class="c"># 三位零起：episode-000 .. epis
       <div class="sec-head"><span class="sec-no">§6</span><h2>meta/episodes/（每段一个文件）</h2></div>
       <h3>6.1 文件与原子性</h3>
       <ul>
-        <li>每 episode 一个文件 <code>chunk-{c:03d}/episode-{f:03d}.parquet</code>（与 data/videos 同编号：episode-000 = episode 1），<strong>恒 1 行</strong>（10 列，见 §6.2）。</li>
+        <li>每 episode 一个文件 <code>chunk-{c:03d}/episode-{f:03d}.parquet</code>（与 data/videos 同编号：episode-000 = episode 1），<strong>恒 1 行</strong>（11 列，见 §6.2）。</li>
         <li>episode 结束时单行原子写：临时文件 + <code>os.replace</code> 原子替换；同号重录 = 覆盖该文件。读取方<span class="tag must">MUST</span>容忍文件在任意时刻被原子替换（每次打开重新读取，勿缓存 fd）。</li>
         <li>新布局写入<span class="tag must">MUST NOT</span>依赖 flock（单文件原子替换即完整）；flock 锚点 <code>.lock</code> 仅剩旧分片回退的读-改-写路径使用（见 §7.4）。</li>
         <li><b>旧分片回退（读侧<span class="tag must">MUST</span>容忍）</b>：v1.1.0 早期目录可能存在「每 chunk 一个分片」（文件名 = chunk 编号，≤1000 行，行序按 <code>episode_index</code> 升序）。读侧定位行必须按 <code>episode_index</code> 列过滤、<strong>不靠文件名</strong>（v1.1.2 起分片保留 file- 前缀、每段文件改 episode- 前缀，路径不再重名）。迁移工具 <code>--split-episodes</code> 可原地拆分（幂等）。</li>
       </ul>
-      <h3>6.2 列（10 列）</h3>
+      <h3>6.2 列（11 列）</h3>
       <div class="tblwrap"><table>
         <tr><th>列</th><th>类型</th><th>说明</th></tr>
         <tr><td><code>episode_index</code></td><td>int64</td><td>全局序号 N（1 起）</td></tr>
@@ -355,7 +355,9 @@ fnum  = (N - 1) % 1000      <span class="c"># 三位零起：episode-000 .. epis
         <tr><td><code>drop_stats</code></td><td>str</td><td>JSON 字符串（如 <code>{"imu_overflow": 0}</code>），读取方须 <code>json.loads</code></td></tr>
         <tr><td><code>video_codec</code></td><td>str</td><td>JSON 字符串：本机原始编码信息（encoder/codec/crf/ffmpeg 路径/probe）；上传 zip 中的 mp4 可能已被再编码，见 §8</td></tr>
         <tr><td><code>calibration</code></td><td>str</td><td>JSON 字符串：本 episode 标定（结构与 info.json 的 calibration 同型），保每 episode 标定保真</td></tr>
+        <tr><td><code>force_matrix_specs</code></td><td>str</td><td>JSON 字符串：本段力矩阵列规格（列名 → 描述），<strong>倍率的权威来源</strong>，见 §7.2.1。v1.3.x 新增；旧 episode 无此列（读侧<span class="tag must">MUST</span>容忍缺失，退回 info.json）</td></tr>
       </table></div>
+      <p><b>追加旧任务（写侧<span class="tag must">MUST</span>）</b>：向 v1.3.x 之前的任务继续录 episode 时，重写整表须对缺列补默认值（<code>force_matrix_specs</code> → <code>"{}"</code>，现由 <code>_episode_rows_table</code> 按 schema 填），否则新行与旧行拼不成一张表。读侧同理<span class="tag must">MUST</span>容忍该列缺失。</p>
     </section>
 
     <section id="s7">
@@ -382,6 +384,19 @@ fnum  = (N - 1) % 1000      <span class="c"># 三位零起：episode-000 .. epis
         <tr><td><code>action</code></td><td>list&lt;float32, 1&gt;</td><td>恒写（现为 0）</td></tr>
         <tr><td><code>status.&lt;did&gt;</code></td><td>str</td><td>稀疏设备状态列（<code>"connected"</code>/<code>"disconnected"</code> 等）</td></tr>
       </table></div>
+      <h4>7.2.1 力矩阵列（UMI 夹爪）</h4>
+      <p><code>observation.[gripper_N_]gripper_{left,right}_force_matrix</code> —— 稀疏 <code>list</code> 列，每个样本是一整帧 <code>(250,250,3)</code>（fx/fy/fz，单位 mN）的扁平编码，长度恒 <code>250 × 750 = 187500</code>，行差分按 <code>(250, 750)</code> 分块还原：</p>
+      <div class="tblwrap"><table>
+        <tr><th>编码</th><th>列类型</th><th>解码</th></tr>
+        <tr><td><code>row_flat_raw</code></td><td>list&lt;float32&gt;</td><td>原值直存（无差分无量化），<code>reshape(250,250,3)</code>；<b>不要 cumsum</b></td></tr>
+        <tr><td><code>row_diff_quantized</code></td><td>list&lt;int16&gt;</td><td>先 <code>cumsum</code> 还原差分（int16 回绕，累加器用 int32），再 <code>reshape</code>，最后 ÷<code>scale</code></td></tr>
+      </table></div>
+      <p><b><code>scale</code> 是读取端的必需信息，不能从数据推断</b>：×10/×100/×1000 三档的列类型都是 <code>list&lt;int16&gt;</code>、元素也都是 int，只有 <code>scale</code> 能决定 ÷10 还是 ÷1000。漏读 = 数值整体放大 N 倍（图形形状仍对，故为静默错）。<code>row_flat_raw</code> 恒 1。</p>
+      <ul>
+        <li><b>权威顺序（读侧<span class="tag must">MUST</span>）</b>：① 同号 <code>meta/episodes/chunk-NNN/episode-NNN.parquet</code> 的 <code>force_matrix_specs</code>（每段一份，权威）；② <code>&lt;task&gt;/meta/info.json</code> 的 <code>features[列].scale</code>（任务级回退）；③ 都没有 → 1（未定标）。</li>
+        <li><b>为什么必须有 ①</b>：<code>info.json</code> 是任务级且「值以最新 episode 为准」，同任务里换过力矩阵档位，早先几段的 <code>scale</code> 会被后一段覆盖（实测 ×10/×100/×1000 三段连录后再录一段 float32，三段全被顶成 1）。① 每段写一次、只增不改，不受后续录制影响。</li>
+        <li><b>自检判据</b>：同一帧 Σ(fz 平面) ≈ 同帧 <code>observation.*_gripper_*_force</code> 的 fz 分量（float32 档实测比值 1.000）。历史未定标 int16 档因逐点向零截断，该比值明显小于 1（实测 0.04~0.55）——这是截断造成的，不是倍率。<code>scripts/repair_force_matrix_scale.py</code> 用该判据给旧 episode 补写 ①（只补 meta 行，不碰 data 字节）。</li>
+      </ul>
       <h3>7.3 时间对齐模型</h3>
       <p><strong>表为帧行为主</strong>：一行 = 一个 30fps 帧；视频帧/传感器读数/帧行共用同一 <code>frame_index</code>（写入线程同拍产出）。IMU 为变长 list 列挂在帧行上，录制时按 <code>hardware_ns</code> 设备时钟窗口挂靠。读取零重采样；宿主时间锚定靠 <code>timestamp</code> + <code>wall_time</code>。客户 9 列平表由导出工具展开插值合成，非本契约内容。</p>
       <h3>7.4 meta/episodes/.lock（运行时辅助文件，非数据）</h3>

@@ -140,7 +140,7 @@ fnum  = (N - 1) % 1000      # 三位零起：episode-000 .. episode-999
 ### 6.1 文件与原子性
 
 - **每 episode 一个文件** `chunk-{c:03d}/episode-{f:03d}.parquet`（与 data/videos
-  同编号：episode-000 = episode 1），**恒 1 行**（10 列，见 §6.2）。
+  同编号：episode-000 = episode 1），**恒 1 行**（11 列，见 §6.2）。
 - episode 结束时**单行原子写**：临时文件 + `os.replace` 原子替换；同号重录 =
   覆盖该文件。读取方 MUST 容忍文件在任意时刻被原子替换（每次打开重新
   读取，勿缓存 fd）。
@@ -154,7 +154,7 @@ fnum  = (N - 1) % 1000      # 三位零起：episode-000 .. episode-999
   `scripts/migrate_pooled_storage.py --split-episodes` 可把旧分片原地拆成
   每段文件（幂等）。
 
-### 6.2 列（10 列，MUST）
+### 6.2 列（11 列，MUST）
 
 | 列 | 类型 | 说明 |
 |---|---|---|
@@ -168,6 +168,11 @@ fnum  = (N - 1) % 1000      # 三位零起：episode-000 .. episode-999
 | `drop_stats` | str | **JSON 字符串**（如 `{"imu_overflow": 0}`），读取方须 `json.loads` |
 | `video_codec` | str | **JSON 字符串**：本机原始编码信息（encoder/codec/crf/ffmpeg 路径/probe）；上传 zip 中的 mp4 可能已被再编码，见 §8 |
 | `calibration` | str | **JSON 字符串**：本 episode 标定（结构与 info.json 的 calibration 同型），保每 episode 标定保真 |
+| `force_matrix_specs` | str | **JSON 字符串**：本段力矩阵列规格（列名 → 描述），**倍率的权威来源**，见 §7.2.1。v1.3.x 新增；旧 episode 无此列（读侧按缺列容忍，退回 info.json） |
+
+**追加旧任务（写侧 MUST）**：向 v1.3.x 之前的任务继续录 episode 时，重写整表
+须对缺列补默认值（`force_matrix_specs` → `"{}"`，现由 `_episode_rows_table`
+按 schema 填），否则新行与旧行拼不成一张表。读侧同理 **MUST 容忍该列缺失**。
 
 ## 7. data/（每 episode 一个 parquet）
 
@@ -195,6 +200,39 @@ fnum  = (N - 1) % 1000      # 三位零起：episode-000 .. episode-999
 | `observation.right_hand_pose` | list<float32, 63> | 同上 |
 | `action` | list<float32, 1> | 恒写（现为 0） |
 | `status.<did>` | str | 稀疏设备状态列（`"connected"`/`"disconnected"` 等） |
+
+#### 7.2.1 力矩阵列（UMI 夹爪）
+
+`observation.[gripper_N_]gripper_{left,right}_force_matrix` —— 稀疏 `list` 列，
+每个样本是一整帧 `(250,250,3)`（fx/fy/fz，单位 mN）的扁平编码，长度恒
+`250 × 750 = 187500` 行差分按 `(250, 750)` 分块还原：
+
+| 编码 | 列类型 | 解码 |
+|---|---|---|
+| `row_flat_raw` | `list<float32>` | 原值直存（无差分无量化），`reshape(250,250,3)`；**不要 cumsum** |
+| `row_diff_quantized` | `list<int16>` | 先 `cumsum` 还原差分（int16 回绕，累加器用 int32），再 `reshape`，最后 ÷`scale` |
+
+**`scale` 是读取端的必需信息，不能从数据推断**：×10/×100/×1000 三档的列类型
+都是 `list<int16>`、元素也都是 int，只有 `scale` 能决定 ÷10 还是 ÷1000。
+漏读 = 数值整体放大 N 倍（图形形状仍对，故为静默错）。`row_flat_raw` 恒 1。
+
+**权威顺序（读侧 MUST）**：
+
+1. 同号 `meta/episodes/chunk-NNN/episode-NNN.parquet` 的 `force_matrix_specs`
+   —— **每段一份，权威**；
+2. `<task>/meta/info.json` 的 `features[列].scale` —— 任务级**回退**；
+3. 都没有 → 1（未定标）。
+
+**为什么必须有 (1)**：`info.json` 是任务级且「值以最新 episode 为准」，
+同任务里换过力矩阵档位，早先几段的 `scale` 会被后一段覆盖（实测 ×10/×100/
+×1000 三段连录后再录一段 float32，三段全被顶成 1）。(1) 每段写一次、只增不改，
+不受后续录制影响。
+
+**自检判据**：同一帧 `Σ(fz 平面)` ≈ 同帧 `observation.*_gripper_*_force` 的
+fz 分量（float32 档实测比值 1.000）。历史未定标 int16 档因逐点向零截断，
+该比值明显小于 1（实测 0.04~0.55）——这是截断造成的，不是倍率。
+`scripts/repair_force_matrix_scale.py` 用该判据给旧 episode 补写 (1)（只补
+meta 行，不碰 data 字节）。
 
 ### 7.3 时间对齐模型（MUST 理解）
 

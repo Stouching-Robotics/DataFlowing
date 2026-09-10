@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 import threading
+import time
 
 import requests
 from PyQt5.QtCore import QObject, pyqtSignal, QTimer
@@ -19,6 +20,10 @@ from config import settings
 from core import task_record
 
 CONNECT_TIMEOUT = 10  # HTTP 请求超时（秒）
+
+# 进度端点 404 后的冷却期：不是永久拉黑，过这段时间再探一次。
+# 服务端补上端点后，采集端**不必重启**就能自动恢复上报。
+PROGRESS_RETRY_INTERVAL_S = 600
 
 
 def _normalize_tasks(raw: list[dict]) -> list[dict]:
@@ -96,6 +101,7 @@ class TaskService(QObject):
 
         # 进度增量上报（多电脑协同聚合）
         self._progress_supported = True     # 后端 404 → False 静默降级本地口径
+        self._progress_retry_at = 0.0       # 降级期间下一次试探的时刻（monotonic）
         self._flush_fail: dict[str, int] = {}  # task_id → 连续失败次数（防日志刷屏）
         self._flush_lock = threading.Lock()    # 防 flush_now 与轮询 tick 并发重复 POST
         self._poll_fail = 0                 # 轮询连续失败次数（防日志刷屏）
@@ -187,6 +193,7 @@ class TaskService(QObject):
         self._session.cookies.clear()
         self._logged_in = False
         self._progress_supported = True  # 新后端可能已实现进度端点
+        self._progress_retry_at = 0.0
         self._trigger_login_and_poll()
 
     def set_credentials(self, username: str, password: str):
@@ -260,10 +267,14 @@ class TaskService(QObject):
         """水位合并上报：每任务一次 POST increment = local - synced。
 
         幂等键含设备名与水位（重试不重复计数）；崩溃安全由 tasks.json 落盘
-        保证；401/403 跳过本轮不标记死（重新登录后自然恢复）。
+        保证；401/403 跳过本轮不标记死（重新登录后自然恢复）；404 降级但带
+        冷却期重探（PROGRESS_RETRY_INTERVAL_S），后端补上端点后自动恢复。
         """
         if not self._progress_supported:
-            return
+            # 曾经 404：后端没这个端点。不永久拉黑 —— 冷却期过后再探一次，
+            # 服务端补上端点后采集端无需重启即可自动恢复上报。
+            if time.monotonic() < self._progress_retry_at:
+                return
         if not self._flush_lock.acquire(blocking=False):
             return  # 已有一次 flush 在途（tick 或 flush_now），让给先到者
         try:
@@ -276,11 +287,17 @@ class TaskService(QObject):
                 new_backend, err = self._post_progress(tid, session_id, inc, device)
                 if err == "404":
                     self._progress_supported = False  # 后端未升级 → 静默降级本地口径
+                    self._progress_retry_at = (
+                        time.monotonic() + PROGRESS_RETRY_INTERVAL_S)
                     return
                 if new_backend is None:
                     self._note_fail(tid)  # auth/net/http：跳过本轮，下个 tick 重试
                     continue
                 self._flush_fail.pop(tid, None)
+                if not self._progress_supported:
+                    # 冷却期里的那次试探成功了 → 后端已实现该端点，结束降级
+                    self._progress_supported = True
+                    self._progress_retry_at = 0.0
                 task_record.mark_synced(tid, p["synced_count"] + inc, new_backend)
                 changed = True
             if changed:

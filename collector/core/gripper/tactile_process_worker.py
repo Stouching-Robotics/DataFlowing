@@ -229,8 +229,89 @@ def clear_frame_queue(frame_queue, free_slots=None):
             return
 
 
+# ── 热力图显示量程 ──────────────────────────────────────────────────
+# 0902 的固定量程（bevel ×50 / curved ×200）是按已标定 mN 矩阵定的，而实测
+# 逐点值比它小一到两个数量级（录制实证：非零像素多为 1~3、峰值 7），固定
+# 量程下整幅图停在深蓝区，用力大小只剩接触面积在变、颜色几乎不动。改为
+# 「下限固定 + 慢速自适应」：满量程参考值默认取 FLOOR（bevel 3.0 → ×85，
+# 正好把 1~3 铺成青→橙→红），只有非零像素 p99 明显更高时才慢速抬高参考值
+# （τ≈8s）——换 SDK/换硬件后量级变大也不会整片糊成红。无接触时回落到下限。
+HEATMAP_REF_FLOOR = {"bevel": 3.0, "curved": 12.0}
+HEATMAP_REF_CEILING = {"bevel": 20.0, "curved": 80.0}
+HEATMAP_REF_ALPHA = 0.004           # 参考值跟随速度（30fps 下 τ≈8s）
+HEATMAP_REF_MIN_PIXELS = 64         # 非零像素少于该值按无接触处理（噪声）
+_HEATMAP_AUTO_CACHE = {}
+
+
+def _heatmap_tuning():
+    """显示量程标定表（config.settings 可覆盖，缺失时用模块内默认）。"""
+    try:
+        from config import settings
+        floor = getattr(settings, "GRIPPER_TACTILE_HEATMAP_REF", None)
+        ceiling = getattr(settings, "GRIPPER_TACTILE_HEATMAP_REF_MAX", None)
+        if isinstance(floor, dict) and isinstance(ceiling, dict):
+            return floor, ceiling
+    except Exception:
+        pass
+    return HEATMAP_REF_FLOOR, HEATMAP_REF_CEILING
+
+
+def heatmap_auto_enabled():
+    """显示量程是否自适应（config.settings.GRIPPER_TACTILE_HEATMAP_AUTO）。"""
+    if "value" not in _HEATMAP_AUTO_CACHE:
+        try:
+            from config import settings
+            value = bool(getattr(
+                settings, "GRIPPER_TACTILE_HEATMAP_AUTO", True))
+        except Exception:
+            value = True
+        _HEATMAP_AUTO_CACHE["value"] = value
+    return _HEATMAP_AUTO_CACHE["value"]
+
+
+class HeatmapScaleTracker:
+    """每侧热力图的显示量程（子进程内每个传感器一个，逐帧更新）。"""
+
+    def __init__(self, device_type="bevel", floor=None, ceiling=None):
+        self.device_type = str(device_type)
+        floor_table, ceiling_table = _heatmap_tuning()
+        self.floor = float(floor if floor is not None
+                           else floor_table.get(self.device_type, 3.0))
+        self.ceiling = float(ceiling if ceiling is not None
+                             else ceiling_table.get(self.device_type, 20.0))
+        self.ref = self.floor
+
+    def scale(self, pressure_matrix):
+        """返回本帧显示增益（255/满量程参考值）。"""
+        plane = np.asarray(pressure_matrix, dtype=np.float32)
+        nonzero = plane[plane > 0]
+        target = self.floor
+        if nonzero.size >= HEATMAP_REF_MIN_PIXELS:
+            target = min(max(float(np.percentile(nonzero, 99)),
+                             self.floor), self.ceiling)
+        self.ref += HEATMAP_REF_ALPHA * (target - self.ref)
+        return 255.0 / max(self.ref, 1e-6)
+
+
+def heatmap_scale_for(sensor, pressure_matrix):
+    """本帧显示增益：自适应开启时按传感器跟踪，关闭时回固定量程（None）。"""
+    if not heatmap_auto_enabled():
+        return None
+    tracker = getattr(sensor, "_ksq_heatmap_scale", None)
+    if tracker is None:
+        tracker = HeatmapScaleTracker(
+            getattr(sensor, "device_type", "bevel"))
+        # _ksq_ 前缀：snapshot_sensor_state 不跨进程搬运该状态
+        sensor._ksq_heatmap_scale = tracker
+    return tracker.scale(pressure_matrix)
+
+
 def pressure_to_heatmap(pressure_matrix, device_type="bevel", scale=None):
-    """0902 定标 JET 显示；不再按每传感器/每帧各自归一化。"""
+    """压力平面 → 320×240 RGB 热力图（JET）。
+
+    scale=None 用固定量程（curved 200 / bevel 50）；实时链路传入
+    heatmap_scale_for() 给出的自适应增益（见上方量程说明）。
+    """
     if pressure_matrix is None:
         return None
     if scale is None:
@@ -308,7 +389,8 @@ def process_tactile_frame(sensor, raw_frame, captured_at):
         ).astype(np.float32, copy=False)
     heatmap_started = time.perf_counter()
     heatmap = pressure_to_heatmap(
-        fz_matrix, getattr(sensor, "device_type", "bevel"))
+        fz_matrix, getattr(sensor, "device_type", "bevel"),
+        scale=heatmap_scale_for(sensor, fz_matrix))
     heatmap_ms = (time.perf_counter() - heatmap_started) * 1000.0
     if heatmap is None:
         return {"kind": "skip"}

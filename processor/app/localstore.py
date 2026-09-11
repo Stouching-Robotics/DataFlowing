@@ -34,6 +34,9 @@ _sessions_cache_at = 0.0
 # fast fallback; the ingest queue refreshes it after the batch is committed.
 _task_sessions_cache: list[dict] | None = None
 _SESSIONS_CACHE_TTL = 300.0
+# get_episode 未命中后允许强制重扫的最小间隔:既让刚上传的批次立刻可见,
+# 又不至于被反复查询的无效 id 触发远程全量遍历风暴。
+_MISS_RESCAN_MIN_INTERVAL = 5.0
 # 全量遍历远程挂载很慢:只允许单一线程执行(_scan_lock),遍历本身不持有
 # _lock —— 缓存过期触发的重扫不再把状态读写请求拖在锁后面排队。
 _scan_lock = threading.Lock()
@@ -202,13 +205,18 @@ def _run_session_refresh() -> None:
             _sessions_refresh_running = False
 
 
-def _scan_sessions_blocking() -> list[dict]:
-    """Full remote tree walk; callers block for the duration."""
+def _scan_sessions_blocking(force: bool = False) -> list[dict]:
+    """Full remote tree walk; callers block for the duration.
+
+    ``force=True`` 跳过 TTL 判断,即使快照还新鲜也重新遍历 —— 供
+    :func:`get_episode` 在未命中时使用:快照里没有不代表磁盘上没有,
+    可能只是本进程还没看到刚上传的批次。
+    """
     global _sessions_cache, _sessions_cache_at, _task_sessions_cache
     while True:
         with _lock:
             now = time.monotonic()
-            if (_sessions_cache is not None
+            if (not force and _sessions_cache is not None
                     and now - _sessions_cache_at < _SESSIONS_CACHE_TTL):
                 return copy.deepcopy(_sessions_cache)
             generation = _scan_generation
@@ -216,7 +224,9 @@ def _scan_sessions_blocking() -> list[dict]:
         with _scan_lock:
             with _lock:
                 now = time.monotonic()
-                if (_sessions_cache is not None
+                # force 时不吃这个捷径:那份快照可能正是我们刚刚未命中的
+                # 那一份。既然调用方明确要求重扫,就实实在在走一遍。
+                if (not force and _sessions_cache is not None
                         and now - _sessions_cache_at < _SESSIONS_CACHE_TTL):
                     # 等待 _scan_lock 期间已有线程完成扫描
                     return copy.deepcopy(_sessions_cache)
@@ -619,10 +629,30 @@ def _probe_video_cached(path: Path) -> tuple[int, float]:
 
 
 def get_episode(episode_id: str) -> dict | None:
-    """按批次名查 episode(扫描目录)。"""
+    """按批次名查 episode(扫描目录)。
+
+    未命中时会强制同步重扫一次再判断 —— **快照里没有不等于磁盘上没有**:
+    上传只清发起上传那个进程的缓存,别的进程(worker / 另一个 API 实例)
+    要等自己的 TTL 过期才看得见新批次。而未命中恰恰是不能相信缓存的时刻:
+    导出链路里 ``get_episode`` 返回 None 会让整条 run 直接失败(实测 ep74-79
+    在 17:25-17:31 全部因此 failed,派生产物没能合并回 canonical)。
+
+    重扫有最小间隔,避免反复查询不存在的 id 时把远程全量遍历打成风暴;
+    真正的"不存在"在重扫后依然返回 None,只是多付一次遍历。
+    """
     name = str(episode_id)
-    return next((episode for episode in scan_sessions()
-                 if str(episode.get("id")) == name), None)
+    episode = next((item for item in scan_sessions()
+                    if str(item.get("id")) == name), None)
+    if episode is not None:
+        return episode
+    with _lock:
+        just_scanned = (time.monotonic() - _sessions_cache_at
+                        < _MISS_RESCAN_MIN_INTERVAL)
+    if just_scanned:
+        # 刚刚才遍历过,这次未命中是可信的
+        return None
+    return next((item for item in _scan_sessions_blocking(force=True)
+                 if str(item.get("id")) == name), None)
 
 
 # ── 审核状态 ─────────────────────────────────────────

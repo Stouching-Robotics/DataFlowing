@@ -1,7 +1,8 @@
 """Device heartbeat & polling API — 本地 JSON 存储(无数据库)。
 
 设备存 data/state/devices.json;采集端轮询 /device/tasks 获取
-active 项目列表(任务概念已移除,项目即采集任务)。
+active 项目列表(任务概念已移除,项目即采集任务);采集端「录制完成」的
+增量上报存 data/state/device_task_progress.json(见 app/device_progress.py)。
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ from app.localstore import (
     list_projects,
     scan_sessions,
 )
+from app import device_progress
+from app.device_progress import reported_totals
 from app.security import verify_api_key
 from app.device_naming import decorate_device_sources, display_names_for_sources
 
@@ -237,18 +240,31 @@ async def device_tasks(
     device_name: str = Query(..., min_length=1),
     _: str = Depends(verify_api_key),
 ):
-    """采集端轮询此接口获取 active 项目(DAQ client 格式)。"""
+    """采集端轮询此接口获取 active 项目(DAQ client 格式)。
+
+    current_count 口径:各设备上报的录制完成数之和(见 app/device_progress.py);
+    只有从未收到过上报的项目才回退到「项目目录下的 session 数」,让升级前就
+    存在的历史项目不归零。session 是**上传**的产物,早先直接拿它当进度会让
+    同一条数据被算两次(录制一次、上传一次)。
+    """
     project_rows = await asyncio.to_thread(list_projects)
     projects = [p for p in project_rows if p.get("status", "active") == "active"]
-    # Prefer the last complete snapshot.  A cache miss only happens during a
-    # cold start, and even that first remote scan is kept off the event loop.
-    episodes = cached_sessions_for_tasks()
-    if episodes is None:
-        episodes = await asyncio.to_thread(scan_sessions)
+    reported = await asyncio.to_thread(reported_totals)
+    # 只有需要 session 兜底时才扫目录(用了上报口径的项目不再触发远程遍历)
+    needs_sessions = device_progress.needs_session_fallback(projects, reported)
+    episodes: list = []
+    if needs_sessions:
+        # Prefer the last complete snapshot.  A cache miss only happens during a
+        # cold start, and even that first remote scan is kept off the event loop.
+        episodes = cached_sessions_for_tasks()
+        if episodes is None:
+            episodes = await asyncio.to_thread(scan_sessions)
 
     tasks = []
     for p in projects:
-        cur = sum(1 for e in episodes if e.get("project") == p.get("name"))
+        sessions = (sum(1 for e in episodes if e.get("project") == p.get("name"))
+                    if needs_sessions else None)
+        cur, source = device_progress.resolve_count(p, reported, sessions or 0)
         params = p.get("params") or {}
         if not isinstance(params, dict):
             params = {}
@@ -261,6 +277,37 @@ async def device_tasks(
             "current_count": cur,
             "assigned_at": p.get("created_at"),
             "params": params,
+            # 供 Web UI/排查用:进度口径与该项目实际已上传的 session 数
+            "progress_source": source,
+            "session_count": sessions,
         })
 
     return {"tasks": tasks, "updated_at": utcnow().isoformat()}
+
+
+@router.post("/device/tasks/progress")
+async def device_task_progress(body: dict | None = None,
+                               _: str = Depends(verify_api_key)):
+    """采集端「录制完成」增量上报(幂等)。
+
+    body::
+
+        {"task_id": "<项目 id>", "device_name": "EGO_001",
+         "session_id": "EGO_001:<task_id>:<本地水位>", "increment": 1}
+
+    返回 ``{"completed_count": <该项目最新进度>}`` —— 采集端把这个数当后端
+    权威数落进自己的分账(backend_count)。同一 (device_name, session_id)
+    重放不重复计数:采集端崩溃/断网后重发同一个水位是安全的。
+
+    错误:参数缺失/非法、任务不存在 → 400。**刻意不用 404** —— 采集端把 404
+    当成「后端还没实现该端点」并永久降级(整机不再上报任何进度)。
+    """
+    from fastapi import HTTPException
+
+    projects = await asyncio.to_thread(list_projects)
+    known = {str(p.get("id") or "") for p in projects}
+    try:
+        return await asyncio.to_thread(
+            device_progress.apply_report, body or {}, known)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))

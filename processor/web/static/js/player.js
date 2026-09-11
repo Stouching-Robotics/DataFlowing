@@ -1,5 +1,5 @@
 /* Plyr video player management */
-console.log('[player.js] build 202609091912-tactile-chunk-prefetch');
+console.log('[player.js] build 20260911-tactile-episode-color-scale');
 
 const players = {};  // {camera_name: Plyr instance}
 let currentEpisodeId = null;
@@ -1219,7 +1219,15 @@ function _syncWorkspacePlayers() {
     if (typeof startHeatmapSync === 'function') startHeatmapSync(active);
     if (masterPlaying) {
         Object.values(players).forEach(player => {
-            try { player.play(); } catch (e) {}
+            // play() returns a promise: a try/catch cannot see its rejection,
+            // and the load chain right after this call runs pauseAll(), which
+            // aborts the pending play → uncaught AbortError in the console.
+            try {
+                const result = player.play();
+                if (result && typeof result.catch === 'function') {
+                    result.catch(() => {});
+                }
+            } catch (e) {}
         });
     }
 }
@@ -1781,7 +1789,13 @@ function _createTactileWebGLRenderer(canvas) {
                 canvas.width = width;
                 canvas.height = height;
             }
-            gl.viewport(0, 0, width, height);
+            // 传感器是 250x250 的方格阵列,必须等比显示 —— 铺满 canvas 会按
+            // tile 的宽高比横向拉伸(实测宽窗约 2.9:1),格子就不再是正方形,
+            // 接触位置的形状判断会失真。取短边做居中正方形 viewport,多出来的
+            // 两侧留背景色(gl.clear 不受 viewport 限制,会整块清成底色)。
+            const side = Math.min(width, height);
+            gl.viewport(Math.round((width - side) / 2),
+                        Math.round((height - side) / 2), side, side);
             gl.clearColor(0.0039, 0.0039, 0.502, 1.0);
             gl.clear(gl.COLOR_BUFFER_BIT);
             if (!this.field) return;
@@ -1815,77 +1829,19 @@ function _createTactileWebGLRenderer(canvas) {
     };
 }
 
-// Wheel zoom / drag pan / double-click reset for one tactile matrix tile.
-// One texture texel is one sensor cell, so zooming in reveals the individual
-// contact cells that the whole-field view averages away (same interaction as
-// the acquisition-side demo viewer).
-function _tactileScreenUv(canvas, clientX, clientY) {
-    const rect = canvas.getBoundingClientRect();
-    return [
-        (clientX - rect.left) / Math.max(1, rect.width),
-        1 - (clientY - rect.top) / Math.max(1, rect.height),
-    ];
-}
-
-function _clampTactileView(renderer) {
-    const limit = Math.max(0, (1 - 1 / renderer.zoom) / 2);
-    renderer.pan[0] = Math.max(-limit, Math.min(limit, renderer.pan[0]));
-    renderer.pan[1] = Math.max(-limit, Math.min(limit, renderer.pan[1]));
-}
-
-function initTactileView(entry) {
-    const canvas = entry?.canvas;
-    const renderer = entry?.renderer;
-    if (!canvas || !renderer) return;
-    const maxZoom = 12;
-    canvas.addEventListener('wheel', event => {
-        event.preventDefault();
-        const [u, v] = _tactileScreenUv(canvas, event.clientX, event.clientY);
-        const before = 1 / renderer.zoom;
-        renderer.zoom = Math.max(1, Math.min(maxZoom,
-            renderer.zoom * (event.deltaY < 0 ? 1.2 : 1 / 1.2)));
-        const delta = before - 1 / renderer.zoom;
-        renderer.pan[0] += (u - 0.5) * delta;
-        renderer.pan[1] += (v - 0.5) * delta;
-        _clampTactileView(renderer);
-        canvas.style.cursor = renderer.zoom > 1 ? 'grab' : 'default';
-        renderer.render();
-    }, { passive: false });
-    canvas.addEventListener('pointerdown', event => {
-        if (event.button !== 0 || renderer.zoom <= 1) return;
-        entry._panDrag = { x: event.clientX, y: event.clientY };
-        canvas.style.cursor = 'grabbing';
-        if (canvas.setPointerCapture) canvas.setPointerCapture(event.pointerId);
-        event.preventDefault();
-    });
-    canvas.addEventListener('pointermove', event => {
-        if (!entry._panDrag) return;
-        const rect = canvas.getBoundingClientRect();
-        renderer.pan[0] -= (event.clientX - entry._panDrag.x)
-            / Math.max(1, rect.width) / renderer.zoom;
-        renderer.pan[1] += (event.clientY - entry._panDrag.y)
-            / Math.max(1, rect.height) / renderer.zoom;
-        entry._panDrag = { x: event.clientX, y: event.clientY };
-        _clampTactileView(renderer);
-        renderer.render();
-    });
-    const endPan = event => {
-        if (!entry._panDrag) return;
-        entry._panDrag = null;
-        canvas.style.cursor = renderer.zoom > 1 ? 'grab' : 'default';
-        if (event && canvas.hasPointerCapture
-                && canvas.hasPointerCapture(event.pointerId)) {
-            canvas.releasePointerCapture(event.pointerId);
-        }
-    };
-    canvas.addEventListener('pointerup', endPan);
-    canvas.addEventListener('pointercancel', endPan);
-    canvas.addEventListener('dblclick', () => {
-        renderer.zoom = 1;
-        renderer.pan = [0, 0];
-        canvas.style.cursor = 'default';
-        renderer.render();
-    });
+// The tactile force matrix tile is display-only. Zoom/pan were removed on
+// purpose: the review page is read-only evidence, and a stray wheel or drag
+// could leave the matrix zoomed into a few cells and look like a sensor
+// defect. The whole 250x250 field stays fixed, one texture texel per cell.
+// The renderer keeps supporting zoom/pan (uniforms u_zoom/u_pan) so the
+// acquisition-side demo viewer and any future opt-in can reuse it; here the
+// view is pinned to identity.
+function _resetTactileView(renderer) {
+    if (!renderer) return;
+    renderer.zoom = 1;
+    renderer.pan = [0, 0];
+    if (renderer.canvas) renderer.canvas.style.cursor = 'default';
+    renderer.render();
 }
 
 // One chunk = 96 frames of 250x250 R8 = 6 MB per request. The old code issued
@@ -1918,7 +1874,7 @@ function _fetchTactileChunk(entry, chunkStart) {
     const signal = getMediaLoadSignal();
     const url = `/api/v1/video/${currentEpisodeId}/tactile-matrix-range`
         + `?side=${entry.source.side}&start=${chunkStart}`
-        + `&limit=${TACTILE_CHUNK_FRAMES}&v=202609091912-tactile-chunk-prefetch`;
+        + `&limit=${TACTILE_CHUNK_FRAMES}&v=20260911-tactile-episode-color-scale`;
     const options = { credentials: 'same-origin', cache: 'force-cache' };
     if (signal) options.signal = signal;
     fetch(url, options).then(response => {
@@ -2057,8 +2013,8 @@ async function mountGroupedSource(source, tile) {
             curveCanvas, loadedFrame: -1, pendingFrame: null,
             chunks: new Map(), chunkInflight: new Set(),
             frameCount: Number(tactileMatrixData?.frame_count) || 0 };
-        initTactileView(entry);
-        canvas.title = '滚轮缩放 / 拖拽平移 / 双击复位';
+        _resetTactileView(renderer);
+        canvas.title = '接触力场(固定全幅,不可缩放)';
         currentTactileTiles.push(entry);
         const frame = typeof currentFrameTarget === 'number' ? currentFrameTarget : 0;
         _updateTactileForceTile(entry, frame);
@@ -2625,6 +2581,12 @@ function renderGroupedWorkspace() {
         _restorePlayersToCurrentFrame();
         const active = getActivePlayer();
         if (!active) { hideVideoLoading(); return; }
+        // A freshly mounted episode always starts paused. Clear the state and
+        // sync before wiring the players: _syncWorkspacePlayers() re-issues
+        // play() for a workspace still marked as playing, and the pauseAll()
+        // further down then aborts it — a play/pause race that fires an
+        // uncaught AbortError and leaves the transport button flapping.
+        masterPlaying = false;
         _syncWorkspacePlayers();
         refreshPlayButton(false);
         try {
@@ -3324,6 +3286,10 @@ function playAll() {
 
 
 function pauseAll() {
+    // Keep the transport state consistent with reality: callers that pause
+    // without flipping the flag left the button reading "Pause" while every
+    // player was stopped, so the next click replayed instead of resuming.
+    masterPlaying = false;
     Object.values(players).forEach(p => {
         try { p.pause(); } catch(e) {}
     });
@@ -4215,10 +4181,13 @@ function _slamSmoothRows() {
 // world frame: +Z is up (measured on real data - a physical turn of the
 // gripper rotates about world +Z, and the gripper's own up axis sits within
 // ~12 deg of it for the whole episode). The browser camera uses a right-handed
-// frame with Y up, so display=[source X, source Z, -source Y] keeps the
-// stored values untouched and puts world up on screen up.
+// frame with Y up, so the display mapping puts world up on screen up.
+//
+// 源 +X 指向设备的**左侧**(S80M R_corr 之后源系是"左、后、上"),
+// 直接透传会让整个空间视图相对真实动作左右镜像:设备往左绕圈,
+// 画面里往右走。取反 X 修正左右;Y/Z 不动,前后与上下仍与实测一致。
 function _slamDisplayPoint(sourcePoint) {
-    return [Number(sourcePoint[0]), Number(sourcePoint[2]), -Number(sourcePoint[1])];
+    return [-Number(sourcePoint[0]), Number(sourcePoint[2]), -Number(sourcePoint[1])];
 }
 
 function _slamSourcePoint(row) {
@@ -4358,10 +4327,12 @@ function renderSlamTile(entry, frameOverride) {
 
     // Small axis marker at the fitted area: the recorded world axes, drawn in
     // the display frame that _slamDisplayPoint produces (world +Z is up).
+    // The X tip follows the same negation as _slamDisplayPoint: display +X is
+    // source -X, so the recorded +X axis points toward display -X.
     const axisOrigin = [fit.center[0], fit.gridY, fit.center[2]];
     const axisTips = [
         // World axes: X and Y horizontal, Z up.
-        [[axisOrigin[0] + 0.2, axisOrigin[1], axisOrigin[2]], 'rgb(248,90,90)', 'X'],
+        [[axisOrigin[0] - 0.2, axisOrigin[1], axisOrigin[2]], 'rgb(248,90,90)', 'X'],
         [[axisOrigin[0], axisOrigin[1], axisOrigin[2] - 0.2], 'rgb(80,220,130)', 'Y'],
         [[axisOrigin[0], axisOrigin[1] + 0.2, axisOrigin[2]], 'rgb(90,150,255)', 'Z'],
     ];
@@ -4423,10 +4394,13 @@ function renderSlamTile(entry, frameOverride) {
         });
 
         // Simplified UMI gripper model. The recorded pose frame is the S80M
-        // camera frame; measured on real data the device axes sit at
-        // +X = camera right (~world +Y), +Y = gripper up (~world +Z, the
-        // camera is mounted inverted) and +Z = gripper forward (~world +X,
-        // the optical axis). So the body extends along local +Z, the two
+        // camera frame; measured on the uploaded UMIGripper_AI episodes (every
+        // frame of every batch) the device axes sit at
+        // +X = gripper right (jaw separation, horizontal),
+        // +Y = gripper forward (the optical axis, horizontal) and
+        // +Z = gripper up (vertical, within ~12 deg of world +Z — the world
+        // frame is gravity-aligned, so this is a fixed sensor-frame fact, not
+        // a per-episode pose). So the body extends along local +Y, the two
         // plates separate along local X, and each plate is 0.20m long
         // (forward) by 0.05m tall (up) with a 0.12m maximum opening.
         const grip = _slamGripperState(currentRow);
@@ -4449,18 +4423,18 @@ function renderSlamTile(entry, frameOverride) {
             const jawFill = grip.gripped
                 ? 'rgba(248,90,90,0.16)' : 'rgba(88,168,232,0.12)';
             const relativeCorners = [
-                [0, -plateHeight / 2, -plateLength / 2],
-                [0, -plateHeight / 2, plateLength / 2],
-                [0, plateHeight / 2, plateLength / 2],
-                [0, plateHeight / 2, -plateLength / 2],
+                [0, -plateLength / 2, -plateHeight / 2],
+                [0, plateLength / 2, -plateHeight / 2],
+                [0, plateLength / 2, plateHeight / 2],
+                [0, -plateLength / 2, plateHeight / 2],
             ];
 
             for (const sign of [1, -1]) {
                 const centerX = sign * halfGap;
                 const corners = relativeCorners.map(corner => project(toDisplay([
                     centerX + corner[0],
-                    corner[1],
-                    baseOffset + corner[2],
+                    baseOffset + corner[1],
+                    corner[2],
                 ])));
                 if (corners.every(item => Number.isFinite(item[0]) && Number.isFinite(item[1]))) {
                     ctx.fillStyle = jawFill;
@@ -4474,21 +4448,21 @@ function renderSlamTile(entry, frameOverride) {
                     ctx.stroke();
                 }
                 line(
-                    toDisplay([centerX, 0, baseOffset - plateLength / 2]),
-                    toDisplay([centerX, 0, baseOffset + plateLength / 2]),
+                    toDisplay([centerX, baseOffset - plateLength / 2, 0]),
+                    toDisplay([centerX, baseOffset + plateLength / 2, 0]),
                     jawColor, 1);
             }
 
             // Rear crossbar plus the two supports that tie each plate back to
             // the body, so the opening stays readable when it is small.
-            line(toDisplay([-maxHalfGap, 0, baseOffset]),
-                toDisplay([maxHalfGap, 0, baseOffset]),
+            line(toDisplay([-maxHalfGap, baseOffset, 0]),
+                toDisplay([maxHalfGap, baseOffset, 0]),
                 'rgba(148,163,184,0.8)', 1.5);
             for (const sign of [1, -1]) {
-                for (const cornerZ of [-plateLength / 2, plateLength / 2]) {
+                for (const cornerY of [-plateLength / 2, plateLength / 2]) {
                     line(
-                        toDisplay([sign * halfGap, 0, baseOffset + cornerZ]),
-                        toDisplay([0, 0, baseOffset + cornerZ]),
+                        toDisplay([sign * halfGap, baseOffset + cornerY, 0]),
+                        toDisplay([0, baseOffset + cornerY, 0]),
                         'rgba(148,163,184,0.8)', 1);
                 }
             }

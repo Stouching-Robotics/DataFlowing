@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, Response
 
 from app.config import settings
 from app.localstore import (
-    list_runs, get_run, save_run, get_episode,
+    list_runs, list_run_summaries, get_run, save_run, get_episode,
     set_episode_status, list_exceptions, delete_exception,
     update_run_if_owned, save_annotations,
 )
@@ -59,9 +59,11 @@ def _remove_later(path: str) -> None:
 async def claim_job(body: dict, _: str = Depends(verify_worker_api_key)):
     """Worker 轮询领取任务:queued 或租约过期的 running。"""
     now = _now()
-    runs = list_runs()
+    # Scan summaries, not full records: this endpoint is polled every few
+    # seconds and reading every historical run on each poll is what saturated
+    # the API process.  Only the winner gets its full payload loaded.
     candidate = None
-    for r in sorted(runs, key=lambda r: r.get("created_at") or ""):
+    for r in sorted(list_run_summaries(), key=lambda r: r.get("created_at") or ""):
         status = r.get("status")
         if status in ("queued", "pending"):
             candidate = r
@@ -78,7 +80,9 @@ async def claim_job(body: dict, _: str = Depends(verify_worker_api_key)):
     if candidate is None:
         return Response(status_code=204)
 
-    run = candidate
+    # Reload the full record before mutating — save_run replaces the whole
+    # document, so writing the summary back would drop the run's payload.
+    run = get_run(str(candidate.get("id"))) or dict(candidate)
     run["status"] = "running"
     run["worker_id"] = body.get("worker_id")
     run["lease_token"] = uuid.uuid4().hex
@@ -182,6 +186,30 @@ def clear_input_zip_cache(episode_id: str) -> None:
         pass
 
 
+def _zip_data_parquets_readable(archive_path: Path) -> bool:
+    """包内 ``data/*.parquet`` 是否都能读出 footer。
+
+    NAS/SSHFS 偶尔返回被截断的内容,而 ``archive.write`` 会把它原样打进包。
+    这种包一旦缓存下来就会**永久**生效:worker 解压后读到的副本本身就是坏
+    的,重试也救不回来 —— 表现为
+    ``ArrowInvalid: Parquet magic bytes not found in footer``。
+
+    只读 schema(footer)不做全量解码,代价很小。
+    """
+    try:
+        import pyarrow.parquet as pq
+        with zipfile.ZipFile(archive_path) as archive:
+            for info in archive.infolist():
+                name = info.filename
+                if not (name.startswith("data/") and name.endswith(".parquet")):
+                    continue
+                with archive.open(info) as handle:
+                    pq.read_schema(handle)
+        return True
+    except Exception:
+        return False
+
+
 def prepare_episode_input_cache(episode_id: str, batch_dir: Path | None = None) -> Path:
     """Build a local immutable input archive for a workflow batch.
 
@@ -201,16 +229,47 @@ def prepare_episode_input_cache(episode_id: str, batch_dir: Path | None = None) 
 
     zip_path, stamp_path = _input_zip_cache_paths(str(episode_id))
     with _INPUT_ZIP_LOCK:
-        if zip_path.is_file() and _input_zip_stamp_matches(stamp_path, batch_dir):
+        # 缓存命中也要校验:戳只看 meta/info.json,而合并只重写 data parquet
+        # —— 戳因此可能在内容已变时仍判为新鲜,把早先固化的坏包一直发出去。
+        # 读 footer 很便宜,换掉「坏包只能用一次才知道」的被动局面。
+        if (zip_path.is_file()
+                and _input_zip_stamp_matches(stamp_path, batch_dir)
+                and _zip_data_parquets_readable(zip_path)):
             return zip_path
 
-        tmp = tempfile.NamedTemporaryFile(
-            prefix=f"egodata-input-{episode_id}-", suffix=".zip",
-            dir=str(_worker_tmp_root()), delete=False,
+        # 截断的网络读入不该被缓存:校验失败就重打,连续失败才报错。
+        # 打包本身很便宜(本地 zip),代价远低于把坏包固化进缓存。
+        packaged: str | None = None
+        for attempt in range(3):
+            packaged = _build_input_zip(episode_id, batch_dir)
+            if _zip_data_parquets_readable(Path(packaged)):
+                break
+            _remove_later(packaged)
+            packaged = None
+            print(f"[Worker] input archive unreadable, rebuilding "
+                  f"({attempt + 1}/3): {episode_id}")
+        if packaged is None:
+            raise RuntimeError(
+                f"Input archive for {episode_id} stays unreadable after 3 attempts "
+                f"(source on the storage mount may be corrupt)")
+        _input_zip_cache_dir().mkdir(parents=True, exist_ok=True)
+        shutil.move(packaged, str(zip_path))
+        stamp_path.write_text(
+            json.dumps(_input_zip_stamp(batch_dir)), encoding="utf-8"
         )
-        tmp.close()
-        try:
-            with zipfile.ZipFile(tmp.name, "w", allowZip64=True) as archive:
+        _evict_input_zip_cache()
+        return zip_path
+
+
+def _build_input_zip(episode_id: str, batch_dir: Path) -> str:
+    """把一集的 canonical 文件打成 zip,返回临时包路径。"""
+    tmp = tempfile.NamedTemporaryFile(
+        prefix=f"egodata-input-{episode_id}-", suffix=".zip",
+        dir=str(_worker_tmp_root()), delete=False,
+    )
+    tmp.close()
+    try:
+        with zipfile.ZipFile(tmp.name, "w", allowZip64=True) as archive:
                 canonical_episode = None
                 if (batch_dir / "meta" / "episodes").is_dir():
                     from app.project_dataset import episode_row, episode_files
@@ -252,21 +311,10 @@ def prepare_episode_input_cache(episode_id: str, batch_dir: Path | None = None) 
                         else zipfile.ZIP_DEFLATED
                     )
                     archive.write(path, str(arcname), compress_type=compression)
-        except Exception:
-            _remove_later(tmp.name)
-            raise
-
-        try:
-            _input_zip_cache_dir().mkdir(parents=True, exist_ok=True)
-            shutil.move(tmp.name, str(zip_path))
-            stamp_path.write_text(
-                json.dumps(_input_zip_stamp(batch_dir)), encoding="utf-8"
-            )
-            _evict_input_zip_cache()
-        except Exception:
-            _remove_later(tmp.name)
-            raise
-        return zip_path
+    except Exception:
+        _remove_later(tmp.name)
+        raise
+    return tmp.name
 
 
 @router.get("/jobs/{run_id}/input")
@@ -409,6 +457,16 @@ async def complete_job(
                             detail=f"Failed to publish episode result: {exc}")
     finally:
         shutil.rmtree(staging_dir, ignore_errors=True)
+
+    # 合并刚重写了该集的 data parquet,而 Worker 输入包的「新鲜度戳」只看
+    # meta/info.json —— 合并不碰那个文件,戳因此不变,坏包会被一直复用。
+    # 实测后果:包内 parquet 被截断(ArrowInvalid: Parquet magic bytes not
+    # found in footer),节点每次都以「列不可读」跳过,且重试无用(解压出来的
+    # 副本本身就是坏的)。这里主动清掉,下一次运行会重新打包。
+    try:
+        clear_input_zip_cache(str(run.get("episode_id") or ""))
+    except Exception:
+        pass  # 清缓存失败不影响本次结果,下次打包仍会走戳校验
 
     def mark_completed(current: dict) -> None:
         current["status"] = "completed"

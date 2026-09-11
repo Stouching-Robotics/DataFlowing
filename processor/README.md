@@ -1,3 +1,5 @@
+ 
+
 # processor
 
 [English](README.md) | [中文](README.zh-CN.md)
@@ -159,12 +161,12 @@ the current Episode.
 
 ### Video sources
 
-| Type | Example source name | Description |
-| --- | --- | --- |
-| Mono RGB | `head_rgb` | Regular RGB video |
-| Metric depth | `head_depth` | Independent metric-depth video |
-| Stereo RGB | `stereo_left_rgb`, `stereo_right_rgb` | Left and right RGB videos |
-| Stereo depth | `stereo_depth` | Independent depth video |
+| Type         | Example source name                       | Description                    |
+| ------------ | ----------------------------------------- | ------------------------------ |
+| Mono RGB     | `head_rgb`                              | Regular RGB video              |
+| Metric depth | `head_depth`                            | Independent metric-depth video |
+| Stereo RGB   | `stereo_left_rgb`, `stereo_right_rgb` | Left and right RGB videos      |
+| Stereo depth | `stereo_depth`                          | Independent depth video        |
 
 RGB and Depth are always stored as independent streams. A depth-only stream is never treated as
 RGB and is never duplicated alongside the RGB stream.
@@ -250,24 +252,24 @@ when old workflows are loaded; they are not shown in the new-workflow palette.
 
 #### Capture modules (Input)
 
-| Frontend module | Inputs | Outputs | Purpose and rules |
-| --- | --- | --- | --- |
-| `RGB Camera` | None | `RGB Video` | Mono RGB video. The device is selected from the current project's data; blank means auto-match. |
-| `RGB-D Camera` | None | `RGB Video`, `Depth` | Emits RGB and real depth streams from the same device; Depth can connect only to a depth input. |
-| `Stereo RGB Camera` | None | `Left RGB Video`, `Right RGB Video` | Stereo RGB input. Connecting one side creates the corresponding left/right relationship. |
-| `Stereo RGB-D Camera` | None | `Left RGB Video`, `Right RGB Video`, `Depth` | Stereo RGB plus real depth; Depth is used by RGB-D 3D processing. |
-| `Glove Sensor` | None | `Glove Sensor Data` | Pressure, joint, or glove sensor data; no video output. It can connect directly to quality review. |
+| Frontend module         | Inputs | Outputs                                            | Purpose and rules                                                                                  |
+| ----------------------- | ------ | -------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `RGB Camera`          | None   | `RGB Video`                                      | Mono RGB video. The device is selected from the current project's data; blank means auto-match.    |
+| `RGB-D Camera`        | None   | `RGB Video`, `Depth`                           | Emits RGB and real depth streams from the same device; Depth can connect only to a depth input.    |
+| `Stereo RGB Camera`   | None   | `Left RGB Video`, `Right RGB Video`            | Stereo RGB input. Connecting one side creates the corresponding left/right relationship.           |
+| `Stereo RGB-D Camera` | None   | `Left RGB Video`, `Right RGB Video`, `Depth` | Stereo RGB plus real depth; Depth is used by RGB-D 3D processing.                                  |
+| `Glove Sensor`        | None   | `Glove Sensor Data`                              | Pressure, joint, or glove sensor data; no video output. It can connect directly to quality review. |
 
 #### Video and keypoint processing modules (Process)
 
-| Frontend module | Inputs | Outputs | Purpose and rules |
-| --- | --- | --- | --- |
-| `Human Annotation` | `RGB Video` | `Annotation` | Frame-level manual annotation on RGB video. |
-| `AI Annotation` | `RGB Video` | `Annotation` | Video/segment annotation through a local or API VLM; API is recommended for deployment. |
-| `RGB_TO_2D_BareHand` | `RGB Video` | `Hand 2D` | Bare-hand 2D keypoints. `Spatial` is display-only and exports no metric 3D. |
-| `RGB_TO_2D_BlackGlove` | `RGB Video` | `Hand 2D` | Black-glove 2D keypoints. Without Depth, it does not calculate metric 3D. |
-| `RGB-D_3D_BareHand` | `RGB Video`, `Depth` | `Hand 3D` | Metric 3D bare-hand keypoints from RGB and real Depth; a missing branch is skipped. |
-| `RGB-D_3D_BlackGlove` | `RGB Video`, `Depth` | `Hand 3D` | Metric 3D black-glove keypoints from RGB and real Depth; it does not search the disk or fall back to RGB estimation. |
+| Frontend module          | Inputs                   | Outputs        | Purpose and rules                                                                                                    |
+| ------------------------ | ------------------------ | -------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `Human Annotation`     | `RGB Video`            | `Annotation` | Frame-level manual annotation on RGB video.                                                                          |
+| `AI Annotation`        | `RGB Video`            | `Annotation` | Video/segment annotation through a local or API VLM; API is recommended for deployment.                              |
+| `RGB_TO_2D_BareHand`   | `RGB Video`            | `Hand 2D`    | Bare-hand 2D keypoints.`Spatial` is display-only and exports no metric 3D.                                         |
+| `RGB_TO_2D_BlackGlove` | `RGB Video`            | `Hand 2D`    | Black-glove 2D keypoints. Without Depth, it does not calculate metric 3D.                                            |
+| `RGB-D_3D_BareHand`    | `RGB Video`, `Depth` | `Hand 3D`    | Metric 3D bare-hand keypoints from RGB and real Depth; a missing branch is skipped.                                  |
+| `RGB-D_3D_BlackGlove`  | `RGB Video`, `Depth` | `Hand 3D`    | Metric 3D black-glove keypoints from RGB and real Depth; it does not search the disk or fall back to RGB estimation. |
 
 `MediaPipe Hand` remains available for historical workflows and backend compatibility but is hidden
 from the new-workflow palette. All nodes provide hover text describing their purpose and accepted
@@ -275,32 +277,32 @@ connection types.
 
 #### Review modules (Review)
 
-| Frontend module | Inputs | Outputs | Purpose and rules |
-| --- | --- | --- | --- |
-| `Human Review` | `Review Target` | `Reviewed Data` | Human inspection of video, keypoints, or annotation results before downstream processing. |
+| Frontend module       | Inputs                    | Outputs           | Purpose and rules                                                                                      |
+| --------------------- | ------------------------- | ----------------- | ------------------------------------------------------------------------------------------------------ |
+| `Human Review`      | `Review Target`         | `Reviewed Data` | Human inspection of video, keypoints, or annotation results before downstream processing.              |
 | `AI Quality Review` | `Quality Review Target` | `Reviewed Data` | Checks video decoding, frame continuity, black screens, freezes, annotation coverage, and sensor data. |
 
 #### Export modules (Export)
 
-| Frontend module | Inputs | Outputs | Purpose and rules |
-| --- | --- | --- | --- |
+| Frontend module    | Inputs              | Outputs     | Purpose and rules                                                  |
+| ------------------ | ------------------- | ----------- | ------------------------------------------------------------------ |
 | `LeRobot Export` | `Exportable Data` | `Dataset` | Exports LeRobot v2.1 or v3.0; the version is selected on the node. |
-| `HDF5 Export` | `Exportable Data` | `Dataset` | Exports HDF5 with the configured compression parameters. |
+| `HDF5 Export`    | `Exportable Data` | `Dataset` | Exports HDF5 with the configured compression parameters.           |
 
 #### Workflow Studio UI components
 
 <details>
 <summary>Click to expand: frontend component reference</summary>
 
-| UI component | Function |
-| --- | --- |
-| `NodePalette` | Displays Input, Process, Review, and Export categories; supports search, category collapse, and hover descriptions. |
-| `WorkflowCanvas` | Supports drag-and-drop node creation, typed-port connections, node movement, selection, zoom, grid snapping, and minimap navigation. |
-| `WorkflowNode` | Renders the card title, ports, project device selector/input, `Spatial` button, and API settings button. |
-| `WorkflowDrawer` | Lists workflows, creates new workflows, loads workflows, and refreshes project-specific input sources. |
-| `PipelineToolbar` | Provides New, Save, Save As, workflow JSON Export, and Run actions; the yellow dot indicates unsaved changes. |
-| `NodeSettingsModal` | Configures AI Annotation API vendor, model, endpoint, and key fields. |
-| `DeletableEdge` | Renders data connections; a selected edge can be deleted. |
+| UI component          | Function                                                                                                                             |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `NodePalette`       | Displays Input, Process, Review, and Export categories; supports search, category collapse, and hover descriptions.                  |
+| `WorkflowCanvas`    | Supports drag-and-drop node creation, typed-port connections, node movement, selection, zoom, grid snapping, and minimap navigation. |
+| `WorkflowNode`      | Renders the card title, ports, project device selector/input,`Spatial` button, and API settings button.                            |
+| `WorkflowDrawer`    | Lists workflows, creates new workflows, loads workflows, and refreshes project-specific input sources.                               |
+| `PipelineToolbar`   | Provides New, Save, Save As, workflow JSON Export, and Run actions; the yellow dot indicates unsaved changes.                        |
+| `NodeSettingsModal` | Configures AI Annotation API vendor, model, endpoint, and key fields.                                                                |
+| `DeletableEdge`     | Renders data connections; a selected edge can be deleted.                                                                            |
 
 Device selection is always scoped to the current project. A new empty workflow does not display a
 device from another project. After data is uploaded, each card's selector shows only real sources
@@ -434,17 +436,17 @@ The build output is written to `web/static/workflow-studio/` and served by FastA
 Configuration is stored in `processor/.env` or environment variables and must not be
 committed:
 
-| Setting | Purpose |
-| --- | --- |
-| `STORAGE_DIR` | Root directory for data and system state |
-| `STORAGE_BACKEND` | `local` or `sftp` |
-| `SFTP_*` | Remote data directory and SSH connection settings |
-| `API_KEY` | API key for the capture client and protected endpoints |
-| `WORKER_API_KEY` | API key used by the Worker to claim and return jobs |
-| `JWT_SECRET` | Secret used to sign Web login sessions |
-| `UPLOAD_STAGING_DIR` | Local staging directory for upload archives |
-| `HOST` / `PORT` | Web/API listen address and port |
-| `PUBLIC_BASE_URL` | Public service URL |
+| Setting                | Purpose                                                |
+| ---------------------- | ------------------------------------------------------ |
+| `STORAGE_DIR`        | Root directory for data and system state               |
+| `STORAGE_BACKEND`    | `local` or `sftp`                                  |
+| `SFTP_*`             | Remote data directory and SSH connection settings      |
+| `API_KEY`            | API key for the capture client and protected endpoints |
+| `WORKER_API_KEY`     | API key used by the Worker to claim and return jobs    |
+| `JWT_SECRET`         | Secret used to sign Web login sessions                 |
+| `UPLOAD_STAGING_DIR` | Local staging directory for upload archives            |
+| `HOST` / `PORT`    | Web/API listen address and port                        |
+| `PUBLIC_BASE_URL`    | Public service URL                                     |
 
 See [`.env.example`](.env.example) for the complete template. Production environments must use
 random secrets and restrict `.env` permissions. Never put passwords, tokens, API keys, or database

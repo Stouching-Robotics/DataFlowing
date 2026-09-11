@@ -12,10 +12,13 @@ migration command and the upload path so both produce the same layout.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
 import shutil
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -442,7 +445,42 @@ def episode_index_from_name(name: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def project_episode_rows(project_root: Path) -> list[dict[str, Any]]:
+# ── Project index cache ───────────────────────────────
+# Every _canonical_episode_data_files() call reads the complete episode
+# metadata parquet set (52 episodes = 52 remote reads) plus two project-wide
+# directory walks — measured at 1.4s warm, and the review page issues ~11
+# video requests per episode open, so the same index was rebuilt a dozen
+# times per click.  Cache the parsed rows and the file index against a cheap
+# fingerprint of the episode index files.
+_PROJECT_CACHE_LOCK = threading.RLock()
+_PROJECT_CACHE: dict[str, dict[str, Any]] = {}
+# Computing the fingerprint still stats every episode index file, so a short
+# TTL skips even that inside one page load.  Structural changes are announced
+# explicitly through invalidate_project_cache().
+_PROJECT_CACHE_TTL = 60.0
+_PROJECT_SCAN_LOCK = threading.Lock()
+
+
+def _project_source_revision(project_root: Path) -> tuple:
+    """Fingerprint the episode index files (name, size, mtime).
+
+    The index files are written by whoever writes the data (upload, workflow
+    merge), so a change there means the project changed.  ``data/`` and
+    ``videos/`` are deliberately not walked: any addition or removal there is
+    accompanied by an index write.
+    """
+    parts: list[tuple] = []
+    try:
+        for path in _episode_parquet_files(project_root):
+            stat = path.stat()
+            parts.append((path.name, stat.st_size, stat.st_mtime_ns))
+    except OSError:
+        return ()
+    return tuple(parts)
+
+
+def _read_project_rows(project_root: Path) -> list[dict[str, Any]]:
+    """Uncached: one parquet read per episode, sorted by episode index."""
     rows: list[dict[str, Any]] = []
     for path in _episode_parquet_files(project_root):
         try:
@@ -453,6 +491,63 @@ def project_episode_rows(project_root: Path) -> list[dict[str, Any]]:
         rows.extend(value for value in values if isinstance(value, dict))
     rows.sort(key=lambda row: int(row.get("episode_index", 10**9)))
     return rows
+
+
+def _project_cache_entry(project_root: Path) -> dict[str, Any]:
+    """Return the cached ``{rows, index}`` for a project, rebuilding if stale."""
+    root = Path(project_root)
+    key = str(root)
+    now = time.monotonic()
+    with _PROJECT_CACHE_LOCK:
+        entry = _PROJECT_CACHE.get(key)
+        if entry is not None and now - entry["checked_at"] < _PROJECT_CACHE_TTL:
+            return entry
+    # The fingerprint touches the remote mount, so keep it outside the lock.
+    revision = _project_source_revision(root)
+    with _PROJECT_CACHE_LOCK:
+        entry = _PROJECT_CACHE.get(key)
+        if entry is not None and entry["revision"] == revision:
+            entry["checked_at"] = now
+            return entry
+    # Single-flight: a page load fires its requests in parallel, and they all
+    # miss at once.  One rebuild serves the whole burst.
+    with _PROJECT_SCAN_LOCK:
+        now = time.monotonic()
+        with _PROJECT_CACHE_LOCK:
+            entry = _PROJECT_CACHE.get(key)
+            if entry is not None and (
+                    entry["revision"] == revision
+                    or now - entry["checked_at"] < _PROJECT_CACHE_TTL):
+                return entry
+        rows = _read_project_rows(root)
+        index = _build_project_file_index(root, rows)
+        entry = {
+            "revision": revision,
+            "checked_at": time.monotonic(),
+            "rows": rows,
+            "index": index,
+        }
+        with _PROJECT_CACHE_LOCK:
+            _PROJECT_CACHE[key] = entry
+        return entry
+
+
+def invalidate_project_cache(project_root: Path | None = None) -> None:
+    """Drop cached project indexes after a structural change.
+
+    Called from ``localstore.invalidate_session_cache`` so an upload, delete or
+    rename becomes visible on the next read instead of after the TTL.
+    """
+    with _PROJECT_CACHE_LOCK:
+        if project_root is None:
+            _PROJECT_CACHE.clear()
+        else:
+            _PROJECT_CACHE.pop(str(Path(project_root)), None)
+
+
+def project_episode_rows(project_root: Path) -> list[dict[str, Any]]:
+    # Callers may assume they own the rows, so never hand out the cache itself.
+    return copy.deepcopy(_project_cache_entry(project_root)["rows"])
 
 
 def _match_episode_row(rows: list[dict[str, Any]],
@@ -519,29 +614,84 @@ def _chunk_number_from_path(path: Path) -> int:
     return 0
 
 
-def episode_files(project_root: Path, episode_index: int) -> dict[str, Any]:
-    """Return only one episode's source files from a project dataset."""
+def _build_project_file_index(
+        project_root: Path, rows: list[dict[str, Any]] | None = None
+) -> dict[int, dict[str, Any]]:
+    """Uncached: one pass over ``data/``, ``videos/`` and the episode rows."""
     root = Path(project_root)
-    data_files = [
-        path for path in (root / "data").rglob("*.parquet")
-        if path.is_file() and _episode_number_from_path(path) == episode_index
-    ] if (root / "data").is_dir() else []
-    videos: list[tuple[str, Path]] = []
+    index: dict[int, dict[str, Any]] = {}
+    data_root = root / "data"
+    if data_root.is_dir():
+        for path in data_root.rglob("*.parquet"):
+            if not path.is_file():
+                continue
+            number = _episode_number_from_path(path)
+            if number is None:
+                continue
+            index.setdefault(number, {"data": []})["data"].append(path)
     for source, path in iter_video_streams(root / "videos"):
-        if _episode_number_from_path(path) == episode_index:
-            videos.append((source, path))
-    row = next((item for item in project_episode_rows(root)
-                if _episode_index(item.get("episode_index")) == episode_index), {})
-    episode_id = _episode_id_for_row(row, root.name)
+        number = _episode_number_from_path(path)
+        if number is None:
+            continue
+        index.setdefault(number, {"data": []}).setdefault(
+            "videos", []).append((source, path))
+    if rows is None:
+        rows = _read_project_rows(root)
+    for row in rows:
+        number = _episode_index(row.get("episode_index"))
+        if number is None:
+            continue
+        # ``episode_files`` resolves a duplicate episode number to the first
+        # row in index order; ``setdefault`` keeps that same winner.
+        index.setdefault(number, {"data": []}).setdefault("row", row)
+    return index
+
+
+def project_episode_file_index(project_root: Path) -> dict[int, dict[str, Any]]:
+    """Index every episode's source files with a single pass over the project.
+
+    :func:`episode_files` re-walks ``data/``, ``videos/`` and the whole episode
+    index for each episode it is asked about, so scanning a project costs
+    ``(1 + episodes) x index files`` parquet reads on the (possibly remote)
+    storage mount.  This entry point keeps that contract while serving repeat
+    callers from the revision-checked project cache.
+
+    Keys are episode numbers; values carry the same ``data`` / ``videos`` /
+    ``row`` payload :func:`episode_files` reports, and are ordered exactly as
+    a per-episode walk would have produced them.
+    """
+    return copy.deepcopy(_project_cache_entry(Path(project_root))["index"])
+
+
+def episode_files_from_index(project_root: Path, episode_index: int,
+                             index: dict[int, dict[str, Any]]) -> dict[str, Any]:
+    """Look one episode up in a prebuilt :func:`project_episode_file_index`.
+
+    Returns the same shape as :func:`episode_files`; the caller owns the index
+    lifetime and is responsible for rebuilding it when the project changes.
+    """
+    root = Path(project_root)
+    entry = index.get(episode_index) or {}
+    row = entry.get("row") or {}
     relative_meta: list[Path] = [Path("meta/info.json"), Path("meta/tasks.json")]
     return {
         "episode_index": episode_index,
-        "episode_id": episode_id,
+        "episode_id": _episode_id_for_row(row, root.name),
         "row": row,
-        "data": data_files,
-        "videos": videos,
+        "data": list(entry.get("data") or []),
+        "videos": list(entry.get("videos") or []),
         "meta": [path for path in relative_meta if (root / path).is_file()],
     }
+
+
+def episode_files(project_root: Path, episode_index: int) -> dict[str, Any]:
+    """Return only one episode's source files from a project dataset.
+
+    Single-episode callers keep this entry point; it builds a one-shot index,
+    so it now walks the project once instead of three times.
+    """
+    return episode_files_from_index(
+        project_root, episode_index, project_episode_file_index(project_root))
 
 
 def _processing_token(value: Any, fallback: str = "result") -> str:
@@ -706,7 +856,8 @@ def publish_processing_result(
     records = _processing_artifacts(outputs)
     tabular_records = [item for item in records
                        if str(item[2].get("kind") or "") in
-                       {"hand_keypoints", "hand_3d", "glove_sensor"}]
+                       {"hand_keypoints", "hand_3d", "glove_sensor",
+                        "umi_slam_action"}]
     # A reprocess is authoritative for its hand-3D sources.  Remove any
     # source-qualified hand-3D columns left by an earlier partial publish
     # (including legacy ``*_1`` collision columns) before merging the fresh
@@ -717,10 +868,26 @@ def publish_processing_result(
                         if str(name).startswith("processing.hand_3d.")]
         if stale_hand3d:
             data_frame = data_frame.drop(columns=stale_hand3d, errors="ignore")
+    # Derived action replaces the collector's placeholder column instead of
+    # being renamed to ``processing.<kind>.*.action``.  The UMI collector
+    # writes an all-zero ``action`` that the LeRobot exporter correctly drops
+    # as a constant/zero-information column, so without this drop the fresh
+    # action would land under a name no exporter reads.  Only drop it when a
+    # umi_slam_action result is actually being published for this episode.
+    if any(str(ref.get("kind") or "") == "umi_slam_action"
+           for _node, _handle, ref in records):
+        # 本模块产出的列全部按原名覆盖(重跑幂等):action 之外还有
+        # observation.state,它同样不该因为二次合并被改名成 processing.*。
+        stale_action = [str(name) for name in data_frame.columns
+                        if str(name) in {"action", "observation.state"}
+                        or str(name).startswith("processing.umi_slam_action.")]
+        if stale_action:
+            data_frame = data_frame.drop(columns=stale_action, errors="ignore")
     assigned_columns: set[str] = set(data_frame.columns)
     merged_columns: list[str] = []
     published = {"artifacts": {}}
     merged_hand3d_sources: set[str] = set()
+    merged_action_files: set[str] = set()
 
     for node_id, handle, ref in records:
         source_path = _processing_ref_path(Path(extracted_root), ref)
@@ -734,6 +901,24 @@ def publish_processing_result(
         published_ref = dict(ref)
         source = _processing_token(ref.get("source_key") or metadata.get("source_key")
                                    or handle, kind)
+        # A review/review-export node forwards its upstream action ref, so the
+        # same derived action arrives twice (once from the producing node,
+        # once forwarded).  Merging both would add a duplicate
+        # ``processing.<kind>.*.action`` column holding identical values.
+        # Deduplicate on the artifact file, not the node id: two genuinely
+        # separate umi_slam_action nodes produce different files and must both
+        # merge.
+        if kind == "umi_slam_action":
+            action_file = str(source_path.resolve())
+            if action_file in merged_action_files:
+                published_ref["path"] = str(data_path.relative_to(root)).replace("\\", "/")
+                published_ref["metadata"] = {
+                    **metadata, "merged_into": published_ref["path"],
+                    "deduplicated": True, "merged_columns": [],
+                }
+                published["artifacts"].setdefault(node_id, {})[handle] = published_ref
+                continue
+            merged_action_files.add(action_file)
         # Review/export nodes pass the node-36 hand-3D refs through again.
         # They are the same source data, not a second measurement. Merge each
         # source once and keep the passthrough artifact only as an audit link.
@@ -760,7 +945,7 @@ def publish_processing_result(
                                           "storage": "browser_overlay"}
             published["artifacts"].setdefault(node_id, {})[handle] = published_ref
             continue
-        if kind in {"hand_keypoints", "hand_3d", "glove_sensor"}:
+        if kind in {"hand_keypoints", "hand_3d", "glove_sensor", "umi_slam_action"}:
             result_frame = pd.read_parquet(source_path)
             raw_columns = [str(name) for name in result_frame.columns
                            if name not in {"frame_index", "episode_index"}]

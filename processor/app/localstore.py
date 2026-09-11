@@ -37,6 +37,7 @@ _SESSIONS_CACHE_TTL = 300.0
 # 全量遍历远程挂载很慢:只允许单一线程执行(_scan_lock),遍历本身不持有
 # _lock —— 缓存过期触发的重扫不再把状态读写请求拖在锁后面排队。
 _scan_lock = threading.Lock()
+_sessions_refresh_running = False  # 后台 stale-while-revalidate 单飞标志
 _scan_generation = 0          # invalidate_session_cache 递增;并发扫描据此丢弃过期结果
 _state_write_generation = 0   # write_episode_state 递增;扫描期间的状态写入触发重扫
 _video_probe_cache: dict[str, tuple[int, float]] = {}
@@ -48,6 +49,14 @@ _workflows_cache: list[dict] | None = None
 _workflows_cache_at = 0.0
 _runs_cache: list[dict] | None = None
 _runs_cache_at = 0.0
+_runs_cache_revision: tuple = ()
+# list_runs(include_archived=False) keeps its own slot; the two variants are
+# cached independently so neither call pattern can serve the other's result.
+_runs_live_cache: list[dict] | None = None
+_runs_live_cache_at = 0.0
+_runs_live_cache_revision: tuple = ()
+# 指纹变化时才重建快照;单飞,避免并发请求各读一遍 539 个 JSON。
+_runs_scan_lock = threading.Lock()
 # Runs are written by the API process and read by separate worker processes.
 # A ten-minute process-local cache can hide a newly queued upload/reprocess
 # from workers. Keep the cache short while still coalescing rapid UI scans.
@@ -129,6 +138,14 @@ def invalidate_session_cache() -> None:
         _sessions_cache = None
         _sessions_cache_at = 0.0
         _video_probe_cache.clear()
+    # 项目索引缓存(project_dataset)按指纹自校验,但上传/删除/改名必须
+    # 立刻可见,不能等 TTL。懒导入避免模块级循环依赖。
+    try:
+        from app.project_dataset import invalidate_project_cache
+
+        invalidate_project_cache()
+    except Exception as exc:
+        print(f"[Cache] Project index invalidation skipped: {exc}")
 
 
 def scan_sessions() -> list[dict]:
@@ -141,7 +158,52 @@ def scan_sessions() -> list[dict]:
     _lock:缓存过期触发的重扫不再把状态读写等无关请求拖在锁后面排队。
     遍历期间发生结构变化(invalidate)/状态写入时,按代际计数丢弃过期结果
     重扫一次。
+
+    TTL 过期但已有快照时走 stale-while-revalidate:立刻返回旧快照,后台单飞
+    重建。全量遍历要 5s+,让审核页的请求撞上它正是"打开一条数据等十几秒"
+    的一个来源;旧快照里缺的只是刚上传的那一集,而上传会走
+    invalidate_session_cache() 清空缓存,所以这里不会藏住新数据。
     """
+    global _sessions_cache, _sessions_cache_at, _task_sessions_cache
+    with _lock:
+        snapshot = (copy.deepcopy(_sessions_cache)
+                    if _sessions_cache is not None else None)
+        fresh = (snapshot is not None
+                 and time.monotonic() - _sessions_cache_at < _SESSIONS_CACHE_TTL)
+    if fresh:
+        return snapshot
+    if snapshot is not None:
+        _refresh_sessions_in_background()
+        return snapshot
+    # 冷启动或刚被 invalidate:必须同步扫出第一份快照。
+    return _scan_sessions_blocking()
+
+
+def _refresh_sessions_in_background() -> None:
+    """Single-flight background rebuild of the expired session snapshot."""
+    global _sessions_refresh_running
+    with _lock:
+        if _sessions_refresh_running:
+            return
+        _sessions_refresh_running = True
+    threading.Thread(
+        target=_run_session_refresh, name="session-refresh", daemon=True
+    ).start()
+
+
+def _run_session_refresh() -> None:
+    global _sessions_refresh_running
+    try:
+        _scan_sessions_blocking()
+    except Exception as exc:
+        print(f"[Cache] Background session refresh failed: {exc}")
+    finally:
+        with _lock:
+            _sessions_refresh_running = False
+
+
+def _scan_sessions_blocking() -> list[dict]:
+    """Full remote tree walk; callers block for the duration."""
     global _sessions_cache, _sessions_cache_at, _task_sessions_cache
     while True:
         with _lock:
@@ -210,11 +272,19 @@ def _build_sessions_snapshot() -> list[dict]:
 def _scan_project_dir(project_dir: Path, project: str) -> list[dict]:
     """Scan a project-level LeRobot tree and expose one row per episode."""
     from app.lerobot_v21 import is_depth_source
-    from app.project_dataset import episode_files, project_episode_rows
+    from app.project_dataset import (
+        episode_files_from_index,
+        project_episode_file_index,
+        project_episode_rows,
+    )
 
     info = _read_json(project_dir / "meta" / "info.json", {})
     if not isinstance(info, dict):
         info = {}
+    # One index for the whole project: asking ``episode_files`` per episode
+    # would re-walk data/, videos/ and every episode index file each time,
+    # costing (1 + episodes) x parquet reads on the storage mount.
+    file_index = project_episode_file_index(project_dir)
     rows: list[dict] = []
     for row in project_episode_rows(project_dir):
         try:
@@ -223,7 +293,7 @@ def _scan_project_dir(project_dir: Path, project: str) -> list[dict]:
             continue
         episode_id = str(row.get("episode_id") or row.get("source_batch")
                          or f"{project}_{episode_index:06d}")
-        files = episode_files(project_dir, episode_index)
+        files = episode_files_from_index(project_dir, episode_index, file_index)
         state = read_episode_state(episode_id)
         # Project-level info is an aggregate.  Do not let it make a new
         # one-camera episode display devices that belong to another episode.
@@ -683,6 +753,13 @@ def delete_episode(episode_id: str, permanent: bool = False,
             _remove_json(EPISODE_STATES_DIR / f"{name}.json")
             _remove_json(ANNOTATIONS_DIR / f"{name}.json")
             _episode_state_cache.pop(name, None)
+            # 内容指纹指向已删除的批次:清掉,否则同一条录制重新上传时会被
+            # 误判成"重复"而试图覆盖一个已经不存在的 episode。
+            try:
+                from app.batch_fingerprint import forget_fingerprint
+                forget_fingerprint(name)
+            except Exception:
+                pass
             global _deleted_episodes_cache, _deleted_episodes_cache_at
             _deleted_episodes_cache = None
             _deleted_episodes_cache_at = 0.0
@@ -1190,38 +1267,198 @@ def mutate_annotation_by_id(
 # ── 工作流运行队列 ───────────────────────────────────
 
 RUNS_DIR = STATE_ROOT / "runs"
+# Finished runs keep their full record for the UI, but they are moved out of
+# the live queue directory: the worker polls /jobs/claim every few seconds and
+# used to re-read every historical run (hundreds of 26 KB JSON files on the
+# NAS mount) on each poll.  Only unfinished work stays in RUNS_DIR.
+RUNS_ARCHIVE_DIR = RUNS_DIR / "archive"
+_TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "superseded"})
+
+# claim_job only needs these to pick the next job; the full run payload is
+# loaded afterwards for the winner alone.
+_RUN_SUMMARY_FIELDS = ("id", "status", "created_at", "lease_until",
+                       "worker_id", "lease_token", "attempt")
 
 
-def list_runs() -> list[dict]:
-    global _runs_cache, _runs_cache_at
+def list_runs(include_archived: bool = True) -> list[dict]:
+    """All runs, newest-finished records included by default.
+
+    ``include_archived=False`` restricts the scan to the live queue and is
+    only for callers that just need claimable work.  Everything else keeps
+    the historical view it had before archiving existed.
+
+    The two variants are cached separately — a single shared cache would
+    serve whichever variant ran first to both callers.
+
+    TTL 过期后先比一次廉价指纹(目录 listing + stat,539 个 run 实测 4ms),
+    内容没变就只刷新时间戳。历史快照要读 539 个 JSON,冷读 6s —— 那正是
+    ``/export/episode-format`` 每次点开数据都要付的代价;而 worker 领取
+    走的是 :func:`list_run_summaries`,不经过这里,所以缓存不会耽误派活。
+    """
+    global _runs_cache, _runs_cache_at, _runs_cache_revision
+    global _runs_live_cache, _runs_live_cache_at, _runs_live_cache_revision
     now = time.monotonic()
-    if (_runs_cache is not None
-            and now - _runs_cache_at < _STATE_LIST_CACHE_TTL):
-        return copy.deepcopy(_runs_cache)
+    cache, cache_at = ((_runs_cache, _runs_cache_at) if include_archived
+                       else (_runs_live_cache, _runs_live_cache_at))
+    if cache is not None and now - cache_at < _STATE_LIST_CACHE_TTL:
+        return copy.deepcopy(cache)
+    revision = _run_dirs_revision(include_archived)
+    cached_revision = (_runs_cache_revision if include_archived
+                       else _runs_live_cache_revision)
+    if cache is not None and cached_revision == revision:
+        if include_archived:
+            _runs_cache_at = now
+        else:
+            _runs_live_cache_at = now
+        return copy.deepcopy(cache)
+    # 指纹变化时才真读;单飞避免并发请求各读一遍 539 个文件。
+    with _runs_scan_lock:
+        now = time.monotonic()
+        cache, cache_at = ((_runs_cache, _runs_cache_at) if include_archived
+                           else (_runs_live_cache, _runs_live_cache_at))
+        cached_revision = (_runs_cache_revision if include_archived
+                           else _runs_live_cache_revision)
+        if cache is not None and (cached_revision == revision
+                                  or now - cache_at < _STATE_LIST_CACHE_TTL):
+            return copy.deepcopy(cache)
+        runs: list[dict] = []
+        for directory in _run_dirs(include_archived):
+            if not directory.is_dir():
+                continue
+            for f in sorted(directory.glob("*.json")):
+                run = _read_json(f, None)
+                if isinstance(run, dict):
+                    runs.append(run)
+        revision = _run_dirs_revision(include_archived)
+        if include_archived:
+            _runs_cache = runs
+            _runs_cache_at = time.monotonic()
+            _runs_cache_revision = revision
+        else:
+            _runs_live_cache = runs
+            _runs_live_cache_at = time.monotonic()
+            _runs_live_cache_revision = revision
+        return copy.deepcopy(runs)
+
+
+def _run_dirs_revision(include_archived: bool) -> tuple:
+    """Cheap fingerprint of the run files (name, size, mtime)."""
+    parts: list[tuple] = []
+    try:
+        for directory in _run_dirs(include_archived):
+            if not directory.is_dir():
+                continue
+            for f in sorted(directory.glob("*.json")):
+                stat = f.stat()
+                parts.append((f.name, stat.st_size, stat.st_mtime_ns))
+    except OSError:
+        return ()
+    return tuple(parts)
+
+
+def _run_dirs(include_archived: bool = False) -> list[Path]:
+    """Live queue directory first; the archive only when explicitly asked."""
+    dirs = [RUNS_DIR]
+    if include_archived:
+        dirs.append(RUNS_ARCHIVE_DIR)
+    return dirs
+
+
+def _invalidate_runs_cache() -> None:
+    """Drop both run-list caches. Callers must hold ``_lock``."""
+    global _runs_cache, _runs_cache_at, _runs_live_cache, _runs_live_cache_at
+    _runs_cache = None
+    _runs_cache_at = 0.0
+    _runs_live_cache = None
+    _runs_live_cache_at = 0.0
+
+
+def list_run_summaries() -> list[dict]:
+    """Live runs with only the fields the claim scan needs.
+
+    Parsing 26 KB of JSON per historical run is what made an idle worker burn
+    the backend's CPU; the claim path only compares ``status`` /
+    ``created_at`` / ``lease_until``.  Archived (terminal) runs are skipped
+    entirely — nothing in the live queue can be claimed from them.
+    """
+    summaries: list[dict] = []
     if not RUNS_DIR.is_dir():
-        _runs_cache = []
-        _runs_cache_at = now
-        return []
-    runs = []
+        return summaries
     for f in sorted(RUNS_DIR.glob("*.json")):
         run = _read_json(f, None)
-        if isinstance(run, dict):
-            runs.append(run)
-    _runs_cache = runs
-    _runs_cache_at = time.monotonic()
-    return copy.deepcopy(runs)
+        if not isinstance(run, dict):
+            continue
+        summaries.append({key: run.get(key) for key in _RUN_SUMMARY_FIELDS})
+    return summaries
+
+
+def archive_run_file(run_id: str) -> bool:
+    """Move a finished run out of the live queue directory.
+
+    Keeps the record (the UI can still load it by id) while taking it out of
+    the per-poll directory listing.  Safe to call repeatedly.
+    """
+    source = RUNS_DIR / f"{run_id}.json"
+    if not source.is_file():
+        return False
+    try:
+        RUNS_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+        destination = RUNS_ARCHIVE_DIR / source.name
+        if destination.exists():
+            destination.unlink()
+        source.replace(destination)
+    except OSError:
+        return False
+    with _lock:
+        _invalidate_runs_cache()
+    return True
 
 
 def get_run(run_id: str) -> dict | None:
-    return _read_json(RUNS_DIR / f"{run_id}.json", None)
+    """Load one run by id from the live queue, falling back to the archive."""
+    run = _read_json(RUNS_DIR / f"{run_id}.json", None)
+    if isinstance(run, dict):
+        return run
+    return _read_json(RUNS_ARCHIVE_DIR / f"{run_id}.json", None)
+
+
+def _write_run_record(run: dict) -> None:
+    """Persist a run, keeping finished ones out of the live queue directory.
+
+    Callers must hold ``_lock``.  Terminal runs are archived so every
+    completion path (worker complete/fail, dispatch, API status writes, the
+    supersede branch) stops contributing to the claim scan without each site
+    having to remember.  A run that leaves a terminal state is pulled back
+    into the live queue.
+    """
+    run_id = str(run.get("id") or "")
+    _write_json(RUNS_DIR / f"{run_id}.json", run)
+    if not run_id:
+        return
+    if run.get("status") in _TERMINAL_RUN_STATUSES:
+        try:
+            RUNS_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+            live = RUNS_DIR / f"{run_id}.json"
+            if live.is_file():
+                live.replace(RUNS_ARCHIVE_DIR / f"{run_id}.json")
+        except OSError:
+            pass
+    else:
+        # Re-queued after a re-run: drop the stale archived copy so the run
+        # is not listed twice.
+        stale = RUNS_ARCHIVE_DIR / f"{run_id}.json"
+        try:
+            if stale.is_file():
+                stale.unlink()
+        except OSError:
+            pass
 
 
 def save_run(run: dict) -> None:
-    global _runs_cache, _runs_cache_at
+    """Write a run, keeping finished runs out of the live queue directory."""
     with _lock:
-        _write_json(RUNS_DIR / f"{run.get('id')}.json", run)
-        _runs_cache = None
-        _runs_cache_at = 0.0
+        _write_run_record(run)
+        _invalidate_runs_cache()
 
 
 def update_run_if_owned(
@@ -1231,7 +1468,6 @@ def update_run_if_owned(
     mutator: Callable[[dict], None],
 ) -> dict | None:
     """Atomically mutate a running job only for its current lease owner."""
-    global _runs_cache, _runs_cache_at
     with _lock:
         path = RUNS_DIR / f"{run_id}.json"
         run = _read_json(path, None)
@@ -1242,9 +1478,10 @@ def update_run_if_owned(
                 or run.get("lease_token") != lease_token):
             return None
         mutator(run)
-        _write_json(path, run)
-        _runs_cache = None
-        _runs_cache_at = 0.0
+        # The mutator may mark the run completed/failed; archiving happens in
+        # the shared writer so this path stays in sync with save_run.
+        _write_run_record(run)
+        _invalidate_runs_cache()
         return run
 
 
@@ -1265,7 +1502,6 @@ def save_run_if_absent(
     ``workflow_revision`` 时，queued/running 仍视为占用，completed 则
     允许第一次迁移到带版本的幂等记录。
     """
-    global _runs_cache, _runs_cache_at
     with _lock:
         revision = run.get("workflow_revision")
         for existing in list_runs():
@@ -1280,23 +1516,21 @@ def save_run_if_absent(
                 existing["status"] = "superseded"
                 existing["finished_at"] = utcnow_iso()
                 existing["error_log"] = "Superseded by a newer upload or reprocess request"
-                _write_json(RUNS_DIR / f"{existing.get('id')}.json", existing)
-                _runs_cache = None
-                _runs_cache_at = 0.0
+                _write_run_record(existing)
+                _invalidate_runs_cache()
                 continue
             if same_revision or legacy_active:
                 if existing.get("status") in ("queued", "running"):
                     return existing, False
                 if existing.get("status") == "completed" and not allow_completed_rerun:
                     return existing, False
-        _write_json(RUNS_DIR / f"{run.get('id')}.json", run)
-        _runs_cache = None
-        _runs_cache_at = 0.0
+        _write_run_record(run)
+        _invalidate_runs_cache()
         return run, True
 
 
 def delete_run(run_id: str) -> None:
-    global _runs_cache, _runs_cache_at
+    """Remove a run from the live queue and from the archive."""
     _remove_json(RUNS_DIR / f"{run_id}.json")
-    _runs_cache = None
-    _runs_cache_at = 0.0
+    _remove_json(RUNS_ARCHIVE_DIR / f"{run_id}.json")
+    _invalidate_runs_cache()

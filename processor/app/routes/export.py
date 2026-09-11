@@ -362,8 +362,15 @@ def _workflow_export_version(episode_id: str) -> str | None:
 
 
 @router.get("/episode-format/{episode_id}")
-async def episode_export_format(episode_id: str):
-    """前端按钮徽标:该批次下载时实际返回的格式。"""
+def episode_export_format(episode_id: str):
+    """前端按钮徽标:该批次下载时实际返回的格式。
+
+    同步端点(FastAPI 丢线程池执行)。以前写成 ``async def`` 却调
+    :func:`_episode_export_target` —— 那里读历史 run 快照 + 逐个 ``is_file()``
+    全是远程阻塞 I/O,在事件循环上跑会把同一次开页的其它请求一起冻住:
+    实测该接口冷调用 4.4s,期间 hand-3d / slam / tactile 全部排队,这正是
+    "打开一条数据时而 2 秒时而 7 秒"的来源。
+    """
     if get_episode(episode_id) is None:
         raise HTTPException(status_code=404, detail="Episode not found")
     target = _episode_export_target(episode_id)

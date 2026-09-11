@@ -489,6 +489,37 @@ async def _process_upload_job(
             is_depth_source, iter_video_streams, normalize_extracted_dataset,
         )
         normalize_extracted_dataset(staging_dir, batch_name)
+
+        # ── 内容级重复检测(与包名无关)──
+        # 采集端可能把已上传过的录制换个包名再推一次(本地去重标记丢失 /
+        # 包名规则变化),此时上面的 incoming_name 判断不出来,同一份数据
+        # 会被追加成新批次。用规范化后的内容指纹兜底:命中已有批次就按
+        # 同名重传处理,覆盖原批次而不是新增一条重复数据。
+        # 算不出指纹时返回 None,一律按新批次正常入库。
+        try:
+            from app.batch_fingerprint import (
+                compute_fingerprint, lookup_duplicate,
+            )
+            content_fingerprint = compute_fingerprint(staging_dir)
+            duplicate_of = lookup_duplicate(
+                project_folder, content_fingerprint, existing_ids)
+        except Exception as fingerprint_err:
+            content_fingerprint = None
+            duplicate_of = None
+            print(f"[Upload] Fingerprint skipped: {fingerprint_err}")
+        if duplicate_of and duplicate_of != batch_name:
+            print(
+                f"[Upload] Duplicate content of {duplicate_of} "
+                f"(incoming name {incoming_name!r}) → replacing that episode"
+            )
+            batch_name = duplicate_of
+            is_reupload = True
+            batch_preexisted = True
+            # staging 目录名只是本地上传中转名,append_project_episode 以
+            # batch_name 参数为准,无需跟着改名。
+            old_state = read_episode_state(batch_name)
+            old_annotations = list_annotations(batch_name)
+
         info = _read_json(staging_dir / "meta" / "info.json")
         if not isinstance(info, dict):
             info = {}
@@ -573,6 +604,13 @@ async def _process_upload_job(
         )
         write_episode_state(batch_name, new_state)
         save_annotations(batch_name, [])
+        # 指纹只在批次真正提交后记录:失败的上传不该占住一个内容身份,
+        # 否则重试时会被判成"重复"而覆盖掉自己。
+        try:
+            from app.batch_fingerprint import record_fingerprint
+            record_fingerprint(project_folder, content_fingerprint, batch_name)
+        except Exception as fingerprint_err:
+            print(f"[Upload] Fingerprint record skipped: {fingerprint_err}")
         # A new upload or a same-name re-upload changes files/cameras, not
         # just review state.  Force the next session scan to discover the new
         # structure before a workflow or review request can use stale streams.

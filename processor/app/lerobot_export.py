@@ -129,9 +129,11 @@ def _write_stats(output_dir: Path,
         if not np.isfinite(num).any():
             continue
         q = _quantiles(num)
+        # 只写数值统计量。不要再加 dtype/shape 之类的元数据字段:官方
+        # 加载器会把 stats 里的每一项都转成张量做归一化,字符串字段直接
+        # 崩在 torch.from_numpy(np.ndarray of type numpy.str_)。官方数据集
+        # 的 stats 也只有 min/max/mean/std/count。
         stats[col] = {
-            "dtype": "float32" if np.issubdtype(s.dtype, np.floating) else "int64",
-            "shape": [1],
             "mean": float(np.nanmean(num)),
             "std": float(np.nanstd(num)),
             "min": float(np.nanmin(num)),
@@ -268,7 +270,22 @@ def _write_stats(output_dir: Path,
                 }
                 continue
 
-            samples: list = []
+            # 增量累积:全部集的采样帧若一次性留在内存里会爆 —— 960×1280
+            # 的一帧 float32 是 14.75MB,34 集 × 约 200 采样帧 ≈ 100GB。
+            # 这里只保留跑动统计量(min/max/和/平方和/计数)与一个固定大小的
+            # 分位数蓄水池,内存与集数无关。
+            ch_sum = np.zeros(channels, dtype=np.float64)
+            ch_sq = np.zeros(channels, dtype=np.float64)
+            ch_min = np.full(channels, np.inf, dtype=np.float64)
+            ch_max = np.full(channels, -np.inf, dtype=np.float64)
+            pixel_count = 0
+            # 蓄水池上限与每帧贡献:分位数只需近似,但样本必须**跨帧、跨集**
+            # 均匀铺开 —— 只取前几帧会让分位数偏向最早的那一集。每帧按固定
+            # 步长抽约 1200 个像素,800 万像素上限可覆盖数千帧。
+            reservoir_cap = 8_000_000
+            per_frame_budget = 1200
+            taken = 0
+            reservoir: list = []
             for vpath in videos:
                 cap = cv2.VideoCapture(str(vpath))
                 if not cap.isOpened():
@@ -283,25 +300,44 @@ def _write_stats(output_dir: Path,
                     if not ok:
                         break
                     if read_idx % step == 0 and frame.ndim == 3:
-                        samples.append(frame.astype(np.float32)[..., :channels] / 255.0)
+                        # 先按步长抽样再转 float:一帧 960×1280 有 120 万像素,
+                        # 对整帧做 astype(float32)/255 是这一步的主要开销,
+                        # 而统计只需要千级样本。抽样后再运算快约三个数量级。
+                        flat_u8 = frame[..., :channels].reshape(-1, channels)
+                        stride_u8 = max(1, flat_u8.shape[0] // per_frame_budget)
+                        flat = (flat_u8[::stride_u8].astype(np.float32) / 255.0)
+                        ch_sum += flat.sum(axis=0, dtype=np.float64)
+                        ch_sq += np.square(flat, dtype=np.float64).sum(axis=0)
+                        ch_min = np.minimum(ch_min, flat.min(axis=0))
+                        ch_max = np.maximum(ch_max, flat.max(axis=0))
+                        pixel_count += flat.shape[0]
+                        if taken < reservoir_cap:
+                            # flat 已是抽样结果,直接入池
+                            take = min(reservoir_cap - taken, flat.shape[0])
+                            reservoir.append(flat[:take].copy())
+                            taken += take
                     read_idx += 1
                 cap.release()
-            if not samples:
+            if not pixel_count:
                 continue
-            stack = np.stack(samples)  # (T, H, W, C)
-            per_channel = stack.reshape(-1, stack.shape[-1])
             def _nested(vals):
                 return [[[float(v)] for v in vals]]
-            q = np.percentile(per_channel, [1, 10, 50, 90, 99], axis=0)
+            mean = ch_sum / pixel_count
+            var = np.maximum(ch_sq / pixel_count - mean * mean, 0.0)
+            pooled = np.concatenate(reservoir, axis=0) if reservoir else None
+            if pooled is not None and pooled.shape[0]:
+                q = np.percentile(pooled, [1, 10, 50, 90, 99], axis=0)
+            else:
+                q = np.stack([mean] * 5)
             stats[vkey] = {
-                "min": _nested(per_channel.min(axis=0)),
-                "max": _nested(per_channel.max(axis=0)),
-                "mean": _nested(per_channel.mean(axis=0)),
-                "std": _nested(per_channel.std(axis=0)),
+                "min": _nested(ch_min),
+                "max": _nested(ch_max),
+                "mean": _nested(mean),
+                "std": _nested(np.sqrt(var)),
                 "q01": _nested(q[0]), "q10": _nested(q[1]),
                 "q50": _nested(q[2]), "q90": _nested(q[3]),
                 "q99": _nested(q[4]),
-                "count": [int(per_channel.shape[0] * per_channel.shape[1])],
+                "count": [int(pixel_count)],
             }
     except Exception:
         pass
@@ -686,8 +722,14 @@ _TACTILE_COLUMN_MAP = {
 
 
 def _read_sensor_rows(session_dir: Path,
-                      episode_id: str | None = None) -> dict[int, dict]:
-    """Merge independently stored glove/action parquet rows by frame_index."""
+                      episode_id: str | None = None,
+                      skip_columns: set[str] | None = None) -> dict[int, dict]:
+    """Merge independently stored glove/action parquet rows by frame_index.
+
+    ``skip_columns``: 调用方已排除的列。这些列在读取阶段就被跳过 ——
+    触觉力矩阵每帧 0.8MB,整集 14MB,在 SSHFS 上读完要十几秒;既然最终
+    不会写进数据集,就不该读。仅按列名裁剪,不改变任何保留列的值。
+    """
     rows: dict[int, dict] = {}
     try:
         import pyarrow.parquet as pq
@@ -705,7 +747,13 @@ def _read_sensor_rows(session_dir: Path,
                     and path.name != f"episode_{episode_index:06d}.parquet"):
                 continue
             try:
-                table = pq.read_table(path)
+                if skip_columns:
+                    # 先读 schema(只读 footer,便宜),再只取需要的列。
+                    available = [str(n) for n in pq.read_schema(path).names]
+                    wanted = [n for n in available if n not in skip_columns]
+                    table = pq.read_table(path, columns=wanted)
+                else:
+                    table = pq.read_table(path)
                 names = table.schema.names
                 if "frame_index" not in names:
                     continue
@@ -1059,16 +1107,221 @@ def _passthrough_dtype(key: str, sensor_rows: dict[int, dict]) -> str:
     return "float32"
 
 
+def _write_video_dense_keyframes(source: Path, destination: Path) -> None:
+    """把视频写入数据集,必要时重编码以加密关键帧。
+
+    采集端用 ffmpeg 默认设置编码(GOP=250),10 秒的集只有 2 个关键帧
+    (0s 和 8.3s)。lerobot 按时间戳取帧时先 seek 到关键帧再向前解码,当
+    查询点紧邻下一个关键帧时 seek 会落到**目标之后**,该帧永远取不到,
+    训练直接抛 FrameTimestampError(实测 7 个采样点里坏 2 个)。
+
+    GOP=30(每秒一个关键帧)可让 seek 稳定落在目标之前,实测 7/7 全通过;
+    代价是文件约大 2 倍(2.7MB -> 5.7MB/集)。
+
+    编码失败(缺 ffmpeg、编码器不可用)时退回原样复制:宁可保留稀疏关键帧
+    也不要让整个导出失败 —— 取不到的帧会让那条样本报错,而不是产出错数据。
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(source),
+             "-c:v", "libx264", "-g", "30", "-pix_fmt", "yuv420p",
+             "-crf", "20", "-preset", "veryfast", str(destination)],
+            capture_output=True, timeout=300)
+        if result.returncode == 0 and destination.is_file() and destination.stat().st_size:
+            return
+    except (OSError, subprocess.SubprocessError):
+        pass
+    shutil.copy2(source, destination)
+
+
+def _ensure_observation_state(rows: list[dict]) -> str | None:
+    """确保每帧有 ``observation.state``;缺失时由 UMI 列派生。
+
+    ACT 的 VAE 编码器无条件读取 ``batch[observation.state]``
+    (modeling_act.py 里那句 ``device=batch[OBS_STATE].device`` 没做
+    robot_state_feature 判空),缺这列直接 KeyError。即便抛开这个上游
+    问题,单帧观测的 ACT 也需要 proprioception 才知道夹爪在哪。
+
+    派生口径 ``[Δx, Δy, Δz, gripper]``:位置是本帧相对**本集第一帧**的
+    偏移。SLAM 的世界原点是每次采集初始化时任意确定的,直接喂绝对坐标
+    等于把无关的世界位置当特征。夹爪取开合度 0–1。
+
+    已有 observation.state 时不动(尊重上游的显式声明)。返回派生列名或
+    None。
+    """
+    import numpy as np
+
+    if any("observation.state" in row for row in rows):
+        return None
+    if not any("observation.slam_pose" in row for row in rows):
+        return None
+
+    # 按 episode_index 分组:相对偏移必须在**各自集内**计算,跨集求差
+    # 会把两集世界原点的差异当成运动。
+    by_episode: dict[int, list[dict]] = {}
+    for row in rows:
+        try:
+            episode = int(row.get("episode_index", 0))
+        except (TypeError, ValueError):
+            episode = 0
+        by_episode.setdefault(episode, []).append(row)
+
+    derived = 0
+    for episode_rows in by_episode.values():
+        origin = None
+        for row in episode_rows:
+            pose = row.get("observation.slam_pose")
+            try:
+                pose_values = np.asarray(pose, dtype=float).reshape(-1)
+            except (TypeError, ValueError):
+                continue
+            if pose_values.size < 3 or not np.isfinite(pose_values[:3]).all():
+                continue
+            if origin is None:
+                origin = pose_values[:3].copy()
+            gripper = 0.0
+            raw = row.get("observation.gripper_state")
+            try:
+                gripper_values = np.asarray(raw, dtype=float).reshape(-1)
+                if gripper_values.size:
+                    gripper = float(np.clip(gripper_values[0] / 100.0, 0.0, 1.0))
+            except (TypeError, ValueError):
+                pass
+            row["observation.state"] = [
+                float(value) for value in np.concatenate([
+                    pose_values[:3] - origin, [gripper]])
+            ]
+            derived += 1
+    if not derived:
+        return None
+    print(f"[lerobot_export] derived observation.state for {derived} frames")
+    return "observation.state"
+
+
+def _ensure_slam_pose(rows: list[dict]) -> str | None:
+    """确保每帧有 ``observation.slam_pose``;缺失时由 ``slam_trajectory`` 重建。
+
+    采集端从 52 集起不再写 ``observation.slam_pose``,只写高频样本缓冲
+    ``observation.slam_trajectory``(旧批两列都有)。ACT 的输入特征里声明了
+    slam_pose,整列缺失会让官方加载器与策略直接 KeyError —— 这批数据因此
+    完全无法训练或评估。
+
+    重建口径见 ``app.umi_slam_action.poses_from_trajectory``(与派生 action
+    用的是同一个函数)。拿旧集(有 slam_pose)做过对照:位置相关系数
+    0.998~0.9999、逐帧位置差 std 仅 1~4mm(亚帧采样差),数值范围完全一致,
+    四元数 |dot| 中位 1.0000 —— **同一个物理量、同一个世界系**,不是近似。
+    重建版反而补上了采集端留的 28.5% 零填充行,质量更好。
+
+    起点偏移的口径与 ``_ensure_observation_state`` 一致,故两者可以串联:本
+    函数先跑,缺 state 的集还能继续从重建出的 slam_pose 派生 state。
+
+    已有该列时不动(旧批重导行为完全不变)。返回写入的列名或 None。
+    """
+    import numpy as np
+
+    if any("observation.slam_pose" in row for row in rows):
+        return None
+    if not any("observation.slam_trajectory" in row for row in rows):
+        return None
+
+    from app.umi_slam_action import poses_from_trajectory
+
+    # 按 episode_index 分组:时间基映射是每集单独拟合的(各集 SLAM 会话
+    # 独立),跨集混在一起会把不同集的时间基搅乱,重建出的位姿全错。
+    by_episode: dict[int, list[dict]] = {}
+    for row in rows:
+        try:
+            episode = int(row.get("episode_index", 0))
+        except (TypeError, ValueError):
+            episode = 0
+        by_episode.setdefault(episode, []).append(row)
+
+    written = 0
+    for episode_rows in by_episode.values():
+        count = len(episode_rows)
+        trajectories = [row.get("observation.slam_trajectory")
+                        for row in episode_rows]
+        # 时间戳必须是稠密 float 数组:缺帧补 NaN(poses_from_trajectory 会
+        # 把它们标为缺失再插值),混进 None 会让 np.asarray 推断出 object。
+        stamps = np.full(count, np.nan, dtype=float)
+        for index, row in enumerate(episode_rows):
+            try:
+                stamps[index] = float(row.get("timestamp"))
+            except (TypeError, ValueError):
+                continue
+        poses = poses_from_trajectory(trajectories, stamps, count)
+        if poses is None:
+            continue
+        for row, pose in zip(episode_rows, poses):
+            row["observation.slam_pose"] = [float(value) for value in pose]
+            written += 1
+    if not written:
+        return None
+    print(f"[lerobot_export] derived observation.slam_pose for {written} frames")
+    return "observation.slam_pose"
+
+
+def _pad_sparse_matrix_columns(rows: list[dict], nan_fill: float) -> dict[str, int]:
+    """定长矩阵/trajectory 列的空帧补齐到声明长度。
+
+    采集端在尚无数据的帧上写空数组(如触觉矩阵首帧、SLAM 丢帧时的
+    trajectory),同一列因此长短不一。官方加载器按声明的 shape 转成定长
+    Sequence,遇到空值直接 cast 失败:
+        TypeError: Couldn't cast array of type list<element: int64>
+                   to List(Value('int64'), length=187500)
+
+    只补空值,不动有值帧 —— 缺失语义由列本身的值域表达。
+
+    返回 ``{列名: 补齐后的长度}``:features 声明必须用这个长度,而不是
+    首帧样本的长度 —— 首帧常常正是空的那一帧,拿它声明会得到 shape [0],
+    与实际写入的长度不符,加载器照样 cast 失败。
+    """
+    import numpy as np
+    targets: dict[str, int] = {}
+    for key in {k for row in rows for k in row}:
+        if not (key.endswith("_matrix") or key.endswith("_trajectory")):
+            continue
+        target = 0
+        sample_value = None
+        for row in rows:
+            value = row.get(key)
+            if isinstance(value, (list, tuple)) and len(value) > target:
+                target = len(value)
+                sample_value = value
+        if not target or not sample_value:
+            continue
+        targets[key] = target
+        # 补齐值的类型必须与该列已有元素**逐位一致**:触觉矩阵是 int16
+        # (声明 int64),补浮点会让 pyarrow 把整列推断成 double,与声明的
+        # dtype 冲突 → 加载器 cast 失败。int 列补 0,浮点列补 nan_fill。
+        existing = next((v for v in sample_value if v is not None), None)
+        if isinstance(existing, (int, np.integer)) and not isinstance(existing, bool):
+            fill = 0
+        else:
+            fill = nan_fill
+        for row in rows:
+            value = row.get(key)
+            if not isinstance(value, (list, tuple)) or len(value) == target:
+                continue
+            row[key] = list(value) + [fill] * (target - len(value))
+    return targets
+
+
 def _pad_variable_columns(rows: list[dict],
-                          nan_fill: float = float("nan")) -> int:
-    """IMU 变长列固定长度化(官方加载器不支持变长:list<int64> 对声明
-    int64[1] 实测 cast 失败)。返回补齐后的每帧样本数 cap。
+                          nan_fill: float = float("nan")) -> tuple[int, dict[str, int]]:
+    """变长/稀疏列固定长度化。返回 ``(imu_cap, {列名: 补齐长度})``。
 
     - observation.imu:每样本 6 维 → 展平为 cap*6(nan_fill 补尾)
     - observation.imu_ts_ns:补 0 到 cap
-    无 IMU 列时返回 3(不影响任何声明)。
+    - 矩阵/trajectory 类的空帧:补齐到该列最大长度
+      (见 _pad_sparse_matrix_columns)
+
+    第二个返回值供 features 声明使用 —— 声明必须等于**实际写入的长度**,
+    否则官方加载器 cast 失败。
     """
     import numpy as np
+    matrix_targets = _pad_sparse_matrix_columns(rows, nan_fill)
     imu_cap = 3
     for row in rows:
         for key in ("observation.imu", "observation.imu_ts_ns"):
@@ -1076,7 +1329,7 @@ def _pad_variable_columns(rows: list[dict],
             if isinstance(value, (list, tuple)):
                 imu_cap = max(imu_cap, len(value))
     if not any("observation.imu" in row for row in rows):
-        return imu_cap
+        return imu_cap, matrix_targets
     for row in rows:
         imu = row.get("observation.imu")
         if isinstance(imu, (list, tuple)):
@@ -1100,7 +1353,7 @@ def _pad_variable_columns(rows: list[dict],
         if isinstance(ts, (list, tuple)):
             row["observation.imu_ts_ns"] = (
                 [int(v) for v in ts] + [0] * (imu_cap - len(ts)))[:imu_cap]
-    return imu_cap
+    return imu_cap, matrix_targets
 
 
 def _propagated_hand_sets(source_row: dict) -> tuple[set[str], set[str], dict[str, set[str]]]:
@@ -1662,8 +1915,14 @@ def build_lerobot_dataset(dataset_name: str, episode_ids: list[str], output_dir:
                           hand_3d_right_paths: list[str] | None = None,
                           version: str = "v3.0",
                           hand_3d_unit: str | None = None,
+                          exclude_columns: list[str] | None = None,
                           progress_callback=None) -> Path:
     """Build a LeRobot dataset (``version`` = "v2.1" | "v3.0").
+
+    ``exclude_columns``: 可选,精确列名列表,从数据集中整体剔除。
+    用于丢掉训练用不到但体积/计算代价极高的列(如 250×250×3 的触觉
+    力矩阵:每帧 0.8MB,且逐元素分位数统计是导出耗时的主要来源)。
+    被剔除的列不会出现在 parquet、features 声明和 stats 里。
 
     Depth sources are exported as their preview video (``is_depth_map``)
     plus the per-frame ``observation.depth.<source>.valid`` marker; the
@@ -1749,7 +2008,9 @@ def build_lerobot_dataset(dataset_name: str, episode_ids: list[str], output_dir:
         # 本集实际导出的每路视频(帧数, fps) → episodes parquet 的
         # videos/<key>/from_timestamp 映射(官方 v3 加载器按时间戳定位帧)
         episode_video_meta: dict[str, tuple[int, float]] = {}
-        sensor_rows = _read_sensor_rows(session_dir, episode_id)
+        sensor_rows = _read_sensor_rows(
+            session_dir, episode_id,
+            skip_columns=set(str(name) for name in exclude_columns or []))
         annotation_map, annotation_defs, _skipped_candidates = _annotation_maps(episode_id)
 
         description = str(episode.get("project") or "").strip()
@@ -1791,7 +2052,7 @@ def build_lerobot_dataset(dataset_name: str, episode_ids: list[str], output_dir:
                                / f"observation.images.{source_key}")
                 output_video = destination / f"file-{out_episode_index:03d}.mp4"
             destination.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, output_video)
+            _write_video_dense_keyframes(source, output_video)
             total_videos += 1
             probed_count, probed_fps, width, height = _probe_video(source)
             episode_video_meta[f"observation.images.{source_key}"] = (
@@ -2025,10 +2286,33 @@ def build_lerobot_dataset(dataset_name: str, episode_ids: list[str], output_dir:
             except Exception:
                 pass  # 进度回调失败不影响导出本身
 
+    # 调用方指定剔除的列(如触觉力矩阵):在补齐/统计/写盘之前删掉,
+    # 这样 parquet、features 声明与 stats 三处天然一致,不需要各自过滤。
+    if exclude_columns:
+        dropped = set(str(name) for name in exclude_columns)
+        if dropped:
+            for row in rows:
+                for key in dropped:
+                    row.pop(key, None)
+            print(f"[lerobot_export] excluded columns: {sorted(dropped)}")
+
+    # SLAM 位姿列:采集端 52 集起只写 slam_trajectory,不再写 slam_pose。
+    # 必须赶在 _pad_variable_columns 之前做 —— 补齐会把冲空帧填成 0,而
+    # 0 在 slam_trajectory 里是一个"合法样本"(t=0 的位姿),重建时会被
+    # 当成真实帧混进去。此处补出的 slam_pose 又是下面 observation.state
+    # 的派生依据,故顺序不能颠倒。
+    _ensure_slam_pose(rows)
+
+    # ACT 的观测需要 proprioception:单帧图像不足以让模型知道夹爪当前
+    # 在哪。数据集若已有 observation.state 则原样保留;否则在 UMI 会话上
+    # 由 SLAM 位姿 + 夹爪开合派生 [Δx, Δy, Δz, gripper](位置为相对本集
+    # 起点的偏移 —— SLAM 世界原点是每集任意初始化的,绝对坐标是噪声)。
+    _ensure_observation_state(rows)
+
     # 变长异步传感器列固定长度化:官方加载器不支持变长列(实测
     # list<int64> 对声明 int64[1] 直接 cast 失败)。取全数据集最大
     # 样本数补齐,声明 shape 同步为固定长度,变长语义保留在 note。
-    imu_cap = _pad_variable_columns(
+    imu_cap, padded_lengths = _pad_variable_columns(
         rows, nan_fill=0.0 if is_v2 else float("nan"))
 
     # 收敛:删恒定哨兵垃圾列(全程 NaN/-1/0/空串 → 数据从未写入)。
@@ -2301,6 +2585,11 @@ def build_lerobot_dataset(dataset_name: str, episode_ids: list[str], output_dir:
             import numpy as np
             arr = np.asarray(value)
             shape = list(arr.shape) if arr.ndim else [1]
+            # 补齐过的列必须以实际写入的长度声明。首帧样本往往正是空的那
+            # 一帧(触觉矩阵首帧、SLAM 丢帧),照它声明会得到 shape [0] 或
+            # 偏小的长度,与实际写入的数据不符 → 官方加载器 cast 失败。
+            if key in padded_lengths:
+                shape = [padded_lengths[key]]
             if key in ("observation.tactile.left", "observation.tactile.right"):
                 features[key] = {
                     "dtype": "float32", "shape": [256],
@@ -2341,6 +2630,33 @@ def build_lerobot_dataset(dataset_name: str, episode_ids: list[str], output_dir:
                                  "shape": shape}
     if junk_cols:
         features = {k: v for k, v in features.items() if k not in junk_cols}
+    # 调用方剔除的列同样从声明里去掉。features 由 sensor_rows 样本推导,
+    # 而剔除只作用于 rows,不过滤这里会留下"声明了但数据里没有"的列,
+    # 官方加载器读不出来会报错。
+    if exclude_columns:
+        excluded = set(str(name) for name in exclude_columns)
+        features = {k: v for k, v in features.items() if k not in excluded}
+    # 导出的行里有 observation.state 就必须声明,否则官方加载器读不完整。
+    # 声明放在剔除之后:调用方显式排除的列不该被这里复活。
+    # 补出来的 slam_pose 同样必须声明:features 是从**源 parquet** 采样的
+    # (sensor_rows),而这列由 _ensure_slam_pose 在内存里写进 rows,采样
+    # 看不到它 —— 不补声明就是"数据里有列、声明里没有",官方加载器读不完整。
+    if rows and "observation.slam_pose" in rows[0] and "observation.slam_pose" not in features:
+        features["observation.slam_pose"] = {
+            "dtype": "float32", "shape": [7],
+            "names": ["x", "y", "z", "qx", "qy", "qz", "qw"],
+            "note": ("世界系绝对位姿(米 + 四元数 xyzw)。采集端 52 集起不再"
+                     "写入该列,导出时由 observation.slam_trajectory 的 50Hz"
+                     "样本重建(与采集端原始列实测位置相关 0.998+,同一世界系)。"),
+        }
+    if rows and "observation.state" in rows[0] and "observation.state" not in features:
+        features["observation.state"] = {
+            "dtype": "float32", "shape": [4],
+            "names": ["delta_x", "delta_y", "delta_z", "gripper"],
+            "note": ("proprioception:本帧位置相对**本集第一帧**的偏移(米)"
+                     "+ 夹爪开合(0–1)。SLAM 世界原点是每集任意初始化的,"
+                     "故用相对量而非绝对坐标。"),
+        }
     # 深度有效帧标记列(行循环写入,不声明会导致官方加载器读不完整)
     for depth_key in sorted(depth_source_keys):
         key = f"observation.depth.{depth_key}.valid"

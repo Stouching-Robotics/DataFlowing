@@ -57,6 +57,21 @@ _TACTILE_FORCE_COLUMNS = {
     "left": "observation.gripper_left_force",
     "right": "observation.gripper_right_force",
 }
+# Colour-scale anchors for the force heatmaps.  The range is measured over the
+# whole episode, never per frame: a frame with no contact holds nothing above
+# the noise threshold but noise, so a per-frame range collapses onto that noise
+# and stretches every blip to the top of the colour ramp - the tile lights up
+# with red dots that read as real pressure.  ``lo`` is the episode's median
+# valid pressure (its noise floor; anything at or below renders as background)
+# and ``hi`` its peak plus headroom.
+_TACTILE_NOISE_FLOOR_MN = 0.01
+_TACTILE_RANGE_BASELINE_PERCENTILE = 50.0
+_TACTILE_RANGE_PEAK_PERCENTILE = 99.9
+_TACTILE_RANGE_HEADROOM = 1.3
+_TACTILE_RANGE_MIN_SPAN_MN = 0.5
+_TACTILE_RANGE_SAMPLE_FRAMES = 256
+_TACTILE_SCALE_CACHE: OrderedDict[tuple, tuple[float, float]] = OrderedDict()
+_TACTILE_SCALE_CACHE_MAX = 8
 # Sequential decode is cheap, but decoding through more than this many
 # frames to reach a scrub target is not; jump via a seek reader instead.
 _DEPTH_WINDOW_SEEK_GAP = 6
@@ -276,7 +291,17 @@ def _read_gripper_state(value) -> list[float] | None:
 
 
 def _read_slam_rows(path: Path) -> tuple[str, list[dict]]:
-    """Read canonical ``observation.slam_pose`` rows once per parquet revision."""
+    """Read canonical SLAM rows once per parquet revision.
+
+    位姿有两个来源,取决于采集端版本:
+
+    - 旧版写 ``observation.slam_pose``(每帧一个 7 维位姿);
+    - 新版只写 ``observation.slam_trajectory``(高频样本缓冲),没有
+      ``slam_pose``。此时前端曾经整块空白 —— 因为这里硬编码读后者。
+
+    两条路径统一成每帧一个位姿:trajectory 交给 ``poses_from_trajectory``
+    重建(它已按时间戳取最近样本,丢帧时也能从相邻格子找回)。
+    """
     import numpy as np
     import pandas as pd
 
@@ -290,23 +315,45 @@ def _read_slam_rows(path: Path) -> tuple[str, list[dict]]:
     cached = _SLAM_DATA_CACHE.get(cache_key)
     if cached is not None and cached[0] == revision:
         return cached
-    columns = ["frame_index", "timestamp", "observation.slam_pose"]
-    has_gripper_state = False
+
     try:
         import pyarrow.parquet as pq
         available_columns = set(pq.ParquetFile(path).schema_arrow.names)
-        has_gripper_state = "observation.gripper_state" in available_columns
     except Exception:
-        pass
-    if has_gripper_state:
+        return revision, []
+
+    has_pose = "observation.slam_pose" in available_columns
+    has_trajectory = "observation.slam_trajectory" in available_columns
+    if not has_pose and not has_trajectory:
+        return revision, []
+
+    columns = ["frame_index", "timestamp"]
+    if has_pose:
+        columns.append("observation.slam_pose")
+    if has_trajectory:
+        columns.append("observation.slam_trajectory")
+    if "observation.gripper_state" in available_columns:
         columns.append("observation.gripper_state")
     try:
         df = pd.read_parquet(path, columns=columns, engine="pyarrow")
     except Exception:
         return revision, []
 
+    # 新版只有 trajectory:重建出逐帧位姿,让下游按同一套逻辑消费。
+    rebuilt = None
+    if not has_pose:
+        from app.umi_slam_action import poses_from_trajectory
+        stamps = (df["timestamp"].to_numpy(dtype=float)
+                  if "timestamp" in df.columns else None)
+        if stamps is None:
+            stamps = np.arange(len(df), dtype=float) / 30.0
+        rebuilt = poses_from_trajectory(
+            df["observation.slam_trajectory"].tolist(), stamps, len(df))
+        if rebuilt is None:
+            return revision, []
+
     rows: list[dict] = []
-    for _, row in df.iterrows():
+    for position, (_, row) in enumerate(df.iterrows()):
         try:
             frame = int(row.get("frame_index", len(rows)))
         except (TypeError, ValueError):
@@ -316,11 +363,16 @@ def _read_slam_rows(path: Path) -> tuple[str, list[dict]]:
             timestamp = float(timestamp) if np.isfinite(float(timestamp)) else None
         except (TypeError, ValueError):
             timestamp = None
-        pose = row.get("observation.slam_pose")
-        try:
-            values = np.asarray(pose, dtype=np.float64).reshape(-1)
-        except (TypeError, ValueError):
-            values = np.empty(0, dtype=np.float64)
+        if has_pose:
+            pose = row.get("observation.slam_pose")
+            try:
+                values = np.asarray(pose, dtype=np.float64).reshape(-1)
+            except (TypeError, ValueError):
+                values = np.empty(0, dtype=np.float64)
+        else:
+            # 已从 trajectory 重建,按位置对齐取本帧位姿
+            values = (rebuilt[position] if position < len(rebuilt)
+                      else np.empty(0, dtype=np.float64))
 
         # A missing native SLAM sample is represented by an all-zero pose in
         # some recordings.  It is not the same thing as a valid pose at the
@@ -337,7 +389,7 @@ def _read_slam_rows(path: Path) -> tuple[str, list[dict]]:
             "p": [float(value) for value in values[:7]],
             "t": timestamp,
             "g": _read_gripper_state(row.get("observation.gripper_state"))
-            if has_gripper_state else None,
+            if "observation.gripper_state" in available_columns else None,
         })
     rows.sort(key=lambda item: item["f"])
 
@@ -424,6 +476,53 @@ def _read_tactile_force_series(path: Path) -> dict | None:
         return None
 
 
+def _tactile_scale_factor(path: Path) -> float:
+    """Read ``features.*.scale`` for the force matrix from dataset metadata.
+
+    Newer recorders store the matrix as quantised integers scaled by 100
+    (``"scale": 100`` alongside ``units: mN``), so the raw values must be
+    divided by that factor to recover mN.  Older recordings omit the field and
+    already store plain mN, so the default is 1.
+
+    The factor is read from metadata rather than hard-coded because the
+    recordings genuinely differ; assuming 100 would divide old data by 100.
+    """
+    try:
+        import json
+        # parquet 位于 <root>/data/chunk-000/,info.json 位于 <root>/meta/。
+        # 逐级上溯找 meta/info.json,避免依赖固定的目录深度。
+        root = Path(path).parent
+        for candidate in (root, *root.parents):
+            meta = candidate / "meta" / "info.json"
+            if meta.is_file():
+                info = json.loads(meta.read_text(encoding="utf-8"))
+                break
+        else:
+            return 1.0
+    except (OSError, ValueError, TypeError):
+        return 1.0
+    features = info.get("features") or {}
+    for key in _TACTILE_COLUMNS.values():
+        entry = features.get(key)
+        if not isinstance(entry, dict):
+            continue
+        try:
+            factor = float(entry.get("scale"))
+        except (TypeError, ValueError):
+            continue
+        # 0/负数会让整块力值失真,视为未声明。
+        if factor > 0:
+            return factor
+    return 1.0
+
+
+def _apply_tactile_scale(matrix, factor: float):
+    """把量化整数还原成物理单位(mN);factor<=1 时不做任何改动。"""
+    if matrix is None or not factor or factor <= 1:
+        return matrix
+    return matrix / factor
+
+
 def _decode_tactile_matrix(value):
     """Decode one canonical 250x250x3 row-diff force matrix to mN.
 
@@ -432,8 +531,9 @@ def _decode_tactile_matrix(value):
     prefix sum must run over the full 750-value row before reshaping back to
     HWC.  Splitting H/W/C first and accumulating each channel independently
     produces a different matrix and was the cause of the incorrect preview.
-    The int16 cast is intentional: the recorder's contract is modulo-2^16 and
-    the final values are integer mN.
+    The int16 cast is intentional: the recorder's contract is modulo-2^16.
+    Values are quantised integers in ``units: mN``; the physical scale is
+    applied by callers via ``_tactile_scale_factor``.
     """
     import numpy as np
 
@@ -464,6 +564,73 @@ def _decode_tactile_matrix(value):
     if decoded.shape[0] == 1:
         decoded = decoded.repeat(3, axis=0)
     return decoded
+
+
+def _compute_tactile_display_range(path: Path, column: str) -> tuple[float, float]:
+    """Sample a whole episode and return its ``(lo, hi)`` colour range in mN.
+
+    Every stored frame shares one row group, so reading the column costs the
+    same as reading any slice of it; the sampling stride bounds the decode and
+    the pooled sample, not the I/O.
+    """
+    import cv2
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    try:
+        table = pq.read_table(path, columns=[column])
+    except Exception:
+        return 0.0, 1.0
+    column_data = table.column(column)
+    if isinstance(column_data, pa.ChunkedArray):
+        column_data = column_data.combine_chunks()
+    offsets = np.asarray(column_data.offsets, dtype=np.int64)
+    values = np.asarray(column_data.values, dtype=np.int16)
+    frames = len(offsets) - 1
+    if frames <= 0:
+        return 0.0, 1.0
+    stride = max(1, frames // _TACTILE_RANGE_SAMPLE_FRAMES)
+    scale_factor = _tactile_scale_factor(path)
+    samples: list[np.ndarray] = []
+    for index in range(0, frames, stride):
+        matrix = _apply_tactile_scale(
+            _decode_tactile_matrix(values[offsets[index]:offsets[index + 1]]),
+            scale_factor)
+        if matrix is None:
+            continue
+        pressure = cv2.GaussianBlur(np.maximum(matrix[2], 0.0), (3, 3), 0.8)
+        valid = pressure[pressure > _TACTILE_NOISE_FLOOR_MN]
+        if valid.size:
+            samples.append(valid)
+    if not samples:
+        return 0.0, 1.0
+    pooled = np.concatenate(samples)
+    lo = float(np.percentile(pooled, _TACTILE_RANGE_BASELINE_PERCENTILE))
+    hi = max(float(np.percentile(pooled, _TACTILE_RANGE_PEAK_PERCENTILE))
+             * _TACTILE_RANGE_HEADROOM, lo + _TACTILE_RANGE_MIN_SPAN_MN)
+    return lo, hi
+
+
+def _tactile_display_range(path: Path, revision: str,
+                           side: str) -> tuple[float, float]:
+    """Return the cached episode-wide colour range ``(lo, hi)`` for one side."""
+    column = _TACTILE_COLUMNS.get(side)
+    if column is None:
+        return 0.0, 1.0
+    key = (str(path.resolve()), revision, side)
+    with _TACTILE_PREVIEW_LOCK:
+        cached = _TACTILE_SCALE_CACHE.get(key)
+        if cached is not None:
+            _TACTILE_SCALE_CACHE.move_to_end(key)
+            return cached
+    result = _compute_tactile_display_range(path, column)
+    with _TACTILE_PREVIEW_LOCK:
+        _TACTILE_SCALE_CACHE[key] = result
+        _TACTILE_SCALE_CACHE.move_to_end(key)
+        while len(_TACTILE_SCALE_CACHE) > _TACTILE_SCALE_CACHE_MAX:
+            _TACTILE_SCALE_CACHE.popitem(last=False)
+    return result
 
 
 def _read_tactile_frame(path: Path, frame_index: int, side: str):
@@ -504,7 +671,7 @@ def _read_tactile_frame(path: Path, frame_index: int, side: str):
                 # making the UI show a broken image.
                 if decoded is None:
                     return np.zeros((3, *_TACTILE_SHAPE), dtype=np.float32)
-                return decoded
+                return _apply_tactile_scale(decoded, _tactile_scale_factor(path))
     except Exception:
         return None
     return None
@@ -516,8 +683,8 @@ def _tactile_force_field(
     """Return one smoothed fz pressure field as float32 bytes.
 
     The payload is numeric data, not a rendered image.  The frontend applies
-    the color map in WebGL2.  ``lo``/``hi`` preserve the acquisition-side
-    per-frame contrast normalization without sending a rendered image.
+    the color map in WebGL2.  ``lo``/``hi`` are the episode-wide contrast
+    range, so the same mN value maps to the same colour in every frame.
     """
     import cv2
     import numpy as np
@@ -545,12 +712,7 @@ def _tactile_force_field(
     # pressure visualization.
     pressure = np.maximum(matrix[2], 0.0)
     pressure = cv2.GaussianBlur(pressure, (3, 3), 0.8)
-    valid = pressure[pressure > 0.01]
-    lo = 0.0
-    hi = 1.0
-    if valid.size > 50:
-        lo = float(np.percentile(valid, 10))
-        hi = max(float(np.percentile(valid, 98)) * 1.3, lo + 0.5)
+    lo, hi = _tactile_display_range(path, f"{revision[0]:x}-{revision[1]:x}", side)
     field = np.ascontiguousarray(pressure, dtype="<f4")
     result = (field.tobytes(), lo, hi)
     with _TACTILE_PREVIEW_LOCK:
@@ -567,11 +729,12 @@ _TACTILE_RANGE_CACHE_MAX = 24
 
 def _tactile_range_payload(path: Path, first: int, last: int,
                            side: str) -> bytes | None:
-    """Encode a run of consecutive fz fields as R8 plus per-frame min/max.
+    """Encode a run of consecutive fz fields as R8 plus the episode's min/max.
 
     Body layout: ``frames * 250 * 250`` bytes of R8 (one byte per cell, row
     major) followed by ``frames * 2`` little-endian float32 values holding
-    each frame's ``lo``/``hi`` normalisation pair.  One request per window
+    each frame's ``lo``/``hi`` normalisation pair - the episode-wide range,
+    repeated once per frame so the header count stays fixed.  One request per window
     replaces one 250 KB request per frame, which is what saturated the
     browser's socket buffers (net::ERR_NO_BUFFER_SPACE) during playback.
     """
@@ -616,20 +779,19 @@ def _tactile_range_payload(path: Path, first: int, last: int,
     pixels = _TACTILE_SHAPE[0] * _TACTILE_SHAPE[1]
     blocks: list[bytes] = []
     pairs: list[float] = []
+    # 量化整数先还原成 mN;色阶取整集区间,不逐帧重算,否则没有接触的帧会
+    # 拿自身噪声当满量程,把噪点画成接触点。
+    scale_factor = _tactile_scale_factor(path)
+    lo, hi = _tactile_display_range(path, revision, side)
     for frame in range(int(first), int(last)):
-        matrix = _decode_tactile_matrix(rows.get(frame))
+        matrix = _apply_tactile_scale(_decode_tactile_matrix(rows.get(frame)),
+                                      scale_factor)
         if matrix is None:
             blocks.append(bytes(pixels))
-            pairs.extend((0.0, 1.0))
+            pairs.extend((lo, hi))
             continue
         pressure = np.maximum(matrix[2], 0.0)
         pressure = cv2.GaussianBlur(pressure, (3, 3), 0.8)
-        valid = pressure[pressure > 0.01]
-        lo = 0.0
-        hi = 1.0
-        if valid.size > 50:
-            lo = float(np.percentile(valid, 10))
-            hi = max(float(np.percentile(valid, 98)) * 1.3, lo + 0.5)
         scaled = np.clip((pressure - lo) / (hi - lo + 1e-6), 0.0, 1.0)
         blocks.append(np.rint(scaled * 255.0).astype(np.uint8).tobytes())
         pairs.extend((lo, hi))

@@ -21,9 +21,20 @@ class LeRobotExportModule(ProcessingModule):
     color = EXPORT_COLOR
     inputs = ({"key": "data", "label": "Exportable Data"},)
     outputs = ({"key": "dataset", "label": "Dataset"},)
-    default_config = {"version": "v3.0", "split_ratio": 0.9, "shard_size": 100000}
+    # 默认排除 UMI 触觉力矩阵:每帧 250×250×3(187500 个整数),实测占
+    # canonical parquet 体积的九成以上,且 99.99% 是零 —— 训练用不到,
+    # 却让单集导出从 2.5 秒涨到 57 秒(写盘 + 逐元素统计 + 结果包上传),
+    # 结果 zip 也从几 MB 涨到几十 MB。要保留就把它从配置里删掉。
+    _DEFAULT_EXCLUDE = ",".join((
+        "observation.gripper_left_force_matrix",
+        "observation.gripper_right_force_matrix",
+    ))
+    default_config = {"version": "v3.0", "split_ratio": 0.9,
+                      "shard_size": 100000, "exclude_columns": _DEFAULT_EXCLUDE}
     config_schema = (
         field("version", "select", "Version", "v3.0", options=["v2.1", "v3.0"]),
+        field("exclude_columns", "string", "Exclude columns (comma separated)",
+              _DEFAULT_EXCLUDE),
     )
     execution_target = "worker"
     capabilities = ("dataset_export", "lerobot")
@@ -80,6 +91,12 @@ class LeRobotExportModule(ProcessingModule):
             None)
         # 数据集先输出到 worker 临时目录，API 完成阶段会把导出产品放到
         # state/exports，不在项目根目录新增 processed/。
+        # 排除列:配置里逗号分隔。留空 = 全量导出(旧行为)。
+        exclude_columns = [
+            name.strip() for name
+            in str(ctx.config.get("exclude_columns", "") or "").split(",")
+            if name.strip()
+        ]
         dataset_dir = build_lerobot_dataset(episode_id, [episode_id],
                                             ctx.output_root, split_ratio,
                                             include_video_keys=include_video_keys,
@@ -87,7 +104,8 @@ class LeRobotExportModule(ProcessingModule):
                                             hand_3d_paths=hand_3d_paths,
                                             hand_3d_right_paths=hand_3d_right_paths,
                                             version=version,
-                                            hand_3d_unit=hand_3d_unit)
+                                            hand_3d_unit=hand_3d_unit,
+                                            exclude_columns=exclude_columns)
         info = dataset_dir / "meta" / "info.json"
         if not info.exists():
             ctx.skip("Dataset build produced no meta/info.json")

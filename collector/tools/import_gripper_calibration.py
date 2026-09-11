@@ -1,17 +1,24 @@
-"""接入新夹爪：把上位机生成的 per-serial 标定搬进 core/gripper/native/。
+"""接入新夹爪：备好 per-serial 标定文件。
 
-collector 不生成夹爪标定，只按现场探到的产品序列号拼文件名去找：
+collector 按现场探到的产品序列号拼文件名去找这两个文件：
 
     core/gripper/native/gripper_version1/fays_config/fays_vikit_<serial>.yaml
     core/gripper/native/dist/fays_opencv48/s80m_<serial>_stereo_inertial.yaml
 
-序列号没出现过的夹爪（没这两个文件）必须先在上位机跑 device_setup /
-标定生成它们，再用本脚本搬过来并校验。序列号本身不用手填也能拿：
---detect 现场读一次（需先关闭主程序的夹爪，否则撞 SDK 初始化锁）。
+主程序现在**自己会生成**（夹爪插上发现缺文件就地调厂商导出程序读出厂标定，
+见 core/gripper/calibration.py），所以常规接入无需本脚本。本脚本留着用于：
+
+  * `--generate`：手工强制重新读取（换夹爪模组/怀疑标定被写坏时）；
+  * 搬运：从别的机器（上位机）把已生成的标定拷进来（无设备在手时）。
+
+出厂标定是**逐设备**的（`Camera1.fx/fy/cx/cy`、`Stereo.b`、`IMU.T_b_c1`
+逐台不同），绝不能跨设备抄。序列号不用手填也能拿：--detect 现场读一次
+（需先关闭主程序的夹爪，否则撞 SDK 初始化锁）。
 
 用法:
     venv/bin/python tools/import_gripper_calibration.py --list
     venv/bin/python tools/import_gripper_calibration.py --detect
+    venv/bin/python tools/import_gripper_calibration.py --generate [序列号]
     venv/bin/python tools/import_gripper_calibration.py 3500000262300099
     venv/bin/python tools/import_gripper_calibration.py 3500000262300099 \
         --source /path/to/online [--force] [--dry-run]
@@ -20,8 +27,8 @@ collector 不生成夹爪标定，只按现场探到的产品序列号拼文件�
 上位机产物目录、或同时含两个 yaml 的任意目录。同名目标已存在且内容
 不同时必须加 --force，旧文件先备份成 *.bak_<时间戳>。
 
-注意：native/ 不入库（见 .gitignore），搬进来的标定只存在本机；
-换机器/重装要重新搬一次。
+注意：native/ 不入库（见 .gitignore），标定只存在本机；换机器/重装要
+重新生成或重新搬一次。
 """
 
 from __future__ import annotations
@@ -241,13 +248,87 @@ def _cmd_import(serial, source_root, *, force, dry_run):
     return 0
 
 
+def _backup_existing(serial):
+    """重生成前把既有标定挪成 .bak_<时间戳>（生成失败也不至于毁掉可用的那份）。"""
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    for path in _target_paths(serial):
+        if os.path.isfile(path):
+            backup = f"{path}.bak_{stamp}"
+            shutil.copy2(path, backup)
+            print(f"  旧文件已备份  {backup}")
+
+
+def _cmd_generate(serial, *, dry_run):
+    """就地读这只夹爪的厂商出厂标定并写进 native/（不经过上位机）。"""
+    if serial is not None and not _SERIAL_PATTERN.match(serial):
+        print(f"序列号格式不合法: {serial!r}")
+        return 2
+    from core.gripper import calibration
+    from core.gripper.fays_runtime import (
+        build_fays_probe_env,
+        discover_fays_device_groups,
+    )
+    from core.gripper.fays_serial_probe import probe_product_serial
+
+    groups = discover_fays_device_groups()
+    if not groups:
+        print("未发现完整的 Fays S80M（检查 USB3 是否插好）")
+        return 1
+    print(f"发现 {len(groups)} 台完整 S80M，逐台读取产品序列号"
+          "（主程序的夹爪请先关闭，标定要独占设备）:")
+    target = None
+    for group in groups:
+        ports = group["ports"]
+        try:
+            probed = probe_product_serial(
+                ports, environment=build_fays_probe_env())
+        except Exception as exc:      # 探针失败不影响其他设备
+            print(f"  {group['physical_usb_path']}  {ports}  探测失败: {exc}")
+            continue
+        mark = ""
+        if serial is None or probed == serial:
+            mark = "  ← 选中"
+            target = target or (probed, ports)
+        print(f"  {group['physical_usb_path']}  {ports}  serial={probed}{mark}")
+
+    if target is None:
+        if serial is None:
+            print("未能读到任何一台夹爪的产品序列号")
+        else:
+            print(f"没找到序列号 {serial} 的夹爪")
+        return 1
+
+    probed, ports = target
+    print(f"\n序列号 {probed}")
+    print(f"  stereo: {ports['stereo_dev_port']}")
+    print(f"  imu   : {ports['imu_dev_port']}")
+    if dry_run:
+        print("\n[dry-run] 将读取该设备的出厂标定并写入 native/，未执行")
+        return 0
+
+    _backup_existing(probed)
+    print("正在读取厂商出厂标定（独占设备，约需数秒）…")
+    result = calibration.generate_fays_calibration(
+        probed, ports, logger=lambda text: print(f"  {text}"))
+
+    resolved_sdk, resolved_orb = paths.per_device_fays_yamls(probed)
+    print("\n已生成:")
+    print(f"  原始 dump: {result['calibration_yaml']}")
+    print(f"  SDK YAML : {resolved_sdk}")
+    print(f"  ORB YAML : {resolved_orb}")
+    print("提醒: native/ 不入库，这些标定只存在本机；换机器要重新生成。")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="把上位机生成的 Fays per-serial 标定搬进 core/gripper/native/",
+        description="备好 Fays per-serial 标定（就地生成 或 从别处搬运）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "serial", nargs="?", help="Fays 产品序列号（如 3500000262300099）")
+        "serial", nargs="?",
+        help="Fays 产品序列号（如 3500000262300099）；"
+             "--generate 时可省略，省略则用现场唯一那台")
     parser.add_argument(
         "--source", default=_DEFAULT_SOURCE,
         help=f"上位机根目录（缺省 {_DEFAULT_SOURCE}）")
@@ -256,6 +337,10 @@ def main(argv=None):
     parser.add_argument(
         "--detect", action="store_true",
         help="现场探测插着的 Fays 序列号（需关闭主程序夹爪）")
+    parser.add_argument(
+        "--generate", action="store_true",
+        help="就地读取这只夹爪的厂商出厂标定并写入 native/"
+             "（需关闭主程序夹爪；会先备份既有标定）")
     parser.add_argument(
         "--force", action="store_true",
         help="目标已存在且内容不同时覆盖（旧文件备份成 *.bak_<时间戳>）")
@@ -267,8 +352,14 @@ def main(argv=None):
         return _cmd_list()
     if args.detect:
         return _cmd_detect()
+    if args.generate:
+        try:
+            return _cmd_generate(args.serial, dry_run=args.dry_run)
+        except RuntimeError as exc:
+            print(f"失败: {exc}")
+            return 1
     if not args.serial:
-        parser.error("需要序列号，或 --list / --detect")
+        parser.error("需要序列号，或 --list / --detect / --generate")
     try:
         return _cmd_import(
             args.serial, os.path.abspath(args.source),

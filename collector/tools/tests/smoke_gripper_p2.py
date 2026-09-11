@@ -33,7 +33,7 @@ def main():
             print(f"[RGB] #{stats['rgb']} {frame.shape} hw={hw_ns}",
                   flush=True)
 
-    def on_tactile(side, heatmap, force, matrix):
+    def on_tactile(side, heatmap, force, matrix, capture_ns):
         key = "tactile_l" if side == "left" else "tactile_r"
         stats[key] += 1
         stats[f"last_force_{side[0]}"] = force

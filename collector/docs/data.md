@@ -291,6 +291,52 @@ data/recordings/                          # 录制根目录（settings.RECORDING
   `episode_index`、`task_index`、`start_frame_index`、`end_frame_index`、
   `length`（均为 int64）。
 
+### 4.5.1 UMI 夹爪列与跨模态时间对齐
+
+启用夹爪时 episode parquet 增加下列稀疏列（无样本的行填 0/空）：
+
+| 列 | 类型 | 含义 |
+|---|---|---|
+| `observation.gripper_{left,right}_force` | list<float32, 3> | 3 向量力 `[fx,fy,fz]` mN |
+| `observation.gripper_{left,right}_force_ns` | int64 | 该力样本的采集时刻 |
+| `observation.gripper_{left,right}_force_matrix` | list<int16> / list<float32> | 250×250×3 力矩阵（档位见下） |
+| `observation.gripper_{left,right}_force_matrix_ns` | int64 | 该力矩阵样本的采集时刻 |
+| `observation.slam_trajectory` | list<double> | 轨迹点 `[t,x,y,z,qx,qy,qz,qw]`×N，变长 |
+| `observation.gripper_state` | list<float32, 3> | `[open_pct, gripped, fz_mn]` |
+
+力矩阵档位记在**每段一份**的 `meta/episodes` 行（`force_matrix_specs` 列），
+不按面值猜——同一任务换档时前一段的倍率不会被后一段顶掉。
+
+**为什么需要 `_ns` 列。** 同一行里的 RGB 帧和力样本**不是同时刻采集的**，
+两条支路各走各的路：RGB 走外部帧源队列，写线程每 tick 取**队头最旧帧**；
+力/矩阵走 latest-wins 单槽，写线程取到的是**当下最新**样本。于是「行号相同」
+≠「时刻相同」——力恒领先 RGB，领先量等于那张 RGB 帧在队列里的滞留时间，
+且随录制时长增长（RGB 源实测 30.84 fps vs 写线程 30 fps，约每秒多积 1 帧）。
+力矩阵还走独立泵线程，与 3 向量力之间也各记各的时刻，所以两者不共用一列。
+
+v1.3.3 起每行落盘两条支路各自的采集时刻（宿主单调钟纳秒，与 `hardware_ns`
+同一时基），下游按时间取最近邻即可还原真实配对：
+
+```bash
+venv/bin/python scripts/align_modalities.py <episode.parquet> --residual
+```
+
+```python
+from align_modalities import align_episode
+mapping, residual_ns = align_episode("episode-000.parquet", side="left")
+# mapping[k] = 视频第 k 帧应对应的 parquet 行号
+```
+
+- 对齐精度上界是**半个力样本间隔**，不是半个行周期。`force_ns == 0` 表示
+  「本行窗口内没有新样本」（**不是**时刻为 0，取最近邻时必须排除，否则会把
+  一批帧吸到第 0 行）。样本每 k 行才有一个时上界放宽到 k/2 个行周期。
+- 早于第一个力样本的帧（段首陈旧帧，见 `rgb-prestart-frames`）与晚于最后
+  一个样本的帧在时间上没有对应样本，只能夹到端点——**这不是对齐结果**，
+  脚本单列「越界帧」计数，下游应丢弃。
+- **v1.3.3 之前录的 episode 无法这样对齐**：那时力侧完全没有时间戳，RGB 侧
+  的 `hardware_ns` 还被 `pyqtSignal(int)` 截成 32 位（每 2.147 s 翻符号）。
+  脚本对这类 episode 明确报「无法对齐」而不是拿行号或增长率去猜。
+
 ### 4.6 `meta/info.json` 字段概览（LeRobot v3 兼容，上传服务器严格依赖）
 
 | 键 | 含义 |

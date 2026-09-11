@@ -15,7 +15,7 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QTreeWidget, QTreeWidgetItem,
-    QInputDialog, QAbstractItemView,
+    QInputDialog, QAbstractItemView, QMenu,
 )
 
 from config import settings
@@ -36,6 +36,8 @@ class DevicePanel(QWidget):
 
     device_toggled = pyqtSignal(object, bool)   # (DeviceInfo, checked)
     device_renamed = pyqtSignal(object, str)    # (DeviceInfo, new_name)
+    # 右键菜单：重新读取这只夹爪的厂商出厂标定（DeviceInfo）
+    gripper_recalibration_requested = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -59,6 +61,8 @@ class DevicePanel(QWidget):
             lambda item: self._record_expansion(item, True))
         self._tree.itemCollapsed.connect(
             lambda item: self._record_expansion(item, False))
+        self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._on_context_menu)
         layout.addWidget(self._tree, 1)
 
         self._refresh_hint = QLabel(tr("双击设备可重命名"))
@@ -72,6 +76,8 @@ class DevicePanel(QWidget):
                                 "gripper": True,
                                 "other_ble": False}   # 组展开状态（重建保留）
         self._locked = False              # 录制中锁死开关
+        self._has_gripper = False         # 有夹爪时才提示右键菜单
+        self._refresh_hint_text()
 
     # ── 对外接口 ─────────────────────────────────────
 
@@ -87,11 +93,15 @@ class DevicePanel(QWidget):
             placeholder.setFlags(Qt.NoItemFlags)
             self._tree.addTopLevelItem(placeholder)
             self._tree.blockSignals(False)
+            self._has_gripper = False
+            self._refresh_hint_text()
             return
 
         by_group: dict = {}
         for dev in devices:
             by_group.setdefault(dev.group, []).append(dev)
+        self._has_gripper = bool(by_group.get("gripper"))
+        self._refresh_hint_text()
 
         for group in _GROUP_ORDER:
             devs = by_group.get(group, [])
@@ -192,7 +202,7 @@ class DevicePanel(QWidget):
     def refresh_texts(self):
         """语言切换刷新提示文字、组标题与占位项。"""
         self._hint.setText(tr("开关设备以显示画面"))
-        self._refresh_hint.setText(tr("双击设备可重命名"))
+        self._refresh_hint_text()
         self._tree.blockSignals(True)
         for i in range(self._tree.topLevelItemCount()):
             item = self._tree.topLevelItem(i)
@@ -204,6 +214,31 @@ class DevicePanel(QWidget):
         self._tree.blockSignals(False)
 
     # ── 内部 ─────────────────────────────────────────
+
+    def _refresh_hint_text(self):
+        """底部提示：夹爪在场时才提右键菜单（别的设备没有这个菜单）。"""
+        text = tr("双击设备可重命名")
+        if self._has_gripper:
+            text += tr("；右键夹爪可重读取出厂标定")
+        self._refresh_hint.setText(text)
+
+    def _on_context_menu(self, pos):
+        """夹爪条目右键 → 「重新读取出厂标定」。"""
+        item = self._tree.itemAt(pos)
+        if item is None:
+            return
+        dev = item.data(0, Qt.UserRole)
+        if dev is None or isinstance(dev, tuple):
+            return                       # 组标题 / 占位项
+        if dev.group != "gripper":
+            return
+        # 标定要独占设备，录制中不给入口（与 set_locked 的灰显口径一致）
+        menu = QMenu(self)
+        action = menu.addAction(tr("重新读取出厂标定"))
+        action.setEnabled(not self._locked)
+        chosen = menu.exec_(self._tree.viewport().mapToGlobal(pos))
+        if chosen is action and not self._locked:
+            self.gripper_recalibration_requested.emit(dev)
 
     def _row_text(self, dev) -> str:
         icon = _ICON.get(dev.kind, "📹")

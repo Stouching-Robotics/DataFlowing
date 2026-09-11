@@ -643,7 +643,12 @@ class EgoDataWriter(QObject):
                        gripper_state [open_pct, gripped, fz_mn]
                        gripper_{left,right}_force [fx,fy,fz] mN
                        gripper_{left,right}_force_matrix 力矩阵变长
-                       列表（P4 泵线程预编码，无新样本不写键）。元素
+                       列表（P4 泵线程预编码，无新样本不写键）
+                       gripper_{left,right}_force_ns /
+                       gripper_{left,right}_force_matrix_ns int64 采集
+                       时刻（宿主单调钟纳秒，与 hardware_ns 同时基；
+                       矩阵与 3 向量力来自不同落盘路径故各记各的）。
+                       元素
                        类型只能区分「家族」，**倍率要另看 info.json
                        features.scale**：
                          int   = int16 行差分量化（250×750 展平，cumsum
@@ -725,7 +730,12 @@ class EgoDataWriter(QObject):
         for key, value in (gripper or {}).items():
             if value is None:
                 continue
-            if key.endswith("_force_matrix"):
+            if key.endswith("_ns"):
+                # 采集时刻列（int64 宿主单调钟纳秒，与 hardware_ns 同时基）。
+                # 后缀判定必须排在 _force_matrix/_force 之前：`_force_matrix_ns`
+                # 不以 `_force_matrix` 结尾只是巧合，靠顺序防止以后改后缀踩雷。
+                row[f"observation.{key}"] = int(value)
+            elif key.endswith("_force_matrix"):
                 row[f"observation.{key}"] = value
                 self._note_matrix_dtype(key, value)
             elif key.endswith("slam_trajectory"):
@@ -909,7 +919,11 @@ class EgoDataWriter(QObject):
         # 后者类型按本 episode 实际规格：int16 行差分 / float32 原值）
         for key in sorted(self._present_gripper):
             name = f"observation.{key}"
-            if key.endswith("_force_matrix"):
+            if key.endswith("_ns"):
+                # 采集时刻（缺失帧填 0 = 未知，与 hardware_ns 的 0 约定一致）
+                cols[name] = pa.array(
+                    [int(r.get(name, 0)) for r in rows], pa.int64())
+            elif key.endswith("_force_matrix"):
                 item = (pa.float32() if self._matrix_dtype.get(key) == "float32"
                         else pa.int16())
                 cols[name] = pa.array(
@@ -1041,7 +1055,13 @@ class EgoDataWriter(QObject):
         # 这里不重写一遍以免两处漂移）
         matrix_features = self._force_matrix_features()
         for key in sorted(self._present_gripper):
-            if key.endswith("_force_matrix"):
+            if key.endswith("_ns"):
+                # 采集时刻：宿主单调钟纳秒，与 hardware_ns 同一时基。
+                # 下游按此把力样本重采样到 RGB 帧时刻（见 docs/data.md）。
+                features[f"observation.{key}"] = {
+                    "dtype": "int64", "shape": [1],
+                    "encoding": "host_monotonic_ns"}
+            elif key.endswith("_force_matrix"):
                 features[f"observation.{key}"] = matrix_features[
                     f"observation.{key}"]
             elif key.endswith("slam_trajectory"):

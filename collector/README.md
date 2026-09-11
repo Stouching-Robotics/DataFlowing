@@ -1,6 +1,6 @@
 # collector — Multimodal Data Acquisition SDK · 多模态数据采集 SDK
 
-![Version](https://img.shields.io/badge/version-1.3.2-blue)
+![Version](https://img.shields.io/badge/version-1.3.4-blue)
 ![Python](https://img.shields.io/badge/python-3.12-blue)
 ![License](https://img.shields.io/badge/license-TBD-lightgrey)
 
@@ -361,6 +361,60 @@ are documented in [docs/index.md](docs/index.md#开发约定).
 
 ### Changelog
 
+- **v1.3.4** — a newly plugged-in gripper now generates its own runtime
+  calibration and connects, with no manual step. Previously onboarding a new
+  Fays S80M took two manual steps — click `device_setup` on the gripper's host
+  PC, then run `tools/import_gripper_calibration.py` on the capture machine —
+  and missing either one made the app refuse to start ("current Fays is missing
+  runtime calibration files … please run device_setup on the gripper host PC").
+  Now `SingleFaysLease.acquire()` finds the per-serial YAMLs missing and, under
+  the device lock, runs the vendor exporter to read the factory calibration off
+  **this gripper itself**, producing both the SDK YAML (port fields rewritten)
+  and the ORB YAML (fisheye `stereoRectify` for P1/R1, IMU extrinsics
+  `T_b_c1`, plus the five noise/rate fields from the IMU probe), then re-checks
+  the on-disk paths and connects. Grippers that already have calibration take
+  an `isfile` fast path — zero extra startup cost, no device access. These two
+  files are **per-device** factory calibration and cannot be copied between
+  units (098 and 099 differ in all three groups), so they can only be read in
+  place. Also adds a right-click "re-read factory calibration" entry on gripper
+  rows in the device panel (disabled while recording; the gripper is closed
+  first and reopened afterwards), and a `--generate` mode for
+  `tools/import_gripper_calibration.py` (existing files are backed up to
+  `.bak_<timestamp>`) for forced regeneration from the command line. Along the
+  way, fixes the provenance comment on line 3 of the generated ORB YAML — the
+  vendor template hard-codes `3500000261870088`, so copying it would record
+  every new gripper's IMU extrinsics as "taken from another unit"; it now names
+  this unit's serial (existing artifacts left untouched). Follows v1.3.3's
+  force-matrix / tactile-force timestamp alignment.
+- **v1.3.3** — force-matrix / tactile-force timestamps are now recorded and
+  aligned to the RGB video. **The force side never had a timestamp at all**:
+  within a row, the RGB frame and the force sample are not captured at the
+  same instant — RGB takes the *oldest* frame off an external source queue
+  while force/matrix take the *newest* sample from a latest-wins slot, so
+  "same row index" ≠ "same instant". Force always leads RGB, and the lead
+  grows with recording time (RGB source at 30.84 fps vs the 30 fps writer,
+  measured ≈1 frame/s — this is where the 3-frame lag seen downstream comes
+  from); the force matrix runs on its own pump thread and keeps its own
+  instant from the 3-vector force. The fix makes every row self-describing:
+  `tactile_ready` gains a fifth `capture_ns` payload taken at the SDK
+  callback entry, and `pipeline.write_tactile_force/_force_matrix` persist
+  it as separate `observation.gripper_{side}_force_ns` /
+  `_force_matrix_ns` sparse int64 columns (same host-monotonic clock as
+  `hardware_ns`, declared as `encoding: host_monotonic_ns`), so downstream
+  can recover the true pairing by nearest-in-time lookup with a precision
+  bound of half a force-sample interval. Also fixed
+  `rgb_frame_ready`/`stereo_frame_ready`, where `pyqtSignal(int)` marshalled
+  `time.monotonic_ns()` through C++ `qint32` and silently truncated it to a
+  negative number that flipped sign every 2.147 s — now marshalled as
+  `object`. That truncation is also why un-wrapping `hardware_ns` used to
+  invent hundreds of frames of phantom drift and report "median 5.8 frames /
+  max ±80 frames" as misalignment (the real figure is ~3 frames; the correct
+  rule is **unsigned**: a monotonic clock consumed FIFO means true steps are
+  never negative). New `scripts/align_modalities.py` provides the
+  nearest-in-time alignment on the processing side and explicitly reports
+  "cannot align (must re-record)" for episodes recorded before v1.3.3 rather
+  than guessing from a growth rate. Follows v1.3.2's pre-ingest rejection of
+  stale SLAM frames and the trajectory deep-copy fix.
 - **v1.3.2** — stale SLAM frames (timestamp regression) are now rejected
   before they reach the core library: the bridge counts *consecutive*
   regressions, dropping single-frame glitches but rebasing after 30 — the
@@ -779,6 +833,42 @@ i18n 文案经 `tr()` 翻译、PyQt5 信号参数用 `object` 封送大整数、
 
 ### 更新记录
 
+- **v1.3.4** — 新夹爪接入即自动生成运行标定并连接，不再需要任何人工步骤。
+  此前接入一只新 Fays S80M 要人工两步——先在夹爪上位机点 `device_setup`、
+  再在采集机跑 `tools/import_gripper_calibration.py` 导入，漏掉任一步主程序
+  直接拒绝启动（「当前 Fays 缺少运行标定文件…请先在夹爪上位机中运行
+  device_setup」）。现在 `SingleFaysLease.acquire()` 发现 per-serial YAML
+  缺失时，就在设备锁内调厂商导出程序从**这只夹爪自身**读出厂标定，生成
+  SDK YAML（端口字段改写）与 ORB YAML（鱼眼 `stereoRectify` 求 P1/R1 +
+  IMU 外参 `T_b_c1` + 探针读五项噪声/频率），复核落盘路径后直接连上；已有
+  标定的夹爪走 `isfile` 快路径，启动零额外开销、不碰设备。这两个文件是
+  **逐设备**出厂标定，不可跨设备复用（实测 098/099 三组全不同），只能现场
+  读。同时给设备面板的夹爪条目加右键「重新读取出厂标定」（录制中禁用；
+  标定前自动关闭该夹爪、完成后开回），并给
+  `tools/import_gripper_calibration.py` 加 `--generate`（旧文件先备份
+  `.bak_<时间戳>`）供命令行强制重生成。顺带修掉生成产物 ORB YAML 第 3 行的
+  出处注释——厂商模板写死指向 `3500000261870088`，照抄会让每只新夹爪的 IMU
+  外参都被记成「取自另一台设备」，现改写成本机序列号（历史产物不动）。
+  承接 v1.3.3 的力矩阵/触觉力与 RGB 视频的时间戳对齐。
+- **v1.3.3** — 力矩阵/触觉力与 RGB 视频的时间戳对齐。**力侧此前完全没有
+  时间戳**：同一行里的 RGB 帧和力样本不是同时刻采集的——RGB 走外部帧源队列
+  取**队头最旧帧**、力/矩阵走 latest-wins 单槽取**当下最新**样本，于是
+  「行号相同」≠「时刻相同」；力恒领先 RGB，领先量随录制时长增长（RGB 源
+  30.84fps vs 写线程 30fps，实测约 1 帧/秒，下游观测到的滞后 3 帧即由此而来），
+  力矩阵还走独立泵线程、与 3 向量力各记各的时刻。修法是让每行自描述：
+  `tactile_ready` 加第 5 个载荷 `capture_ns`（在 SDK 回调入口取），
+  `pipeline.write_tactile_force/_force_matrix` 落成独立的
+  `observation.gripper_{side}_force_ns` / `_force_matrix_ns` 稀疏 int64 列
+  （与 `hardware_ns` 同宿主单调钟时基，features 里声明
+  `encoding: host_monotonic_ns`），下游按时间取最近邻即可还原真实配对，
+  精度上界 = 半个力样本间隔。顺带修 `rgb_frame_ready`/`stereo_frame_ready`
+  的 `pyqtSignal(int)` 把 `time.monotonic_ns()` 按 C++ qint32 **静默截断成
+  负数**（每 2.147s 翻符号），改 `object` 封送——这也解释了此前用
+  `hardware_ns` 解回卷时凭空造出上百帧假漂移、把「中位 5.8 帧 / 最大 ±80 帧」
+  报成对齐误差（真值是 ~3 帧，正确规则是**无符号**：单调钟 + FIFO 消费 ⇒
+  真步长恒非负）。新增 `scripts/align_modalities.py` 处理端最近邻对齐工具，
+  对 v1.3.3 之前录的 episode 明确报「无法对齐（只能重录）」而不用增长率去猜。
+  承接 v1.3.2 的 SLAM 陈旧帧入库前拦截与轨迹显示深拷贝修复。
 - **v1.3.2** — SLAM 陈旧帧（时间戳回退）改在入库前拦截：桥接按「连续回退
   次数」判定——单帧脏读丢弃、连丢 30 帧才判定时钟真跳变并换基准放行（此前
   每一帧回退都会让核心库清空 IMU 队并重建地图、位姿停发 0.2–1.34 s，静止时

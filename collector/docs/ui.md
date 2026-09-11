@@ -259,14 +259,17 @@
 | `_row_text` | `(dev) -> str` | 行文本 = 图标 + `label`（+ `— serial`） | — |
 | `_on_item_changed` | `(item, column)` | 勾选状态真正变化（用 `_last_check` 挡文字类变化与组标题）才发射 `device_toggled` | — |
 | `_on_item_double_clicked` | `(item, _column)` | 双击 → `QInputDialog` 命名 → `settings.save_device_name(dev.stable_key, name)` 持久化 → 更新行文本 + `device_renamed`；对话框打开期间列表可能已被 2s 轮询重建，必须用当前列表里的条目更新 | — |
+| `gripper_recalibration_requested`（信号） | `pyqtSignal(object)` | 夹爪条目右键选「重新读取出厂标定」（v1.3.4） | 由 `MainWindow` 连接 |
+| `_on_context_menu` | `(pos)` | `Qt.CustomContextMenu` 回调：仅 `dev.group == "gripper"` 且非组标题/占位项才弹单项菜单；`_locked`（录制中）时菜单项置灰；按 `chosen is action` 判等，只弹不选不发信号 | — |
+| `_refresh_hint_text` | `()` | 底部提示：有夹爪时追加「；右键夹爪可重读取出厂标定」 | 由 `refresh_texts` 调用 |
 
 **关键数据**：
 
 - `_ICON = {"uvc": "📹", "d435": "🔭", "s80m": "👁", "data_ble": "🧤", "ble": "🎧"}`；`_GROUP_ORDER = ["camera", "glove", "other_ble"]`；`_GROUP_TITLE` 对应中文组标题。
-- `_items`：device key → `QTreeWidgetItem`；`_last_check`：key → 上次勾选状态（防 `itemChanged` 误触发）；`_group_expanded`：组展开状态（初始 camera/glove 展开、other_ble 折叠）。
+- `_items`：device key → `QTreeWidgetItem`；`_last_check`：key → 上次勾选状态（防 `itemChanged` 误触发）；`_group_expanded`：组展开状态（初始 camera/glove 展开、other_ble 折叠）；`_has_gripper`：列表里是否有夹爪（决定底部提示是否提右键入口，两个分支都要更新，空设备分支需重置）。
 - 命名持久化：`config.settings.save_device_name`（device_names.json）。
 
-**调用关系**：由 `ui/main_window.py` 构造并连接 `device_toggled`/`device_renamed`；`tools/tests/device_panel_gui_smoke_test.py` 直接构造。依赖 `config.settings.save_device_name`、`config.i18n.tr`。
+**调用关系**：由 `ui/main_window.py` 构造并连接 `device_toggled`/`device_renamed`/`gripper_recalibration_requested`；`tools/tests/device_panel_gui_smoke_test.py` 直接构造。依赖 `config.settings.save_device_name`、`config.i18n.tr`。夹爪右键重标定的完整链路（关夹爪 → 后台线程 `refresh_calibration` → 完成后开回）见 `docs/core.md`「夹爪」节与 `ui/main_window.py` 的 `_on_gripper_recalibration`。
 
 ### ui/exposure_dialog.py
 

@@ -875,8 +875,20 @@ class CameraPipeline(QObject):
             return
         self._put_gripper_snapshot(f"{prefix}gripper_state", values)
 
-    def write_tactile_force(self, side: str, force3, prefix: str = ""):
-        """触觉力快照 [fx,fy,fz] mN（P2/P3；tactile_ready 回调）。"""
+    def write_tactile_force(self, side: str, force3, prefix: str = "",
+                            capture_ns: int = 0):
+        """触觉力快照 [fx,fy,fz] mN（P2/P3；tactile_ready 回调）。
+
+        capture_ns：该样本在桥接回调入口取的宿主单调钟纳秒（与
+        `hardware_ns` 同一时基）。落成独立列
+        `observation.{prefix}gripper_{side}_force_ns`。
+
+        为什么要它：力走 latest-wins 单槽、RGB 走 FIFO 队头最旧帧，
+        两条支路的队列滞留不同且在段内持续变化，所以**行号配对本身
+        就带偏移**。记下各自真实采集时刻后，下游按时间重采样即可把
+        偏移压到半个行周期（≈0.5 帧）以内，而不是听任行号对齐。
+        0 表示该帧无时刻（旧调用方/无样本），下游按未知处理。
+        """
         if force3 is None or side not in ("left", "right"):
             return
         values = [float(value) for value in force3[:3]]
@@ -884,14 +896,26 @@ class CameraPipeline(QObject):
             return
         self._put_gripper_snapshot(
             f"{prefix}gripper_{side}_force", values)
+        if capture_ns:
+            self._put_gripper_snapshot(
+                f"{prefix}gripper_{side}_force_ns", int(capture_ns))
 
     def write_tactile_force_matrix(self, side: str, encoded,
-                                   prefix: str = ""):
-        """触觉力矩阵快照（P4 泵线程预编码的行差分/原值列表）。"""
+                                   prefix: str = "", capture_ns: int = 0):
+        """触觉力矩阵快照（P4 泵线程预编码的行差分/原值列表）。
+
+        capture_ns 同 `write_tactile_force`，落成
+        `observation.{prefix}gripper_{side}_force_matrix_ns`。矩阵与
+        3 向量力来自同一次回调但落盘时刻不同（矩阵走独立泵线程），
+        所以两者**各记各的时刻**，不共用一列。
+        """
         if encoded is None or side not in ("left", "right"):
             return
         self._put_gripper_snapshot(
             f"{prefix}gripper_{side}_force_matrix", encoded)
+        if capture_ns:
+            self._put_gripper_snapshot(
+                f"{prefix}gripper_{side}_force_matrix_ns", int(capture_ns))
 
     def set_force_matrix_spec(self, prefix: str, spec: str) -> None:
         """登记本段录制的力矩阵规格（录制开始时调一次，须在 start_episode 后）。

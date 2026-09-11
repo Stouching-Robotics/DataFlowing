@@ -134,7 +134,7 @@ def _run_open_flow(fail_select=None, wait_ready=True, ready_errors=(),
     """跑一次 open 流程，返回 (bridge, fakes)。"""
     app = APP
     bridge = GripperBridge()
-    stats = {"rgb": 0, "stereo": [], "tactile": [], "pose": [],
+    stats = {"rgb": 0, "rgb_ns": [], "stereo": [], "tactile": [], "pose": [],
              "state": [], "opened": 0, "error": None}
     fakes = {}
 
@@ -182,11 +182,13 @@ def _run_open_flow(fail_select=None, wait_ready=True, ready_errors=(),
     fakes["discovery"] = discovery
 
     bridge.rgb_frame_ready.connect(
-        lambda _f, _t: stats.__setitem__("rgb", stats["rgb"] + 1))
+        lambda _f, _t: (stats.__setitem__("rgb", stats["rgb"] + 1),
+                        stats["rgb_ns"].append(_t)))
     bridge.stereo_frame_ready.connect(
         lambda slot, _f, _t: stats["stereo"].append(slot))
     bridge.tactile_ready.connect(
-        lambda s, h, f, m: stats["tactile"].append((s, tuple(f), m)))
+        lambda s, h, f, m, ns: stats["tactile"].append(
+            (s, tuple(f), m, ns)))
     bridge.pose_ready.connect(
         lambda p, q, t, ts: stats["pose"].append(
             (tuple(p), tuple(q), tuple(t), ts)))
@@ -241,6 +243,12 @@ def main():
     check(stats["opened"] == 1 and stats["error"] is None,
           f"opened 且无 error: opened={stats['opened']} error={stats['error']}")
     check(stats["rgb"] >= 1, f"RGB 首帧送达 (rgb={stats['rgb']})")
+    # hardware_ns 必须是**未截断**的 64 位宿主单调钟。曾经 rgb_frame_ready
+    # 声明为 pyqtSignal(object, int)，PyQt5 按 C++ qint32 封送 → 每 2.147s
+    # 翻符号变负、落盘后下游无法做任何时间对齐。断言 >2^31 才验得出这个坑
+    # （等于 2^31 以下的值截断与否看不出来）。
+    check(stats["rgb_ns"] and all(ns > (1 << 31) for ns in stats["rgb_ns"]),
+          f"RGB hardware_ns 未被 int32 截断 (首帧={stats['rgb_ns'][:1]})")
     check(fakes["tactile"].start_connected.called,
           "触觉 start_connected 已调用")
     left_arg = fakes["tactile"].start_connected.call_args
@@ -269,8 +277,12 @@ def main():
     bridge._on_tactile_result("left", heatmap, (12.5, -3.0, 88.0), matrix)
     _pump_until(lambda: len(stats["tactile"]) == result_count + 1)
     check(len(stats["tactile"]) == result_count + 1
-          and stats["tactile"][-1] == ("left", (12.5, -3.0, 88.0), matrix),
+          and stats["tactile"][-1][:3] == ("left", (12.5, -3.0, 88.0), matrix),
           "tactile_ready 信号携带 side/force/matrix")
+    # 第 4 个载荷是本样本的采集时刻，同样必须未被 int32 截断。
+    tactile_ns = stats["tactile"][-1][3]
+    check(isinstance(tactile_ns, int) and tactile_ns > (1 << 31),
+          f"tactile_ready 携带 64 位采集时刻 ({tactile_ns})")
 
     # 双目 side_by_side：单包 1280×400 只取左半投左目（右目/IMU 不外送）
     stereo_base = len(stats["stereo"])
@@ -366,6 +378,12 @@ def main():
           "矩阵最新值/序号递增（右侧）")
     check(bridge.matrix_seq("left") == left_seq_before,
           "未收到的侧别序号不动")
+    # 带时刻的版本（泵线程按此落盘）：ns 与矩阵在同一次加锁里取出、恒配对，
+    # 且 ns 同样不得被 int32 截断。
+    stamped = bridge.latest_matrix_stamped("right")
+    check(stamped is not None and stamped[1] is matrix
+          and stamped[0] > (1 << 31),
+          f"latest_matrix_stamped 返回 (采集时刻, 矩阵) ({stamped and stamped[0]})")
 
     # close 逆序回收：串口 → raw → slam → RGB 线程 → 触觉 → 租约 → 服务
     bridge.close()

@@ -168,13 +168,21 @@ class _SerialLifecycleAdapter:
 class GripperBridge(QObject):
     """One open gripper session; owns workers, emits events."""
 
-    stereo_frame_ready = pyqtSignal(str, object, int)
+    stereo_frame_ready = pyqtSignal(str, object, object)
     # slot("gripper_stereo_left"), bgr ndarray, host_monotonic_ns
-    rgb_frame_ready = pyqtSignal(object, int)  # bgr ndarray, host_monotonic_ns
-    tactile_ready = pyqtSignal(str, object, object, object)
+    rgb_frame_ready = pyqtSignal(object, object)  # bgr ndarray, host_monotonic_ns
+    tactile_ready = pyqtSignal(str, object, object, object, object)
     # side("left"|"right"), heatmap(320x240x3 RGB，worker 已 BGR→RGB),
     # force(fx,fy,fz mN),
-    # force_matrix(250x250x3 float32) 或 None（矩阵回传关闭时）
+    # force_matrix(250x250x3 float32) 或 None（矩阵回传关闭时）,
+    # capture_ns(宿主单调钟纳秒，本样本的采集时刻)
+    #
+    # ★ 时间戳一律走 object：PyQt5 队列信号会把 Python int 按 C++ qint32
+    #   封送，超过 2^31（≈2.147s 的纳秒数）即**静默截断成负数**。曾经
+    #   rgb/stereo 两处写 int，落盘的 hardware_ns 因此每 2.147s 翻一次
+    #   符号，下游拿它做不了任何对齐（且解回卷在 ±2.147s 歧义边界上
+    #   猜错会凭空造出上百帧的假漂移）。与 main_window 的
+    #   stereo_frame_ready 用 object 同理。
     pose_ready = pyqtSignal(object, object, object, object)
     # pos(x,y,z), quat(qx,qy,qz,qw), trajectory(位置点不可变元组，新点追加才重建),
     # timestamp(SLAM 秒，与轨迹 txt 第一列同源——轨迹并入 episode parquet 后
@@ -515,6 +523,11 @@ class GripperBridge(QObject):
             self._post_frame("rgb", frame, time.monotonic_ns())
 
     def _on_tactile_result(self, side, heatmap, force, force_matrix):
+        # 采集时刻在回调入口取（最接近样本真实到达时刻），随信号一起送到
+        # 落盘侧：力/矩阵与 RGB 走的是两条互不相干的支路（力是 latest-wins
+        # 单槽、RGB 是 FIFO 队头最旧帧），两者在行内的先后完全由各自的队列
+        # 滞留决定。只有把各自的采集时刻都记下来，下游才能按时间重对齐。
+        capture_ns = time.monotonic_ns()
         if side in ("left", "right"):
             try:
                 self._latest_force[side] = tuple(
@@ -523,14 +536,17 @@ class GripperBridge(QObject):
                 pass
             if force_matrix is not None:
                 with self._matrix_lock:
-                    self._latest_matrix[side] = force_matrix
+                    # 与 matrix 同锁存：泵线程取出的 ns 恒与矩阵配对，
+                    # 不会出现「新矩阵配了旧时刻」
+                    self._latest_matrix[side] = (capture_ns, force_matrix)
                     self._matrix_seq[side] += 1
                 if side not in self._matrix_first_logged:
                     self._matrix_first_logged.add(side)
                     self._log(
                         "[Gripper-Tactile] {} 侧力矩阵首帧回传 shape={}".format(
                             side, force_matrix.shape))
-        self._post_frame("tactile", side, heatmap, force, force_matrix)
+        self._post_frame("tactile", side, heatmap, force, force_matrix,
+                         capture_ns)
 
     # ---- P4 串口/夹爪状态（heartbeat 与 grip 循环线程调用） ----
     def _on_board_update(self, snapshot):
@@ -575,9 +591,23 @@ class GripperBridge(QObject):
         with self._matrix_lock:
             return self._matrix_seq.get(side, 0)
 
-    def latest_matrix(self, side):
+    def latest_matrix_stamped(self, side):
+        """最新力矩阵连同它的采集时刻 → (capture_ns, matrix)，无则 None。
+
+        ns 与 matrix 在同一次加锁里取出，**恒配对**（分两次取会出现
+        「拿到新矩阵、配了旧时刻」）。泵线程用这个版本落盘。
+        """
         with self._matrix_lock:
-            return self._latest_matrix.get(side)
+            entry = self._latest_matrix.get(side)
+        if entry is None:
+            return None
+        ns, matrix = entry
+        return int(ns), matrix
+
+    def latest_matrix(self, side):
+        """最新力矩阵（不含时刻；需要时刻用 latest_matrix_stamped）。"""
+        stamped = self.latest_matrix_stamped(side)
+        return None if stamped is None else stamped[1]
 
     def _on_slam_pose(self, pose):
         """SlamProcessController 工作线程回调：位姿进队列保序。

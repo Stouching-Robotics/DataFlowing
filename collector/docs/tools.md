@@ -29,6 +29,7 @@
 | `tools/hand_3d_s80c/` | S80C 双目实时裸手/手套关键点 demo（含自包含 SDK `third_party/`、`build_dist.sh` 分发包） | 包内 `README.md` |
 | `tools/fayssense_depth_sdk/` | FaysSense VI Kit 深度引擎 SDK（C++，专有；S80C demo 自包含用副本） | 包内 `README.md` |
 | `tools/models/` | 模型权重：`hand_landmarker.task`（MediaPipe 裸手关键点） | — |
+| `tools/import_gripper_calibration.py` | 夹爪出厂标定导入/生成：手工搬运上位机产物，或 `--generate` 就地读设备重生成（v1.3.4） | `docs/core.md` 夹爪节 |
 | `tools/tests/` | 16 个回归/冒烟测试（11 离线 + 5 真机，见文末） | `README.md` 测试节 |
 | `tools/weights/clip/` | CLIP ViT-B-32 大权重（gitignore，不随仓库分发） | — |
 

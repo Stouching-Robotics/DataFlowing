@@ -198,6 +198,9 @@ class MainWindow(QMainWindow):
     # 上传后自动删除结果信号（删除线程 → 主线程）：
     # (session_path, error_msg, episode_index)——episode_index 用 int 且恒 < 2^31
     _upload_session_deleted = pyqtSignal(str, str, int)
+    # 重读夹爪出厂标定完成（标定线程 → 主线程）：(dev_key, label, 错误文案)
+    # 错误文案空串 = 成功。用 str 而非 Exception：跨线程只传可显示文本。
+    _gripper_recalibration_done = pyqtSignal(str, str, str)
 
     def __init__(self):
         super().__init__()
@@ -221,6 +224,8 @@ class MainWindow(QMainWindow):
         # 引用同一 dict，离线测试注入假条目沿用同一形状）
         self._device_manager = DeviceManager()
         self._workers = self._device_manager.entries
+        # 重读标定前这台夹爪是否开着（标定独占设备，完了要开回原来的状态）
+        self._gripper_recalib_reopen = set()
         # ── 面板开关分派表（kind → 具体开启/关闭动作；路由口径在
         #    core.device_manager.dispatch_toggle）──
         self._open_fns = {"uvc": self._open_uvc, "d435": self._open_d435,
@@ -407,6 +412,10 @@ class MainWindow(QMainWindow):
         self._device_panel = DevicePanel()
         self._device_panel.device_toggled.connect(self._on_device_toggled)
         self._device_panel.device_renamed.connect(self._on_device_renamed)
+        self._device_panel.gripper_recalibration_requested.connect(
+            self._on_gripper_recalibration)
+        self._gripper_recalibration_done.connect(
+            self._on_gripper_recalibration_done)
         self._device_dock = QDockWidget(tr("📷 设备检测"), self)
         self._device_dock.setWidget(self._device_panel)
         self._device_dock.setFeatures(
@@ -838,6 +847,7 @@ class MainWindow(QMainWindow):
         # 清设备面板激活状态（防止下次进入采集页误高亮）
         self._active_device_keys = set()
         self._lost_device_keys = set()
+        self._gripper_recalib_reopen = set()
         self._last_device_keys = {}
         self._last_device_kinds = {}
         self._device_panel.set_checked_keys(set())
@@ -1647,8 +1657,9 @@ class MainWindow(QMainWindow):
             lambda slot, frame, hw_ns, key=key:
                 self._on_gripper_stereo(key, slot, frame, hw_ns))
         bridge.tactile_ready.connect(
-            lambda side, heatmap, force, matrix, key=key:
-                self._on_gripper_tactile(key, side, heatmap, force, matrix))
+            lambda side, heatmap, force, matrix, capture_ns, key=key:
+                self._on_gripper_tactile(key, side, heatmap, force, matrix,
+                                         capture_ns))
         bridge.pose_ready.connect(
             lambda position, quat, trajectory=(), timestamp=None, key=key:
                 self._on_gripper_pose(key, position, quat, trajectory,
@@ -1816,9 +1827,10 @@ class MainWindow(QMainWindow):
             prefix=entry["snapshot_prefix"], timestamp=timestamp)
 
     def _on_gripper_tactile(self, dev_key: str, side, heatmap, force,
-                            force_matrix):
+                            force_matrix, capture_ns=0):
         """触觉结果（左/右）：热力图 + 力曲线显示 + 力值落盘；
-        力矩阵落盘 P4 泵线程。"""
+        力矩阵落盘 P4 泵线程。capture_ns 为该样本的采集时刻，随力值
+        一起落盘（力矩阵由其泵线程各自带上自己的时刻）。"""
         entry = self._gripper_entry(dev_key)
         if entry is None:
             return
@@ -1833,7 +1845,8 @@ class MainWindow(QMainWindow):
             widget.update_tactile(display_heatmap, force)
         if force is not None and len(force) == 3:
             self._pipeline.write_tactile_force(
-                side, force, prefix=entry["snapshot_prefix"])
+                side, force, prefix=entry["snapshot_prefix"],
+                capture_ns=capture_ns)
 
     def _on_gripper_state(self, dev_key: str, payload):
         """串口夹爪状态 {pct,gripped,fz,event,board}：PoseView 开合板 +
@@ -1911,9 +1924,12 @@ class MainWindow(QMainWindow):
                 if seq == last_seq[side]:
                     continue
                 last_seq[side] = seq
-                matrix = bridge.latest_matrix(side)
-                if matrix is None:
+                # 时刻与矩阵同锁取出（latest_matrix_stamped），保证配对；
+                # 泵线程与主线程各自落各自模态，所以矩阵的时刻单独记
+                stamped = bridge.latest_matrix_stamped(side)
+                if stamped is None:
                     continue
+                capture_ns, matrix = stamped
                 try:
                     encoded = encode_gripper_force_matrix(matrix, spec)
                 except Exception as exc:
@@ -1921,7 +1937,8 @@ class MainWindow(QMainWindow):
                                  side, exc))
                     continue
                 self._pipeline.write_tactile_force_matrix(
-                    side, encoded, prefix=entry["snapshot_prefix"])
+                    side, encoded, prefix=entry["snapshot_prefix"],
+                    capture_ns=capture_ns)
                 wrote[side] += 1
                 if not first_logged[side]:
                     first_logged[side] = True
@@ -1960,6 +1977,84 @@ class MainWindow(QMainWindow):
         self._device_panel.set_checked(dev_key, False)
         self._device_panel.set_active_keys(self._active_device_keys)
         self._update_status()
+
+    def _on_gripper_recalibration(self, dev):
+        """右键夹爪 → 重新读取这只夹爪的厂商出厂标定。
+
+        出厂标定是**逐设备**的（内参/基线/IMU 外参逐台不同），所以只能从这
+        只夹爪自身读，不能抄别的；读错设备会让 SLAM 位姿系统性跑偏。标定要
+        独占设备，因此先关掉这台夹爪（若已开），完成后再自动开回来。
+        """
+        label = self._device_label(dev)
+        if not dev.serial:
+            QMessageBox.warning(
+                self, tr("夹爪无序列号"),
+                tr("未读取到夹爪 ESP32 序列号，无法定位控制板。"))
+            return
+        if self._pipeline.is_recording:
+            QMessageBox.warning(
+                self, tr("录制中"),
+                tr("录制中不可重读标定，请先停止录制。"))
+            return
+        answer = QMessageBox.question(
+            self, tr("重新读取出厂标定"),
+            tr("将从「{}」这只夹爪重新读取厂商出厂标定，并覆盖本机已有的"
+               "标定文件。\n\n标定期间该夹爪被独占：已开启的话会先关闭，"
+               "完成后自动开回来。\n\n继续？", label),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+
+        was_open = dev.key in self._workers
+        if was_open:
+            self._gripper_recalib_reopen.add(dev.key)
+            self._close_gripper(dev.key)
+            self._active_device_keys.discard(dev.key)
+            self._device_panel.set_checked(dev.key, False)
+            self._device_panel.set_active_keys(self._active_device_keys)
+            self._update_status()
+        self._log(tr("[夹爪] {} 正在重新读取厂商出厂标定…", label))
+
+        thread = threading.Thread(
+            target=self._gripper_recalibration_worker,
+            args=(dev, label),
+            name="gripper-recalibration",
+            daemon=True,
+        )
+        thread.start()
+
+    def _gripper_recalibration_worker(self, dev, label: str):
+        """标定线程：读设备 → 写 YAML。结果经信号回主线程弹窗。"""
+        reason = ""
+        try:
+            from core.gripper.fays_single import SingleFaysLease
+            lease = SingleFaysLease(logger=self._log)
+            lease.refresh_calibration(dev.serial)
+        except Exception as exc:       # 设备被占用/未插好/二进制缺失都走这里
+            reason = str(exc)
+        self._gripper_recalibration_done.emit(dev.key, label, reason)
+
+    def _on_gripper_recalibration_done(self, dev_key: str, label: str,
+                                       reason: str):
+        """标定结果回主线程：失败弹窗，成功把原先开着的夹爪开回来。"""
+        reopen = dev_key in self._gripper_recalib_reopen
+        self._gripper_recalib_reopen.discard(dev_key)
+        if reason:
+            self._log(tr("[夹爪] {} 重读标定失败: {}", label, reason))
+            QMessageBox.critical(
+                self, tr("重读标定失败"),
+                tr("「{}」的出厂标定未能重新读取。\n\n{}\n\n"
+                   "夹爪仍在设备列表中，可重新勾选开启。", label, reason))
+            return
+        self._log(tr("[夹爪] {} 出厂标定已更新", label))
+        if not reopen:
+            return                    # 本来就没开，不擅自打开
+        dev = self._device_panel.device_for_key(dev_key)
+        if dev is None:
+            return                    # 标定期间设备拔了/列表重建过，不自动开
+        # 自动开回来 = 用户点开关那条路，勾选状态与 _active_device_keys 一致
+        self._device_panel.set_checked(dev_key, True)
+        self._on_device_toggled(dev, True)
 
     def _on_device_toggled(self, dev, on: bool):
         """面板开关 → 打开/关闭设备（多路并发：只动自己，不互拆）。

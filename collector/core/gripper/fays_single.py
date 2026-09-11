@@ -6,7 +6,9 @@
     3. USB 链路速度 >= FAYS_MIN_USB_SPEED_MBPS，否则拒绝（提示换 USB3 口）；
     4. probe_product_serial() 通过官方 SDK 探针读取真实产品序列号；
     5. 按序列号定位 fays_config/fays_vikit_{serial}.yaml 与
-       dist/fays_opencv48/s80m_{serial}_stereo_inertial.yaml；
+       dist/fays_opencv48/s80m_{serial}_stereo_inertial.yaml；缺任一个就**现场
+       用厂商导出程序从这只夹爪读出厂标定补齐**（见 calibration.py），不必再
+       人工跑上位机 device_setup + 导入；
     6. flock 租约 /tmp/ksq-gripper-fays-locks/{serial}.lock 防多开；
     7. materialize 当前端口的运行时 SDK yaml，并在 /dev/shm 建 IPC 目录。
 
@@ -26,7 +28,7 @@ import threading
 import time
 
 from config import settings
-from core.gripper import paths
+from core.gripper import calibration, paths
 from core.gripper.fays_runtime import (
     FAYS_MIN_USB_SPEED_MBPS,
     build_fays_probe_env,
@@ -234,6 +236,56 @@ class SingleFaysLease:
             ) from exc
         return serial, speed
 
+    def _ensure_calibration(self, serial, group):
+        """返回 (sdk_yaml, orb_yaml)；缺文件就现场读这只夹爪的出厂标定。
+
+        快路径只 stat 两个文件，已覆盖的夹爪启动零额外开销、不碰设备。
+        """
+        try:
+            return paths.per_device_fays_yamls(serial)
+        except RuntimeError:
+            pass                      # 缺标定，走下面现场生成
+        self._logger(
+            f"[Gripper-Fays] {serial} 尚无运行标定文件，"
+            f"正在从这只夹爪读取厂商出厂标定…"
+        )
+        try:
+            calibration.generate_fays_calibration(
+                serial, group["ports"], logger=self._logger,
+            )
+            # 复核也用 collector 自己的解析函数：生成"成功"却没落在
+            # paths 认得的路径上时，这里必须报出来，不能让下面那句裸
+            # RuntimeError 把「请先跑 device_setup」当成唯一解释。
+            return paths.per_device_fays_yamls(serial)
+        except Exception as exc:
+            raise GripperFaysError(
+                f"Fays {serial} 缺少运行标定文件，且现场读取出厂标定未成功：{exc}。"
+                f"可改用夹爪上位机运行 device_setup 后，执行 "
+                f"tools/import_gripper_calibration.py {serial} "
+                f"--source <上位机根目录> 手工导入。"
+            ) from exc
+
+    def refresh_calibration(self, esp_serial):
+        """强制重新读取这只夹爪的出厂标定（覆盖已有文件）。
+
+        与 acquire() 无关：不建租约、不占 IPC 目录，只是重新探一次设备身份
+        再跑一遍厂商导出。调用前应确保该夹爪未在录制（否则 SDK 正被占用）。
+        """
+        with self._lock:
+            esp = self._match_esp(esp_serial)
+            group = self._discover_unique_fays_group(esp)
+            serial, _speed = self._probe_serial(group)
+            self._logger(
+                f"[Gripper-Fays] 正在重新读取 {serial} 的厂商出厂标定…"
+            )
+            result = calibration.generate_fays_calibration(
+                serial, group["ports"], logger=self._logger,
+            )
+            self._logger(
+                f"[Gripper-Fays] {serial} 出厂标定已重新生成"
+            )
+            return result
+
     def acquire(self, esp_serial):
         """锁定并返回 selected 字典；重复调用返回当前租约快照。"""
         with self._lock:
@@ -243,7 +295,7 @@ class SingleFaysLease:
             esp = self._match_esp(esp_serial)
             group = self._discover_unique_fays_group(esp)
             serial, speed = self._probe_serial(group)
-            sdk_yaml, orb_yaml = paths.per_device_fays_yamls(serial)
+            sdk_yaml, orb_yaml = self._ensure_calibration(serial, group)
 
             os.makedirs(paths.FAYS_LOCK_DIR, mode=0o700, exist_ok=True)
             lease_key = re.sub(r"[^A-Za-z0-9_.-]+", "-", serial)

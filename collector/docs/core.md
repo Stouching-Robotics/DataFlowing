@@ -51,8 +51,9 @@
 | `core/sensor_config_dialogs.py` | PyQt5 传感器配置对话框（矩阵行列 / 仿生手掌逐部位） |
 | `core/sensor_hand_config.py` | 仿生手掌配置加载/传感器列有效性过滤（纯函数，零 Qt） |
 | `core/helpers.py` | 通用工具函数（约 47 个：ID/时间/格式化/路径/会话扫描） |
+| `core/gripper/` | UMI 夹爪 rig 自包含**子包**（Fays SLAM + Sightac 触觉 + 出厂标定生成），与上面平铺模块分开，见下文「夹爪」节 |
 
-（`core/__init__.py` 为空包标记。）
+（`core/__init__.py` 为空包标记；`core/gripper/__init__.py` 为其子包标记。）
 
 ## 采集与设备
 
@@ -949,6 +950,78 @@ rows/cols 映射，点击"选择"弹出子级 `MatrixConfigDialog` 逐部位编�
 **关键数据**：SGBM 参数（代码硬编码）：`minDisparity=0`、`P1=8*3*block²`、`P2=32*3*block²`、`disp12MaxDiff=1`、`preFilterCap=63`、`uniquenessRatio=10`、`speckleWindowSize=100`、`speckleRange=32`、`mode=STEREO_SGBM_MODE_SGBM_3WAY`；WLS `lambda=8000.0`、`sigmaColor=1.5`。输出视差缩放：value=256 → 视差 16 像素。
 
 **调用关系**：被 `ui/main_window.py`（`_on_s80m_depth` 用 `depth_to_heatmap` 渲染 S80C 深度格）、`core/d435_manager.py:24` 与 `core/egodata_writer.py:41`（`depth_to_heatmap`/`DepthHeatmapSmoother` 热力图生成/落盘）、`tools/tests/test_depth_heatmap.py:20` 引用。`StereoDepthComputer`（旧 S80M 视差路径）自 v1.0.11 起无调用方，仅为 demo 保留。
+
+## 夹爪（core/gripper/，v1.3.0 起）
+
+`core/gripper/` 是 UMI 夹爪 rig 的**自包含子包**（从 `online/gripper_version1`
+分叉，运行期不依赖 `online/`），与上面平铺的 `core/*.py` 由 `core/gripper/__init__.py`
+分隔。子包内自带 `native/`（约 785 MB 厂商二进制与 ORB-SLAM 资源，gitignore，
+换机器需重新部署）与 `sightac_sdk/`（pyarmor 加密随包入库）。
+
+| 文件 | 一句话作用 |
+|---|---|
+| `core/gripper/paths.py` | 原生资源路径与运行时常量补丁；`per_device_fays_yamls(serial)` 是 per-serial 标定的唯一解析口径 |
+| `core/gripper/calibration.py` | 现场读取一只 Fays 的出厂标定，生成它的 per-serial 运行文件 |
+| `core/gripper/fays_single.py` | 单夹爪场景的 Fays 租约（`SingleFaysLease`：ESP 匹配 → 拓扑发现 → 序列号探测 → 标定 → flock → IPC 目录） |
+| `core/gripper/fays_runtime.py` | FaysSense S80M 的单一运行时配置来源 + 探针/运行双 env（`build_fays_probe_env` / `build_fays_runtime_env`） |
+| `core/gripper/fays_serial_probe.py` | 经官方 VI Kit SDK 读 S80M 产品序列号 |
+| `core/gripper/bridge.py` | 夹爪 rig 与主程序的 Qt 桥（后台线程采集 → 队列信号回主线程） |
+| `core/gripper/affinity.py` | 夹爪 CPU 预留（主进程掩码收窄 + raw 流接收线程专用核） |
+| `core/gripper/tactile_process_worker.py` | Sightac 触觉计算子进程 |
+| `core/gripper/slam/` | 桥接进程控制器与 stdout 协议解析（`process_controller.py` / `protocol.py`） |
+| `core/gripper/runtime/` | 绑核、线程亲和与**跨进程设备互斥**（`device_access.py`、`cpu_policy.py`、`thread_affinity.py`、`interruptible_queue.py`） |
+| `core/gripper/recording/` | raw 双目/IMU 流客户端（`fays_raw_client.py`） |
+| `core/gripper/devices/` | ESP32 串口/控制板、Sightac 与 DECXIN 相机服务、USB 拓扑关联 |
+| `core/gripper/control/` | 夹爪板状态、百分比与双路 Fz 锁存 |
+
+### core/gripper/calibration.py
+
+**作用**：**新夹爪接入即自动就位**（v1.3.4）。Fays 的运行标定是**逐设备出厂
+标定**，不可跨设备复用（实测同型号不同机的 `Camera1.fx/fy/cx/cy`、`Stereo.b`、
+`IMU.T_b_c1` 全不同），所以只能从这只夹爪自身读。本模块在设备锁内调厂商
+导出程序，产出三份文件：
+
+| 产物 | 路径 | 内容 |
+|---|---|---|
+| 原始 dump | `native/config/calibration/FS-VI80-<model>_<serial>_dump_calib.yaml` | `dump_calib_opencv48` 的原样输出（取证/回溯用） |
+| SDK YAML | `native/gripper_version1/fays_config/fays_vikit_<serial>.yaml` | 由模板改写两个端口字段（`stereo_dev_port` / `imu_dev_port`） |
+| ORB YAML | `native/dist/fays_opencv48/s80m_<serial>_stereo_inertial.yaml` | 由 ORB 模板改写出厂内参/IMU 外参 |
+
+**关键接口**：
+
+| 函数 | 签名 | 作用 |
+|---|---|---|
+| `ensure_fays_calibration` | `(product_serial, ports, *, logger=None, force=False, timeout=60.0)` | 缺则生成、`force=True` 强制重生成；返回 `(sdk_yaml, orb_yaml)` |
+| `generate_fays_calibration` | `(product_serial, ports, *, logger=None, timeout=60.0)` | 完整生成链（dump → SDK YAML → IMU 探针 → ORB YAML） |
+| `dump_fays_calibration` | `(product_serial, ports, *, output_dir=None, dump_binary=None, template_path=None, timeout=60.0)` | 只跑厂商 dump，返回原始 dump 路径 |
+| `run_imu_probe` | `(ports, *, probe_binary=None, template_path=None, timeout=60.0)` | 只跑 IMU 探针，返回原始 stdout |
+| `write_fays_sdk_yaml` | `(product_serial, ports, *, template_path=None, config_dir=None)` | 只由模板生成 SDK YAML |
+| `generate_orb_yaml` | `(product_serial, dump_path, imu_output, *, template_path=None, output_dir=None)` | 只由 dump + 探针输出生成 ORB YAML |
+
+**公开行为（v1.3.4）**：`SingleFaysLease.acquire()` 在探测到序列号后调
+`_ensure_calibration()` —— 已有标定走 `paths.per_device_fays_yamls(serial)`
+的 `isfile` 快路径（启动零额外开销、不碰设备）；缺文件就地生成，**复核落盘
+路径**后才连上，失败抛带序列号与兜底办法的 `GripperFaysError`。生成"成功"
+却没落在 `paths` 认得的路径上必须当场报出来，否则会漏出 `paths.py` 那句误导
+人的「请先在夹爪上位机中运行 device_setup」。手工入口与一键重生成：
+`tools/import_gripper_calibration.py --generate`（旧文件先备份
+`.bak_<时间戳>`）、设备面板夹爪条目右键「重新读取出厂标定」（录制中禁用，
+标定前自动关该夹爪、完成后开回，见 `docs/ui.md`）。
+
+**关键数据**：ORB 内参由 `cv2.fisheye.stereoRectify(..., CALIB_ZERO_DISPARITY)`
+的 `P1`/`R1` 得到，`T_b_c1 = inv(T_cam_imu) @ T_rectified_to_unrectified`；
+IMU 五项（`NoiseGyro`/`NoiseAcc`/`GyroWalk`/`AccWalk`/`Frequency`）由
+`fays_vikit_calibration_probe` 读。厂商二进制定位可用环境变量覆盖：
+`KSQ_FAYS_CALIBRATION_DUMP`、`KSQ_FAYS_IMU_CALIBRATION_PROBE`、`KSQ_FAYS_ORB_TEMPLATE`。
+所有接触 SDK 的子进程都套 `device_access_guard(FAYS_SDK_INITIALIZATION_LOCK)`
++ `fays_device_guard(stereo_dev_port)` 两把跨进程锁，并在
+`build_fays_probe_env()`（OpenCV 4.2 + fays_atrak + ft602）下运行。
+
+**调用关系**：由 `core/gripper/fays_single.py`（`acquire()` 内联生成、
+`refresh_calibration()` 强制重生成）、`tools/import_gripper_calibration.py`
+与 `ui/main_window.py`（后台线程跑 `refresh_calibration`）调用；离线回归见
+`tools/tests/test_gripper_calibration_autogen.py`（重定向全部产物目录 + 假厂商
+二进制，含真机产物逐字节回放）。
 
 ## 数据流
 

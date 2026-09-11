@@ -102,6 +102,7 @@ class TaskService(QObject):
         # 进度增量上报（多电脑协同聚合）
         self._progress_supported = True     # 后端 404 → False 静默降级本地口径
         self._progress_retry_at = 0.0       # 降级期间下一次试探的时刻（monotonic）
+        self._progress_source: dict[str, str] = {}  # task_id → 后端进度口径
         self._flush_fail: dict[str, int] = {}  # task_id → 连续失败次数（防日志刷屏）
         self._flush_lock = threading.Lock()    # 防 flush_now 与轮询 tick 并发重复 POST
         self._poll_fail = 0                 # 轮询连续失败次数（防日志刷屏）
@@ -268,7 +269,9 @@ class TaskService(QObject):
 
         幂等键含设备名与水位（重试不重复计数）；崩溃安全由 tasks.json 落盘
         保证；401/403 跳过本轮不标记死（重新登录后自然恢复）；404 降级但带
-        冷却期重探（PROGRESS_RETRY_INTERVAL_S），后端补上端点后自动恢复。
+        冷却期重探（PROGRESS_RETRY_INTERVAL_S），后端补上端点后自动恢复；
+        不在 _cached_tasks（后端当前列表）里的任务跳过 —— 本地自建任务没有
+        平台侧对应项目，上报只会换回 400。
         """
         if not self._progress_supported:
             # 曾经 404：后端没这个端点。不永久拉黑 —— 冷却期过后再探一次，
@@ -279,11 +282,24 @@ class TaskService(QObject):
             return  # 已有一次 flush 在途（tick 或 flush_now），让给先到者
         try:
             device = getattr(settings, 'DEVICE_NAME', 'EGO_001')
+            # 只上报服务端认识的任务：本地自建任务（客户端里新建、平台没这个
+            # 项目）上报必被拒（400 unknown task_id），没必要每个 tick 重试一遍。
+            # _cached_tasks 是最近一次成功轮询拿到的后端列表（已按身份可见性
+            # 过滤）—— 本方法也正是在 _poll 里刚赋完值后调用的。
+            known = {str(t.get("id") or "") for t in self._cached_tasks}
             changed = False
             for p in task_record.pending_sync_tasks():
                 tid = p["id"]
-                inc = p["local_count"] - p["synced_count"]
-                session_id = f"{device}:{tid}:{p['synced_count']}"
+                if tid not in known:
+                    continue
+                # 基线：后端该项目还没台账（还在按 session 数兜底）时，本机的
+                # 历史录制从没上报过——只送「synced 之后的增量」会把后端计数从
+                # session 数直接砸成增量本身（现场：3/3/3 的项目再录一条变 1）。
+                # 这时送本机全量，让后端第一步就拿到这台设备的真实数。
+                base = 0 if self._progress_source.get(tid) == "sessions" \
+                    else p["synced_count"]
+                inc = p["local_count"] - base
+                session_id = f"{device}:{tid}:{base}"
                 new_backend, err = self._post_progress(tid, session_id, inc, device)
                 if err == "404":
                     self._progress_supported = False  # 后端未升级 → 静默降级本地口径
@@ -298,7 +314,10 @@ class TaskService(QObject):
                     # 冷却期里的那次试探成功了 → 后端已实现该端点，结束降级
                     self._progress_supported = True
                     self._progress_retry_at = 0.0
-                task_record.mark_synced(tid, p["synced_count"] + inc, new_backend)
+                # 上报成功即后端有台账了；本地先记上，免得同一次轮询窗口里再
+                # flush（又录了一段）时还按"没台账"送全量、被幂等键吞掉增量
+                self._progress_source[tid] = "reported"
+                task_record.mark_synced(tid, base + inc, new_backend)
                 changed = True
             if changed:
                 self.progress_synced.emit()
@@ -384,6 +403,13 @@ class TaskService(QObject):
                     raw = [t for t in raw if not (t.get("assigned_user") or None)]
                 tasks = _normalize_tasks(raw)
                 self._cached_tasks = tasks
+                # 后端该项目当前的进度口径："sessions"=后端还没收到过任何上报,
+                # 首次上报要送本机全量当基线（见 _flush_progress）；"reported"=已有
+                # 台账,只送增量。缺失（旧后端）按增量处理,最保守。
+                self._progress_source = {
+                    str(t.get("id") or ""): t.get("progress_source")
+                    for t in raw
+                }
                 self.tasks_updated.emit(tasks)
                 self.connection_status.emit(True)
                 self._poll_fail = 0   # 成功即清零连续失败计数

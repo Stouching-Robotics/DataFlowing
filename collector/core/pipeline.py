@@ -291,6 +291,22 @@ class CameraPipeline(QObject):
         self._external_dims.pop(slot_id, None)
         self._external_fps.pop(slot_id, None)
 
+    def _drain_external_queues(self):
+        """排空外部帧源队列（丢弃未消费的旧帧）。
+
+        外部队列与 CameraSlot.frame_queue 语义相同：生产侧（夹爪 RGB 常驻
+        读取线程）从设备打开起就一直在投递，只有录制期间才被写线程消费。
+        不在录制边界排空的话，上一段停止时残留的最多 30 帧（≈1s）会被原样
+        写成新 mp4 的开头——实测每段开头约 28 帧与上一段 episode 的末帧逐帧
+        匹配。队列满时残留帧还占着 ~110MB/槽 内存。
+        """
+        for q in self._external_queues.values():
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+
     def write_external_frame(self, slot_id: str, frame: np.ndarray,
                              hardware_ns: int = 0,
                              imu_samples: Optional[List] = None):
@@ -566,6 +582,10 @@ class CameraPipeline(QObject):
         while not self._sensor_queue.empty():
             try: self._sensor_queue.get_nowait()
             except queue.Empty: break
+        # 外部帧源（夹爪 RGB 等）同一语义：生产线程从设备打开起就一直在投递，
+        # 而写线程此刻才启动，中间还要等 start_episode（编码器探测/建目录）。
+        # 不清就会把「录制开始前」的画面写成新 mp4 开头的那几十帧
+        self._drain_external_queues()
         with self._gripper_snapshots_lock:
             self._gripper_snapshots.clear()
             self._gripper_traj.clear()
@@ -936,6 +956,11 @@ class CameraPipeline(QObject):
             self._write_thread.join(timeout=3.0)
             self._write_thread = None
 
+        # 写线程已停，残留帧不会再被消费——立即释放（满队列 ~110MB/槽）。
+        # 生产线程可能在 _recording=False 与本次排空之间挤进最后一帧，
+        # 但下一段 _start_async 还会再排空一次，不会漏进视频
+        self._drain_external_queues()
+
         # 快照每相机帧数：_finish_async 在后台线程 emit 回调，
         # 用户可能抢在回调前开始新一轮录制重置 _per_cam_frame
         self._last_recording_frames = dict(self._per_cam_frame)
@@ -971,6 +996,8 @@ class CameraPipeline(QObject):
         if self._write_thread is not None and self._write_thread.is_alive():
             self._write_thread.join(timeout=3.0)
             self._write_thread = None
+
+        self._drain_external_queues()
 
         threading.Thread(target=self._abort_async, daemon=True).start()
 

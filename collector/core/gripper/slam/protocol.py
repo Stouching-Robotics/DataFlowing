@@ -85,6 +85,11 @@ _FPS_RE = re.compile(
     r"(?:\s+wait_ms=([\d.]+)\s+preprocess_ms=([\d.]+)"
     r"\s+middle_ms=([\d.]+)\s+post_ms=([\d.]+))?$"
 )
+_TIME_REGRESSION_RE = re.compile(
+    r"^\[TIME_(DROP|REBASE)\]\s+ts=([-\d.e+]+)\s+previous=([-\d.e+]+)\s+"
+    r"delta=([-\d.e+]+)\s+seq=(\d+)(?:\s+prev_seq=(-?\d+))?\s+"
+    r"consecutive=(\d+)\s+total=(\d+)$"
+)
 _ERROR_RE = re.compile(
     r"(error|failed|exception|cannot|unable|denied|timeout|timed out|"
     r"no device|not found|no such|device busy|resource busy)",
@@ -92,6 +97,10 @@ _ERROR_RE = re.compile(
 )
 _IGNORED_NON_FATAL_RE = re.compile(
     r"^\[FAYS-CALIB\]\s+WARN\s+SetStereoFPS\(\d+\)\s+failed$"
+    # ld.so 报告某个 LD_PRELOAD 条目加载失败——它自带 "ignored."，是信息性
+    # 输出，但文案里的 "cannot" 会命中 _ERROR_RE → state.error，进而把
+    # wait_sdk_ready 的就绪门锁死（2026-09-10 18:32 那次假超时的起因）。
+    r"|^ERROR: ld\.so: object .+ from LD_PRELOAD .*ignored\.$"
 )
 
 
@@ -198,12 +207,42 @@ class FaysRateSample:
 
 
 @dataclass(frozen=True)
+class FrameTimeRegression:
+    """桥接时间戳单调性守卫的一次判定（``[TIME_DROP]``/``[TIME_REBASE]``）。
+
+    ``verdict`` 为 ``drop``（陈旧帧已在入库前丢弃）或 ``rebase``（连续回退
+    达上限，判定为时钟真跳变，换基准放行给 SLAM）。``delta`` 是相对上一条
+    **保留**帧的回退量（秒，恒为负）。
+
+    ``seq`` 是本帧的 SDK 序号，``prev_seq`` 是上一条**真正进了 SLAM** 的帧的
+    SDK 序号（老版本桥接没有这个字段时为 ``None``）。两者一比即可定形态：
+
+    * ``seq < prev_seq`` —— SDK 把一条比自己已交付过的帧还旧的帧给了我们，
+      投递确实乱序，丢的是真实数据；
+    * ``seq == prev_seq`` —— 重复投递同一帧，丢弃零损失；
+    * ``seq > prev_seq`` —— 序号在正常前进，是**时间戳字段**配错了旧值。
+
+    注意 ``prev_seq`` 跨度不恒为 1：入库前有 3-of-5 抽帧，正常递增时本帧
+    比上一条入库帧大 1~3。
+    """
+
+    verdict: str
+    ts: float
+    previous: float
+    delta: float
+    seq: int
+    consecutive: int
+    total: int
+    prev_seq: object = None          # Optional[int]；老桥接无此字段时为 None
+
+
+@dataclass(frozen=True)
 class ProtocolEvent:
     """A classified stdout line.
 
-    ``kind`` is one of ``pose``, ``fays_rates``, ``orb_diagnostic``,
-    ``orb_stage``, ``affinity``, ``ready``, ``origin``, ``status``, ``error``
-    or ``log``.
+    ``kind`` is one of ``pose``, ``fays_rates``, ``time_drop``,
+    ``time_rebase``, ``orb_diagnostic``, ``orb_stage``, ``affinity``,
+    ``ready``, ``origin``, ``status``, ``error`` or ``log``.
     """
 
     kind: str
@@ -386,6 +425,23 @@ def _parse_fays_rates(line):
     return FaysRateSample(*values, stage_times=stages)
 
 
+def _parse_time_regression(line):
+    match = _TIME_REGRESSION_RE.fullmatch(line)
+    if match is None:
+        return None
+    prev_seq = match.group(6)
+    return FrameTimeRegression(
+        verdict=match.group(1).lower(),
+        ts=float(match.group(2)),
+        previous=float(match.group(3)),
+        delta=float(match.group(4)),
+        seq=int(match.group(5)),
+        consecutive=int(match.group(7)),
+        total=int(match.group(8)),
+        prev_seq=int(prev_seq) if prev_seq is not None else None,
+    )
+
+
 def parse_slam_line(line):
     """Classify one stripped Fays bridge stdout line."""
     if not isinstance(line, str):
@@ -402,6 +458,13 @@ def parse_slam_line(line):
     rates = _parse_fays_rates(raw)
     if rates is not None:
         return ProtocolEvent("fays_rates", rates, raw)
+
+    regression = _parse_time_regression(raw)
+    if regression is not None:
+        return ProtocolEvent(
+            "time_rebase" if regression.verdict == "rebase" else "time_drop",
+            regression, raw,
+        )
 
     map_diagnostic = parse_orb_map_diagnostic_line(raw)
     if map_diagnostic is not None:

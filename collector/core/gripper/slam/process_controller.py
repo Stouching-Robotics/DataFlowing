@@ -20,8 +20,8 @@ import traceback
 from core.gripper.runtime.device_access import device_access_guard, FAYS_SDK_INITIALIZATION_LOCK, fays_config_device_guard
 
 from .protocol import (
-    PoseSample, parse_slam_line, pose_rejection_reason, quat_conjugate,
-    quat_product, rotate_pose_z90,
+    FAYS_STAGE_KEYS, PoseSample, parse_slam_line, pose_rejection_reason,
+    quat_conjugate, quat_product, rotate_pose_z90,
 )
 
 
@@ -36,6 +36,132 @@ STALL_TIMEOUT_S = 5.0
 MONITOR_INTERVAL_S = 1.0
 RUNNING_REPORT_INTERVAL_S = 60.0   # 心跳行稀疏化，避免刷屏；卡死检测仍 5s
 ALLOWED_NICE_ADJUSTMENTS = frozenset({0, 5})
+
+# [FPS_DATA] 的健康区间。2026-09-11 实测一整个会话 265 个样本：image
+# 48.47~50.41、process 28.31~31.97、imu 995~1006，抖动都 < 7%（而且桥接
+# 自己的滑动窗口**没有**启动低值 —— 首条就是 image=49.932，厂商 SDK 那个
+# `Stereo FPS: 8` 是另一套计数器）。阈值取实测下沿再留一段余量：这行只要
+# 打出来，就应该是真的出事了。
+FAYS_MIN_IMAGE_FPS = 45.0
+FAYS_MIN_PROCESS_FPS = 25.0
+FAYS_MIN_IMU_HZ = 900.0
+# 持续异常时的重复间隔。短暂抽风只留「进入 + 恢复」两行，长时间故障也
+# 不会刷屏。
+FPS_ANOMALY_REPEAT_S = 30.0
+
+
+def fays_rate_problems(sample):
+    """逐秒遥测里过低的项；返回空列表即健康。
+
+    注意这组阈值**抓不到时间戳回退** —— 丢一帧撼动不了 1 秒滑动窗口，实测
+    四次回退前后 image/process 毫无变化。回退由 ``[TIME_DROP]`` 自己那行
+    负责（``format_frame_time_regression``），两者互补。
+    """
+    problems = []
+    if sample.image_input < FAYS_MIN_IMAGE_FPS:
+        problems.append(
+            f"图像帧率低 image={sample.image_input:.1f}"
+            f"<{FAYS_MIN_IMAGE_FPS:g}")
+    if sample.imu_input < FAYS_MIN_IMU_HZ:
+        problems.append(
+            f"IMU 采样率低 imu={sample.imu_input:.1f}<{FAYS_MIN_IMU_HZ:g}")
+    if sample.process < FAYS_MIN_PROCESS_FPS:
+        problems.append(
+            f"处理帧率低 process={sample.process:.1f}"
+            f"<{FAYS_MIN_PROCESS_FPS:g}")
+    return problems
+
+
+def format_fays_rates(sample, problems):
+    """把一条**异常**的 [FPS_DATA] 采样压成单行 GUI 日志。
+
+    健康态由 ``FaysRateAlarm`` 静默：这行原本每秒一条，会塞满 main.log，
+    而它承载的信息（全量逐秒流）已经完整留在 ``logs/slam_native/`` 的
+    原生日志留档里，GUI 日志只留「出事了」的信号。
+
+    文案不得命中 protocol._ERROR_RE，否则会被判成 error 弹到 UI。
+    """
+    parts = [
+        f"image={sample.image_input:.1f}",
+        f"imu={sample.imu_input:.1f}",
+        f"process={sample.process:.1f}",
+    ]
+    stages = getattr(sample, "stage_times", None)
+    if stages:
+        # wait_ms= / preprocess_ms= / middle_ms= / post_ms=，去掉 _ms 后缀少占宽度
+        for key in FAYS_STAGE_KEYS:
+            if key in stages:
+                parts.append(f"{key[:-3]}={stages[key]:.1f}")
+    return "[SLAM] [FPS_DATA] " + " ".join(parts) + " ⚠ " + "；".join(problems)
+
+
+def format_frame_time_regression(sample):
+    """把一条 [TIME_DROP]/[TIME_REBASE] 压成单行 GUI 日志。
+
+    这类行**永远**打进 GUI 日志：它是崩溃链上游唯一的现场记录，而此前它落进
+    「未匹配行」，被 ``_handle_event`` 的 50 条上限吃掉 —— 2026-09-11 实测
+    原生日志里有 4 次回退、GUI 日志 0 条（开录几十秒后预算就被 [STAT] 之类
+    的周期行耗光了），等于真出事时反而看不见。
+
+    文案不得命中 protocol._ERROR_RE，否则会被判成 error 弹到 UI。
+
+    带上 ``seq``/``prev_seq`` 的对比结论，是为了让这行自解释：「图像帧晚到」
+    的三种成因（SDK 投递乱序 / 重复投递同一帧 / 帧配了旧时间戳）在时间戳上
+    长得一模一样，只有序号对比能分开，而三者的对策完全不同。
+    """
+    if sample.verdict == "rebase":
+        tag, note = "TIME_REBASE", "连续回退达上限，判定时钟跳变并换基准放行"
+    else:
+        tag, note = "TIME_DROP", "陈旧帧已丢弃（未进核心库）"
+    line = (
+        f"[SLAM] [{tag}] {note} ts={sample.ts:.3f} "
+        f"previous={sample.previous:.3f} delta={sample.delta:.3f}s "
+        f"seq={sample.seq}"
+    )
+    if sample.prev_seq is not None:
+        line += f" prev_seq={sample.prev_seq}"
+        if sample.seq < sample.prev_seq:
+            line += f"（序号落后 {sample.prev_seq - sample.seq} 帧）"
+        elif sample.seq == sample.prev_seq:
+            line += "（与已入库帧同号：重复投递）"
+        else:
+            line += "（序号正常前进：帧配了旧时间戳）"
+    return line + f" consecutive={sample.consecutive} total={sample.total}"
+
+
+class FaysRateAlarm:
+    """把逐秒遥测压成「只在异常时出声」。
+
+    健康态静默；进入异常打一行（带全部字段 + 低在哪几项）；持续异常每
+    ``repeat_s`` 重复一行；恢复正常再打一行收尾。这样一次短暂抽风只留两行，
+    长时间故障也不会刷屏，而恢复行让「到底是抽了一下还是一直坏」一眼可辨。
+    """
+
+    def __init__(self, repeat_s=FPS_ANOMALY_REPEAT_S):
+        self._repeat_s = float(repeat_s)
+        self._active = False
+        self._last_log_at = float("-inf")
+
+    def reset(self):
+        self._active = False
+        self._last_log_at = float("-inf")
+
+    def update(self, sample, now):
+        """→ 本次要写进 GUI 日志的行列表（多数时候为空）。"""
+        problems = fays_rate_problems(sample)
+        if not problems:
+            if not self._active:
+                return []
+            self._active = False
+            return [
+                f"[SLAM] [FPS_DATA] 帧率已恢复 image={sample.image_input:.1f} "
+                f"imu={sample.imu_input:.1f} process={sample.process:.1f}"
+            ]
+        if self._active and now - self._last_log_at < self._repeat_s:
+            return []
+        self._active = True
+        self._last_log_at = now
+        return [format_fays_rates(sample, problems)]
 
 
 @dataclass(frozen=True)
@@ -192,6 +318,7 @@ class SlamProcessController:
         self._pose_rotation_zero = None
         self._pose_rotation_zero_pending = True
         self._last_pose_reject_log = float("-inf")
+        self._fays_rates_alarm = FaysRateAlarm()
         self._unmatched_lines = 0
         self._started_event = threading.Event()
         self._sdk_ready_event = threading.Event()
@@ -209,7 +336,13 @@ class SlamProcessController:
         if not self._sdk_initialization_done.wait(timeout):
             return False
         snapshot = self.state.snapshot()
-        return self._sdk_ready_event.is_set() and snapshot.running and not snapshot.error
+        # 只看「本次运行真打出了标定标记」+「进程还活着」。不能再挂
+        # `not snapshot.error`：error 是粘滞字段——一旦命中 _ERROR_RE 就置上，
+        # 只在 start() 清，中途没人清；任何一条信息性输出（如 ld.so 的
+        # "cannot be preloaded ... ignored."）都会让标定明明已完成的这一次
+        # 返回 False，报出误导的「未等到 [FAYS-CALIB] 标记」。进程真死时
+        # running 已是 False，语义等价（2026-09-10 18:32 假超时事故）。
+        return self._sdk_ready_event.is_set() and snapshot.running
 
     @property
     def running(self):
@@ -283,6 +416,7 @@ class SlamProcessController:
             self._last_accepted_pose = None
             self._pose_rejecting = False
             self._last_pose_reject_log = float("-inf")
+            self._fays_rates_alarm.reset()
             self._pose_raw_seq = 0
             self._pose_lost_count = 0
             self._last_accepted_seq = 0
@@ -772,6 +906,14 @@ class SlamProcessController:
     ):
         if event.kind == "fays_rates":
             self._on_fays_rates(event.payload)
+            for line in self._fays_rates_alarm.update(
+                    event.payload, self._clock()):
+                self._log(line)
+            return
+        # 时间戳回退的现场记录，**永远**打进 GUI 日志：它是崩溃链上游唯一的
+        # 直接证据，且必须绕开下面那个未匹配行上限（否则真出事时看不见）。
+        if event.kind in ("time_drop", "time_rebase"):
+            self._log(format_frame_time_regression(event.payload))
             return
         if event.kind == "orb_diagnostic":
             self._on_orb_diagnostic(event.payload)
@@ -781,7 +923,8 @@ class SlamProcessController:
             return
         # 周期诊断行（ORB_STAGE/FAYS-AFFINITY 每秒各一条）只在
         # slam_stdout.log 全量留档，不打 GUI 日志避免刷屏；
-        # 崩溃取证由 _log_native_tail 读回。
+        # 崩溃取证由 _log_native_tail 读回。注意 [FPS_DATA] 不在此列 ——
+        # 它经 FaysRateAlarm 只在帧率过低时报（全量逐秒流同样在留档里）。
         if event.kind in ("orb_stage", "affinity"):
             return
         if event.kind == "ready":

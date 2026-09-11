@@ -1,6 +1,6 @@
 # collector — Multimodal Data Acquisition SDK · 多模态数据采集 SDK
 
-![Version](https://img.shields.io/badge/version-1.3.1-blue)
+![Version](https://img.shields.io/badge/version-1.3.2-blue)
 ![Python](https://img.shields.io/badge/python-3.12-blue)
 ![License](https://img.shields.io/badge/license-TBD-lightgrey)
 
@@ -361,6 +361,45 @@ are documented in [docs/index.md](docs/index.md#开发约定).
 
 ### Changelog
 
+- **v1.3.2** — stale SLAM frames (timestamp regression) are now rejected
+  before they reach the core library: the bridge counts *consecutive*
+  regressions, dropping single-frame glitches but rebasing after 30 — the
+  only path that lets it pass a frame the core accepts as a clock jump.
+  Previously every regression made the core flush its IMU queue and rebuild
+  the map, halting pose output for 0.2–1.34 s (longer when stationary). The
+  new `[TIME_DROP]`/`[TIME_REBASE]` lines always reach the GUI log — they
+  used to fall into the unmatched-line bucket and get eaten by its 50-line
+  budget (measured: 4 regressions in the native log, 0 in the GUI log) —
+  and carry a `seq`/`prev_seq` comparison that separates the three causes
+  that look identical on timestamps alone (out-of-order delivery / the same
+  frame delivered twice / a frame carrying an old timestamp). Per-second
+  telemetry `[FPS_DATA]` is now silent while healthy and speaks only on
+  anomaly (entry line, recovery line, 30 s repeat while it persists; the
+  full per-second stream stays in the native log). `wait_sdk_ready` no
+  longer trips over the sticky `state.error` field, so an informational
+  line (e.g. ld.so's `cannot be preloaded ... ignored.`) can no longer make
+  a run that did print the calibration marker report a misleading "did not
+  see [FAYS-CALIB] marker" (the 2026-09-10 18:32 false timeout). The native
+  log is archived to `logs/slam_native/` (last 20 kept) before its runtime
+  directory is removed — a cleanly exited session's native log used to be
+  unrecoverable, which is exactly how the only evidence of a SLAM crash was
+  lost. Trajectory display drops the Qt-main-thread deep copy that made the
+  `_rendered_trajectory is traj` identity check always false (the direct
+  cause of "the view gets slower the longer you record"), raises the
+  display cap 400 → 6000, and draws with a vectorised projection plus one
+  `drawPolyline` — fixing the visible kinks that appeared after ~13 s
+  (decimation doubles its stride, so the vertex count always lands in
+  [cap/2, cap]; the data itself was always full 30 Hz). The RGB external
+  queues are drained at all three recording boundaries, fixing the previous
+  episode's tail plus the start-up window being written as the head of the
+  new video (measured ~28 head frames matching the prior episode's last
+  frames). Task progress is reported only for tasks present in the
+  backend's current list (locally created tasks have no server-side project
+  and are rejected 400), and when the backend reports a `"sessions"` basis
+  for a project the first report sends this machine's full count as a
+  baseline — sending only the increment collapses the backend's count from
+  the session count down to the increment itself (seen in the field: a
+  3/3/3 project became 1 after one more recording).
 - **v1.3.1** — force-matrix storage spec is now a five-way choice
   (int16 / int16×10 / ×100 / ×1000 / float32) switchable from the
   toolbar, defaulting to ×100 — quantisation error down to 0.9 % of the
@@ -740,6 +779,34 @@ i18n 文案经 `tr()` 翻译、PyQt5 信号参数用 `object` 封送大整数、
 
 ### 更新记录
 
+- **v1.3.2** — SLAM 陈旧帧（时间戳回退）改在入库前拦截：桥接按「连续回退
+  次数」判定——单帧脏读丢弃、连丢 30 帧才判定时钟真跳变并换基准放行（此前
+  每一帧回退都会让核心库清空 IMU 队并重建地图、位姿停发 0.2–1.34 s，静止时
+  更久）。新增 `[TIME_DROP]`/`[TIME_REBASE]` 现场行并**无条件**打进 GUI
+  日志——此前它落进未匹配行、被 50 条上限吃掉（实测原生日志 4 次回退、
+  GUI 日志 0 条，真出事时反而看不见）；行内带 `seq`/`prev_seq` 对比结论，
+  以区分「SDK 乱序投递 / 重复投递同一帧 / 帧配了旧时间戳」三种成因——它们在
+  时间戳上长得一模一样，而对策完全不同。逐秒遥测 `[FPS_DATA]` 改「只在异常
+  时出声」：健康静默、进入异常与恢复各一行、持续异常每 30 s 重复一行，全量
+  逐秒流仍留在原生日志里。修 `wait_sdk_ready` 就绪门被**粘滞** `state.error`
+  锁死——任何信息性输出（如 ld.so 的 `cannot be preloaded ... ignored.`）都会
+  让标定明明已完成的这一次返回 False、报出误导的「未等到 [FAYS-CALIB] 标记」
+  （2026-09-10 18:32 假超时事故，文案白名单 + 去掉粘滞判断双管修）。原生日志
+  在其 runtime 目录被删之前留档到 `logs/slam_native/`（保留最近 20 份），修
+  「一次干净退出的会话其原生日志不可恢复」——排查 SLAM 崩溃时唯一的证据曾
+  随目录一起被删。轨迹显示去掉 Qt 主线程上的整条深拷贝（正是这次拷贝让
+  `_rendered_trajectory is traj` 判等恒为假、每个位姿都在主线程复制随会话
+  线性增长的点列，即「画一段时间后帧率变低」的直接原因）；显示上限
+  400→6000，并以向量化投影 + 一次 `drawPolyline` 绘制，修「十几秒后轨迹显出
+  折角」——降采样按 stride 翻倍使顶点数恒落 [上限/2, 上限]，上限 400 时每段
+  跨 67 ms 且随 stride 每翻一倍继续变粗，观感像 SLAM 出点变慢，实际数据一直
+  是满 30 Hz，是绘制侧丢的。RGB 外部队列在录制开始/结束/中止三个边界排空，
+  修「上一段残留 + 本段启动窗口累积被写成新视频开头」（实测每段开头约 28 帧
+  与上一段 episode 末帧逐帧匹配，队列满时还占 ~110 MB/槽）。任务进度只上报
+  后端当前任务列表里存在的任务（本地自建任务平台没这个项目，上报必被拒
+  400），且后端该项目口径为 `"sessions"`（从没收到过任何上报）时首次送本机
+  **全量**当基线——只送增量会把后端计数从 session 数砸成增量本身（现场：
+  3/3/3 的项目再录一条变 1）。
 - **v1.3.1** — 力矩阵落盘规格改为 5 档可选（int16 / int16×10 / ×100 /
   ×1000 / float32），工具栏「🎚 力矩阵精度」可切、默认 ×100——量化误差降到
   传感器自身噪声的 0.9%，体积仍是 float32 的 38%；倍率记在每段一份的

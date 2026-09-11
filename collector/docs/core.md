@@ -552,6 +552,8 @@ GET `/api/v1/device/tasks?device_name=…`。设计模式参照已移除的 `Syn
 | --- | --- | --- | --- |
 | `CONNECT_TIMEOUT` | int | 10 | HTTP 请求超时（秒） |
 | `PROGRESS_RETRY_INTERVAL_S` | float | 600 | 进度端点 404 后进入降级，冷却期满再探一次（见 `_progress_retry_at`） |
+| 上报白名单 | — | `_cached_tasks` | 只上报最近一次成功轮询里存在的任务：本地自建任务（平台没这个项目）上报必被拒 400，跳过不发也不报错 |
+| 首报基线 | — | `_progress_source` | 后端该项目口径为 `"sessions"`（还没收到过任何上报）时，首次上报送本机**全量**而非增量 —— 只送增量会把后端计数从 session 数砸成增量本身（3/3/3 的项目再录一条变 1）；上报成功即本地转 `reported`，之后只送增量 |
 | 轮询间隔 | int | `settings.TASK_POLL_INTERVAL_MS`（默认 30000） | 读不到时 `getattr` 兜底 5000 毫秒（代码兜底值，非配置默认） |
 | 设备认领名 | str | `settings.DEVICE_NAME` | 读不到时回退 `"EGO_001"`；作为 `device_name` 查询参数 |
 | API 端点 | — | `POST /api/v1/auth/login`、`GET /api/v1/device/tasks`、`POST /api/v1/device/tasks/progress` | 登录 body 含 `username/password/remember_me`；进度上报 body 含 `task_id/session_id/increment/device_name`，`session_id = "{device}:{task_id}:{水位}"` 幂等（后端按 `(device_name, session_id)` 去重，重复请求返回当前全局数不重复加；游客上报公共任务应放行）；404 → `_progress_supported=False` 降级本地口径，冷却期过后自动重探恢复（不必重启）；`set_server_url` 立即解除降级 |

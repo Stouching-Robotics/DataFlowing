@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 
+from config import settings
 from core.gripper import paths
 from core.gripper.fays_runtime import (
     FAYS_MIN_USB_SPEED_MBPS,
@@ -42,6 +43,62 @@ _INSTANCE_IPC_FILES = (
     "orb_current_frame.jpg", "orb_control.json.tmp", "orb_control.json",
     "orb_raw_stream.sock", "camera_calibration.yaml", "imu.yaml",
 )
+
+# 原生 SLAM 日志留档。runtime_dir 在 release() 里被 rmtree，而 ORB_STAGE /
+# FAYS-AFFINITY 这类逐秒诊断**只**写这个文件（GUI 日志刻意不转发它们），
+# 所以一次干净退出的会话，其原生日志原本不可恢复 —— 2026-09-11 排查 SLAM
+# 崩溃时就撞在这上面：唯一的证据随目录一起被删了。留档放 logs/ 下的独立
+# 子目录，免得和 main.log 混放。
+_NATIVE_LOG_NAME = "slam_stdout.log"
+_NATIVE_LOG_ARCHIVE_KEEP = 20
+
+
+def _native_log_archive_dir():
+    return os.path.join(settings.LOGS_DIR, "slam_native")
+
+
+def _prune_native_log_archive(logger=None):
+    """只保留最近 _NATIVE_LOG_ARCHIVE_KEEP 份留档（长期运行不撑爆磁盘）。"""
+    directory = _native_log_archive_dir()
+    try:
+        names = sorted(
+            name for name in os.listdir(directory)
+            if name.endswith(_NATIVE_LOG_NAME)
+        )
+    except OSError:
+        return
+    # 文件名前缀是 %Y%m%d_%H%M%S，字典序即时间序，不必逐个 stat
+    for name in names[:-_NATIVE_LOG_ARCHIVE_KEEP]:
+        try:
+            os.unlink(os.path.join(directory, name))
+        except OSError:
+            pass
+
+
+def _archive_native_log(runtime_dir, serial, logger=None):
+    """把即将被 rmtree 的 slam_stdout.log 拷进 logs/slam_native/。
+
+    纯取证手段：任何失败只记一行日志，绝不打断 release() 的清理流程
+    （留档丢了是少一份证据，清理半途而废会留下脏的租约/IPC 目录）。
+    """
+    source = os.path.join(runtime_dir, _NATIVE_LOG_NAME)
+    if not os.path.isfile(source):
+        return None
+    try:
+        directory = _native_log_archive_dir()
+        os.makedirs(directory, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        lease_key = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(serial or "unknown"))
+        target = os.path.join(
+            directory, f"{stamp}_{lease_key}_{_NATIVE_LOG_NAME}",
+        )
+        shutil.copy2(source, target)
+    except OSError as exc:
+        if logger is not None:
+            logger(f"[Gripper-Fays] 原生日志留档失败: {exc}")
+        return None
+    _prune_native_log_archive(logger)
+    return target
 
 
 class GripperFaysError(RuntimeError):
@@ -322,6 +379,12 @@ class SingleFaysLease:
                     pass
             self._ipc_dir = None
             if self._runtime_dir:
+                # 先留档再删：slam_stdout.log 只活在这个目录里，删掉就没了
+                _archive_native_log(
+                    self._runtime_dir,
+                    (selected or {}).get("product_serial"),
+                    self._logger,
+                )
                 shutil.rmtree(self._runtime_dir, ignore_errors=True)
                 self._runtime_dir = None
             if selected is not None:

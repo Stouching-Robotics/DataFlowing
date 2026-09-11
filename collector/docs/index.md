@@ -231,3 +231,4 @@ VENV_PY=/path/to/python ./tools/hand_3d_d435/run_live_d435.sh
 - `docs/config.md`、`docs/core.md` — 配置、SDK 核心（采集/设备管理器/录制落盘/上传/回放/手套传感）
 - `docs/ui.md`、`docs/scripts.md` — 界面、离线脚本
 - `docs/demos.md`、`docs/stereo_s80m.md`、`docs/tools.md`、`docs/hand_detection.md` — demo、S80M、工具与手部检测
+- `docs/postmortem_trajectory_and_rgb.md` — 两个疑难问题的复盘：轨迹「有棱有角」与 RGB 段首旧帧（根因、评估过的方案、最终修法与回归防护）

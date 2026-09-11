@@ -2,7 +2,7 @@
 
 无 OpenGL——与 Tk 版同一理由：避免 GLX/X11 BadWindow 致命错误。
 主窗口按位姿节奏调用 update(position, rotation, trajectory)；paintEvent
-全量重绘（位姿 ~30Hz 时每条线几十个点，QPainter 开销可忽略）。
+全量重绘（位姿 30Hz，轨迹点数随会话线性增长，绘制用一次 drawPolyline）。
 轨迹显示降采样到 DISPLAY_TRAJECTORY_MAX_POINTS 点；左键拖动旋转视角、
 右键/中键拖动平移、滚轮缩放、双击复位视角。
 """
@@ -17,10 +17,17 @@ from PyQt5.QtCore import Qt, QPointF, QRectF
 from PyQt5.QtGui import QColor, QPainter, QPen, QPolygonF
 from PyQt5.QtWidgets import QWidget
 
-DISPLAY_TRAJECTORY_MAX_POINTS = 400
+# 显示上限。这个值直接决定轨迹看起来光不光滑：降采样按 stride 翻倍，
+# 画出顶点数始终落在 [cap/2, cap] —— 上限是 400 时，只要会话超过 400 点
+# （30Hz 下 13 s）顶点数就从 400 掉到 201，每段跨 67 ms，折线开始明显切角，
+# 且随 stride 每翻一倍继续变粗（801 点→133 ms/段，1601 点→267 ms/段）。
+# 观感像「SLAM 出点变慢」，实际数据一直是满 30Hz，是绘制侧丢的。
+# 6000 是实测代价选出来的：矢量投影 + drawPolyline 下 6000 点约
+# 2ms/帧绘制 + 3ms/次刷新，而顶点数下限 3000 已让折线远密于像素。
+DISPLAY_TRAJECTORY_MAX_POINTS = 6000
 TRAJECTORY_UPDATE_MIN_INTERVAL = 1.0 / 25.0
 # 网格降采样：stride 只增不减（2 的幂）且锚定索引 0——旧顶点索引永不滑动，
-# 新点只在落上网格时追加；stride 翻倍只发生在点数超过 400×stride 时
+# 新点只在落上网格时追加；stride 翻倍只发生在点数超过上限×stride 时
 # （一次离散简化，顶点只减不挪，不再每帧整体重抽）。
 # span 自适配：只在探索前沿超过当前 span 的 85% 时外扩一次（缓动 0.3s，
 # 目标为前沿 ×1.35），其余时间完全固定——前沿位姿噪声不再牵动整幅画面。
@@ -86,12 +93,18 @@ class PoseViewQt(QWidget):
 
     # ---- 外部接口 ----
     def update_pose(self, position, rotation, trajectory=()):
-        """位姿主路径：更新相机/夹爪绘制并触发重绘。"""
+        """位姿主路径：更新相机/夹爪绘制并触发重绘。
+
+        trajectory 按引用透传：桥接侧只在新增轨迹点时重建元组（见
+        bridge.py 的 _trajectory_points 文档），_maybe_refresh_trajectory
+        靠 `is` 判等命中「没有新点」的绝大多数调用。这里若再拷一份，判等
+        恒为假，等于每个位姿都在 Qt 主线程深拷贝整条轨迹——点数随会话线性
+        增长，正是「画一段时间后帧率变低」的原因。
+        """
         self._position = np.asarray(position, dtype=float).reshape(3)
         self._rotation = np.asarray(rotation, dtype=float).reshape(3, 3)
         if trajectory:
-            self._maybe_refresh_trajectory(tuple(
-                tuple(point) for point in trajectory))
+            self._maybe_refresh_trajectory(trajectory)
         self.update()
 
     def set_grip_state(self, percentage, gripped):
@@ -258,9 +271,8 @@ class PoseViewQt(QWidget):
         cx = width / 2.0
         cy = height / 2.0
         unit = min(width, height) / 2.0 * 0.78
-        self._cached_trajectory_points = [
-            self._project(point, self._cached_span, cx, cy, unit)
-            for point in display_traj]
+        self._cached_trajectory_points = self._project_many(
+            display_traj, self._cached_span, cx, cy, unit)
 
     def _decimated_trajectory(self, trajectory):
         """锚定索引 0 的固定网格降采样，已绘制顶点索引永不滑动。
@@ -316,6 +328,24 @@ class PoseViewQt(QWidget):
             cx + (x1 + self._pan_x) / span * unit,
             cy - (y1 + self._pan_y) / span * unit)
 
+    def _project_many(self, points, span, cx, cy, unit):
+        """批量投影成 QPolygonF，供一次 drawPolyline 画完整条轨迹。
+
+        与逐点调 _project 结果逐点相同，只是把三角函数提到循环外并整体
+        向量化（几千点时省掉大部分开销）。整条轨迹必须作为**一条**折线交给
+        Qt：逐段 drawLine 是每次 paintEvent 上万次 Python→Qt 调用，正是显示
+        上限只能卡在 400 的原因。
+        """
+        pts = np.asarray(points, dtype=float).reshape(-1, 3)
+        cos_a, sin_a = math.cos(self._azimuth), math.sin(self._azimuth)
+        cos_e, sin_e = math.cos(self._elevation), math.sin(self._elevation)
+        x1 = pts[:, 0] * cos_a - pts[:, 1] * sin_a
+        y1 = (pts[:, 0] * sin_a + pts[:, 1] * cos_a) * cos_e + pts[:, 2] * sin_e
+        return QPolygonF([
+            QPointF(cx + (x + self._pan_x) / span * unit,
+                    cy - (y + self._pan_y) / span * unit)
+            for x, y in zip(x1, y1)])
+
     def _draw_static(self, painter, width, height, cx, cy, unit, span):
         def project(point):
             return self._project(point, span, cx, cy, unit)
@@ -340,12 +370,11 @@ class PoseViewQt(QWidget):
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor("#50d890"))
         painter.drawEllipse(origin, radius, radius)
-        # 轨迹线
+        # 轨迹线：整条一次画完（逐段 drawLine 的 Python 开销随点数线性增长，
+        # 会把能显示的点数压到几百，轨迹因此显出折角）
         if len(self._cached_trajectory_points) >= 2:
             painter.setPen(QPen(TRAJECTORY, 1.6))
-            path_points = self._cached_trajectory_points
-            for start, end in zip(path_points, path_points[1:]):
-                painter.drawLine(start, end)
+            painter.drawPolyline(self._cached_trajectory_points)
         # 标题
         painter.setPen(TITLE)
         display_count = len(self._cached_trajectory_points)

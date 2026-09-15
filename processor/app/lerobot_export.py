@@ -82,8 +82,42 @@ def _quantiles(arr: "np.ndarray") -> list[float]:
     return [float(q) for q in np.nanpercentile(arr, [1, 10, 50, 90, 99])]
 
 
+def _nanpercentile_axis0(mat: "np.ndarray", qs) -> "np.ndarray":
+    """等价于 ``np.nanpercentile(mat, qs, axis=0)``,但整矩阵一次算完。
+
+    numpy 对带 axis 的 nanpercentile 会退化成 ``apply_along_axis`` —— 逐列
+    调 Python。触觉力矩阵是 (帧数, 187500),那就是每次 18.75 万次 1-D 调用,
+    实测 4.5 秒;两个矩阵就是 9 秒。这里改成"整矩阵排序一次 + 按各列有效值
+    个数做向量化索引",全走 C 层,实测 0.30 秒(15 倍),数值逐元素一致
+    (linear 插值口径与 numpy 相同,已对无 NaN/含 NaN/单行/整列 NaN/常数列
+    逐一比对)。
+
+    NaN 排到每列末尾后不影响取值 —— 有效值个数 counts 把它们排除在外。
+    """
+    import numpy as np
+    qs = np.asarray(qs, dtype=np.float64)
+    valid = np.isfinite(mat)
+    counts = valid.sum(axis=0)
+    safe = np.where(valid, mat, np.inf)
+    safe.sort(axis=0)
+    n = counts[None, :]
+    # linear 插值:virtual_index = q/100 * (n - 1),在 lo/hi 之间按小数部分插值
+    pos = (n - 1) * (qs[:, None] / 100.0)
+    lo = np.floor(pos)
+    frac = pos - lo
+    hi = np.ceil(pos)
+    last = np.maximum(n - 1, 0)
+    lo_i = np.clip(lo, 0, last).astype(np.intp)
+    hi_i = np.clip(hi, 0, last).astype(np.intp)
+    cols = np.arange(mat.shape[1])[None, :]
+    out = safe[lo_i, cols] * (1 - frac) + safe[hi_i, cols] * frac
+    out[:, counts == 0] = np.nan  # 与 nanpercentile 一致:整列无效 → NaN
+    return out
+
+
 def _write_stats(output_dir: Path,
-                 video_features: dict[str, dict] | None = None) -> None:
+                 video_features: dict[str, dict] | None = None,
+                 data_table=None) -> None:
     """LeRobot 官方 meta/stats.json:每个数值列 mean/std/min/max(训练归一化用)。
 
     官方数据集(如 aloha_mobile)在 meta/stats.json 提供统计量,训练管线
@@ -96,17 +130,28 @@ def _write_stats(output_dir: Path,
       observation.images.* 同款 [3,1,1] 嵌套)。
 
     变长嵌套数组列与字符串列不做数值统计。
+
+    ``data_table``: 调用方刚写进 data/ 的 arrow table。传了就直接转 pandas,
+    省掉把整个 data 目录从磁盘再读一遍;不传(旧调用点/表不可用)则退回
+    原磁盘路径,行为不变。
     """
     import numpy as np
     import pandas as pd
     try:
-        parquet_files = sorted((output_dir / "data").rglob("*.parquet"))
-        if not parquet_files:
-            return
-        frames = [pd.read_parquet(p) for p in parquet_files]
-        if not frames:
-            return
-        df = pd.concat(frames, ignore_index=True)
+        if data_table is not None:
+            # ``pd.read_parquet`` 内部就是 ``pq.read_table(...).to_pandas()``,
+            # 所以这里转出来的 DataFrame 与重读磁盘逐列同 dtype、同值(实测
+            # 校验过),但省掉一次全量往返 —— data/ 实测约 13MB/集,50 集
+            # 就是 650MB 从 SSHFS 重新搬进内存再 concat。
+            df = data_table.to_pandas()
+        else:
+            parquet_files = sorted((output_dir / "data").rglob("*.parquet"))
+            if not parquet_files:
+                return
+            frames = [pd.read_parquet(p) for p in parquet_files]
+            if not frames:
+                return
+            df = pd.concat(frames, ignore_index=True)
     except Exception:
         return
     stats: dict[str, dict] = {}
@@ -162,7 +207,7 @@ def _write_stats(output_dir: Path,
                 continue
             if mat.ndim != 2 or not np.isfinite(mat).any():
                 continue
-            q = np.nanpercentile(mat, [1, 10, 50, 90, 99], axis=0)
+            q = _nanpercentile_axis0(mat, [1, 10, 50, 90, 99])
             stats[col] = {
                 "min": np.nanmin(mat, axis=0).tolist(),
                 "max": np.nanmax(mat, axis=0).tolist(),
@@ -1072,6 +1117,41 @@ def _flat63(kps) -> list:
     return arr.tolist()
 
 
+def _force_matrix_semantics(root: Path) -> dict[str, dict]:
+    """从源 canonical 数据集读力矩阵的语义元数据。
+
+    力矩阵列存的不是力值本身,而是**行内差分后的定标整数**:采集端先按规格
+    把 (250,250,3) 的力值放大 ``scale`` 倍(实测 100)再四舍五入成 int16,
+    然后逐行做差分压体积。还原要两步 —— 先 ``cumsum`` 再 ``÷ scale``。
+
+    这两个字段只写在源 ``meta/info.json`` 的 features 里,**parquet 本身
+    不带**。导出若不透传,产物就只剩一条裸整数列表:不知道要 cumsum(拿到
+    的一列差分值毫无意义),也不知道要除以 100(即使还原了也差两个数量级)。
+    数据一个字节没丢,但已经没人能正确解释它了。
+
+    ``encoding``/``scale``/``units``/``names`` 原样搬运,不做解释 —— 消费
+    者按源契约解码即可。
+    """
+    import json
+
+    try:
+        info = json.loads((Path(root) / "meta" / "info.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    features = info.get("features")
+    if not isinstance(features, dict):
+        return {}
+    carried_keys = ("encoding", "scale", "units", "names")
+    out: dict[str, dict] = {}
+    for name, spec in features.items():
+        if "force_matrix" not in str(name) or not isinstance(spec, dict):
+            continue
+        carried = {k: spec[k] for k in carried_keys if k in spec}
+        if carried:
+            out[str(name)] = carried
+    return out
+
+
 def _passthrough_dtype(key: str, sensor_rows: dict[int, dict]) -> str:
     """透传列的声明 dtype 必须与真实值一致(官方加载器按声明 cast,
     实测 gesture 字符串列被泛型 float32 声明 → ArrowInvalid 崩溃)。
@@ -1414,7 +1494,12 @@ def _sanitize_row(row: dict, nan_fill: float = float("nan")) -> None:
     """
     for key, value in list(row.items()):
         if isinstance(value, list):
-            if any(v is None for v in value):
+            # ``None in value`` 走 C 层容器查找,比 ``any(v is None ...)``
+            # 的 Python 生成器快约 2.3 倍。语义等价:``in`` 用 ``==``,
+            # 而数值/字符串与 None 比较恒为 False。
+            # 必须保留 isinstance 前置判断 —— numpy 数组的 ``__eq__``
+            # 返回数组,``in`` 会抛 "truth value of an array is ambiguous"。
+            if None in value:
                 row[key] = [nan_fill if v is None else v for v in value]
         elif value is not None:
             continue
@@ -1975,6 +2060,11 @@ def build_lerobot_dataset(dataset_name: str, episode_ids: list[str], output_dir:
     # Device metadata is used only to derive the dataset robot_type.  It is
     # intentionally not exported as a standalone meta/devices.json file.
     device_metadata_by_episode: dict[str, list[dict]] = {}
+    # 力矩阵的 scale/encoding 等只存在于源 info.json,按 key 收集后写进
+    # 导出产物的 features 声明(见 _force_matrix_semantics)。源根 → 元数据
+    # 加一层缓存:同项目几十集共用一份 info.json,不必每集重读。
+    force_matrix_meta: dict[str, dict] = {}
+    _force_meta_cache: dict[str, dict[str, dict]] = {}
     depth_source_keys: set[str] = set()
     video_features: dict[str, dict] = {}
     # 手部骨骼产物(工作流中处理节点连到导出节点时传入)—— 按 frame 对齐。
@@ -2004,6 +2094,19 @@ def build_lerobot_dataset(dataset_name: str, episode_ids: list[str], output_dir:
         episode_id = str(episode["id"])
         session_dir = Path(episode["path"])
         device_metadata_by_episode[episode_id] = _device_metadata(session_dir)
+        # 力矩阵元数据随源数据集而来。跨项目导出可能混到不同录制规格的集
+        # (scale 10/100/1000 互不兼容),一个 features 声明只能写一个值 ——
+        # 以先出现的为准并出声,不要静默按第一份解读整批数据。
+        root_key = str(session_dir)
+        if root_key not in _force_meta_cache:
+            _force_meta_cache[root_key] = _force_matrix_semantics(session_dir)
+        for fm_key, fm_spec in _force_meta_cache[root_key].items():
+            previous = force_matrix_meta.get(fm_key)
+            if previous is None:
+                force_matrix_meta[fm_key] = fm_spec
+            elif previous != fm_spec:
+                print(f"[Export] 力矩阵规格不一致 {fm_key}: episode {episode_id} "
+                      f"为 {fm_spec},此前为 {previous};沿用前者")
         streams = episode.get("camera_streams") or {}
         # 本集实际导出的每路视频(帧数, fps) → episodes parquet 的
         # videos/<key>/from_timestamp 映射(官方 v3 加载器按时间戳定位帧)
@@ -2338,18 +2441,24 @@ def build_lerobot_dataset(dataset_name: str, episode_ids: list[str], output_dir:
                 robot_kinds.append(kind)
     robot_type = "+".join(robot_kinds) or "unknown"
 
+    # 刚写进 data/ 的表顺手留给 _write_stats:省掉它把整个 data 目录从磁盘
+    # 再读回来一遍(见 _write_stats 的 data_table 参数说明)。
+    data_table = None
     if is_v2:
         # v2.1: each episode has one data parquet.  The official v2.1
         # converter reads the legacy JSONL files below; do not create a
         # nested v3-style meta/episodes parquet tree in a v2.1 export.
         episode_index_rows = []
+        _v2_tables = []
         for ep_index, (_, task_id, length, start, end) in enumerate(
                 episode_row_ranges):
             episode_chunk = ep_index // 1000
             data_dir = output_dir / "data" / f"chunk-{episode_chunk:03d}"
             data_dir.mkdir(parents=True, exist_ok=True)
-            pq.write_table(pa.Table.from_pylist(rows[start:end]),
+            episode_table = pa.Table.from_pylist(rows[start:end])
+            pq.write_table(episode_table,
                            data_dir / f"episode_{ep_index:06d}.parquet")
+            _v2_tables.append(episode_table)
             record = {
                 "episode_index": ep_index,
                 "tasks": [task_descriptions[task_id]],
@@ -2378,12 +2487,20 @@ def build_lerobot_dataset(dataset_name: str, episode_ids: list[str], output_dir:
                                  default=_json_default)
                       for record in episode_index_rows) + "\n",
             encoding="utf-8")
+        # 逐集表的 schema 可能因某一集整列为空而不同(类型推断随值走),
+        # concat 失败就退回磁盘重读 —— 统计量宁可慢,不能缺。
+        try:
+            data_table = (pa.concat_tables(_v2_tables, promote=True)
+                          if _v2_tables else None)
+        except Exception:
+            data_table = None
         _write_episodes_stats_v21(output_dir, episode_row_ranges, rows,
                                   episode_video_meta_records, video_features)
     else:
         data_dir = output_dir / "data" / "chunk-000"
         data_dir.mkdir(parents=True, exist_ok=True)
-        pq.write_table(pa.Table.from_pylist(rows), data_dir / "file-000.parquet")
+        data_table = pa.Table.from_pylist(rows)
+        pq.write_table(data_table, data_dir / "file-000.parquet")
         # Official v3 stores the complete episode table in one parquet file
         # (the writer may shard this directory for very large datasets).  A
         # per-episode file here is readable by our UI but is not the official
@@ -2628,6 +2745,11 @@ def build_lerobot_dataset(dataset_name: str, episode_ids: list[str], output_dir:
             else:
                 features[key] = {"dtype": _passthrough_dtype(key, sensor_rows),
                                  "shape": shape}
+                # 力矩阵的行内差分/定标倍率不是能从数据本身看出来的属性,
+                # 必须跟着声明一起走,否则产物不可解读(见 _force_matrix_semantics)。
+                semantics = force_matrix_meta.get(key)
+                if semantics:
+                    features[key].update(semantics)
     if junk_cols:
         features = {k: v for k, v in features.items() if k not in junk_cols}
     # 调用方剔除的列同样从声明里去掉。features 由 sensor_rows 样本推导,
@@ -2720,8 +2842,15 @@ def build_lerobot_dataset(dataset_name: str, episode_ids: list[str], output_dir:
     # 查看器/加载器读 parquet schema metadata 里的内嵌 info 而非
     # meta/info.json —— 缺失时数据集校验报 total_episodes/total_frames
     # 无效(实测 viewer 报错场景)。
+    # 先算 stats 再嵌 parquet 元数据。两者读写互不相干(stats 只用到内存里
+    # 刚写好的 data_table + video_features + videos/*.mp4;embed 只重写
+    # data/ 与 meta/episodes/ 的 schema metadata),换序不改变任何产物。
+    # 换序是为了内存:_embed_info_metadata 自己会把整份 data parquet 读进
+    # 内存(v3 是单文件,50 集约 650MB),若此时 data_table 还活着,峰值
+    # 就凭空多出一整个数据集的量。算完立刻放掉引用。
+    _write_stats(output_dir, video_features, data_table)
+    data_table = None
     _embed_info_metadata(output_dir, info_json)
-    _write_stats(output_dir, video_features)
 
     tasks_path = output_dir / "meta" / "tasks.jsonl"
     tasks_path.parent.mkdir(parents=True, exist_ok=True)

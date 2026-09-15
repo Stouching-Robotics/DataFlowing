@@ -7,11 +7,16 @@
     .frame-strip-cell.unlabeled { background: #374151; }
     #batch-bar {
         transition: max-height 0.2s ease, opacity 0.2s ease, padding 0.2s ease;
-        max-height: 44px; opacity: 1;
+        max-height: 96px; opacity: 1;
     }
     #batch-bar.hidden {
         max-height: 0; opacity: 0; padding-top: 0; padding-bottom: 0;
-        overflow: hidden; border-top-width: 0;
+        overflow: hidden; border-bottom-width: 0;
+    }
+    /* 选中的卡片:除了左侧 checkbox,整张卡片也给一个可扫视的标记 */
+    .episode-card.selected {
+        background: rgba(37, 99, 235, 0.14);
+        box-shadow: inset 2px 0 0 0 #3b82f6;
     }
     :root { --timeline-side-width: 370px; }
     .timeline-row {
@@ -451,27 +456,39 @@
     <input type="hidden" id="filter-task" value="">
     <input type="hidden" id="search-input" value="">
 
-    <!-- 2. Episode list section (fills available space, independent scroll) -->
-    <div id="episode-list-section" class="flex-1 min-h-0 overflow-y-auto hide-scrollbar">
-        <!-- Select-all bar (only visible in reviewed mode) -->
-        <div id="select-all-bar" class="px-3 py-1.5 border-b border-gray-800 flex items-center justify-between hidden bg-gray-800/50">
-            <label class="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
-                <input type="checkbox" id="select-all-checkbox" onchange="toggleSelectAll(this.checked)" class="w-3.5 h-3.5 rounded accent-blue-600">
-                <span id="select-all-label" data-i18n="select_all">Select All</span>
-                <span id="select-count" class="text-gray-500">(0/0)</span>
-            </label>
+    <!-- 2. Select-all bar (only visible in selection mode) -->
+    <div id="select-all-bar" class="px-3 py-1.5 border-b border-gray-800 flex items-center justify-between flex-shrink-0 hidden bg-gray-800/50">
+        <label class="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
+            <input type="checkbox" id="select-all-checkbox" onchange="toggleSelectAll(this.checked)" class="w-3.5 h-3.5 rounded accent-blue-600">
+            <span id="select-all-label" data-i18n="select_all">Select All</span>
+            <span id="select-count" class="text-gray-500">(0/0)</span>
+        </label>
+    </div>
+
+    <!-- 3. Batch action bar — 放在列表**上方**,不随列表滚动。
+         两个按钮是两条完全不同的路径:导出数据集要整库重建(约 30 秒/集),
+         打包下载是原样 zip(秒级)。文案里直接标出快慢,用户才不会点错。 -->
+    <div id="batch-bar" class="px-2 py-2 border-b border-gray-700 flex-shrink-0 hidden bg-gray-800">
+        <div id="batch-count" class="text-xs text-gray-300 mb-1.5">0 selected</div>
+        <div class="flex gap-1.5">
+            <button id="batch-export-btn" onclick="batchDownload(this)"
+                    class="flex-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs px-1.5 py-1.5 rounded font-medium whitespace-nowrap">
+                <span id="batch-export-label" data-i18n="batch_export_dataset">Export dataset</span>
+            </button>
+            <button id="batch-zip-btn" onclick="batchZipDownload(this)"
+                    class="flex-1 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 disabled:cursor-not-allowed text-gray-100 text-xs px-1.5 py-1.5 rounded font-medium whitespace-nowrap">
+                <span data-i18n="batch_zip_download">Zip download</span>
+            </button>
+            <button id="batch-cancel-btn" onclick="toggleSelectMode()"
+                    class="bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-gray-200 text-xs px-2 py-1.5 rounded font-medium whitespace-nowrap border border-gray-600"
+                    data-i18n="cancel">Cancel</button>
         </div>
-        <!-- Episode cards -->
+    </div>
+
+    <!-- 4. Episode list section (fills available space, independent scroll) -->
+    <div id="episode-list-section" class="flex-1 min-h-0 overflow-y-auto hide-scrollbar">
         <div id="episode-list-inline">
             <div class="p-4 text-center text-gray-500 text-sm" data-i18n="loading">Loading...</div>
-        </div>
-        <!-- Batch action bar -->
-        <div id="batch-bar" class="px-3 py-2 border-t border-gray-800 flex items-center justify-between hidden bg-gray-800">
-            <span id="batch-count" class="text-xs text-gray-300">0 selected</span>
-            <button onclick="batchDownload(this)"
-                    class="bg-blue-600 hover:bg-blue-500 text-white text-xs px-3 py-1.5 rounded font-medium">
-                <iconify-icon icon="ant-design:download-outlined" class="icon-sm"></iconify-icon> <span data-i18n="batch_download">Batch Download</span>
-            </button>
         </div>
     </div>
 
@@ -562,14 +579,14 @@
     </div>
 </aside>
 
-<script src="/static/js/media-cache.js?v=202609081530"></script>
-<script src="/static/js/depth-renderer.js?v=202609081530"></script>
-    <script src="/static/js/player.js?v=20260911-tactile-square-1to1"></script>
-    <script src="/static/js/hand-overlay.js?v=202609081630"></script>
-<script src="/static/js/heatmap.js?v=202609081530"></script>
-    <script src="/static/js/annotations.js?v=202609081530"></script>
-<script src="/static/js/slice-preview.js?v=202609081530"></script>
-    <script src="/static/js/app.js?v=202609081530"></script>
+<script src="/static/js/media-cache.js?v={{ asset_version }}"></script>
+<script src="/static/js/depth-renderer.js?v={{ asset_version }}"></script>
+    <script src="/static/js/player.js?v={{ asset_version }}"></script>
+    <script src="/static/js/hand-overlay.js?v={{ asset_version }}"></script>
+<script src="/static/js/heatmap.js?v={{ asset_version }}"></script>
+    <script src="/static/js/annotations.js?v={{ asset_version }}"></script>
+<script src="/static/js/slice-preview.js?v={{ asset_version }}"></script>
+    <script src="/static/js/app.js?v={{ asset_version }}"></script>
 <script>
     window.EGODATA_PAGE_MODE = {{ page_mode|tojson }};
 </script>

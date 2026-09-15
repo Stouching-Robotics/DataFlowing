@@ -15,7 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import (APIRouter, BackgroundTasks, Depends, HTTPException, Query,
+                     Request)
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
@@ -421,9 +422,50 @@ async def download_reviewed_sessions():
     return _build_episode_zip([str(e["id"]) for e in eps], "egodata-reviewed-", "reviewed.zip")
 
 
+async def _episode_ids_from_request(request: Request) -> list[str]:
+    """从 JSON body 或表单字段取 episode_ids(两种入参都支持)。
+
+    表单路径的值是逗号分隔的单字段 —— 浏览器原生 form POST 只能提交
+    表单编码,而它带来的流式下载正是我们想要的。
+    """
+    values: list[str] = []
+    content_type = request.headers.get("content-type", "")
+    try:
+        if "application/json" in content_type:
+            body = await request.json()
+            raw = (body or {}).get("episode_ids") or []
+            values = raw if isinstance(raw, list) else [raw]
+        else:
+            form = await request.form()
+            raw = form.get("episode_ids") or ""
+            values = str(raw).split(",")
+    except Exception:
+        return []
+    return [str(value).strip() for value in values if str(value).strip()]
+
+
 @router.post("/batch-download")
-async def batch_download_sessions(body: dict, _: str = Depends(verify_api_key)):
-    ids = body.get("episode_ids") or []
+async def batch_download_sessions(request: Request):
+    """打包下载所选批次 —— 从 canon 数据集里裁出选中的集,不重建。
+
+    产出仍是**单个** LeRobot 标准结构(data/ + meta/ + videos/),与单集
+    ``download-episode`` 走的是同一个 ``_zip_episode_selection``,区别只在
+    传入的 id 数量。与「导出数据集」(走 /start 的整库重建,约 30 秒/集)
+    的差异不在目录结构,而在内容:这里文件原样拷贝、episode 编号保留原值
+    (故可能不连续)、meta 整份拷贝自源数据集;重建则重新编号 0..N-1 并
+    按选中集重算 stats。
+
+    秒级返回,前端用两个按钮区分快慢。
+
+    入参两种都收:JSON ``{"episode_ids": [...]}`` 供程序调用;表单字段
+    ``episode_ids``(逗号分隔)供浏览器原生表单提交 —— 后者让浏览器自己
+    流式下载,不必把整个 zip 缓冲进内存再由 JS 触发。
+
+    鉴权:与 download-episode / download/{job_id} / download-reviewed 一致,
+    只靠 AuthMiddleware 的登录 cookie。此前额外的 Depends(verify_api_key)
+    会让浏览器 401(它拿不到 X-API-Key 头),而这三个兄弟端点都没有该依赖。
+    """
+    ids = await _episode_ids_from_request(request)
     if not ids:
         raise HTTPException(status_code=400, detail="No episode_ids provided")
     episode_ids: list[str] = []

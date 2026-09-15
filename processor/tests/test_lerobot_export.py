@@ -1,8 +1,12 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 
-from app.lerobot_export import _ensure_slam_pose, _ensure_observation_state
+from app.lerobot_export import (_ensure_slam_pose, _ensure_observation_state,
+                                _force_matrix_semantics, _write_stats)
 from app.umi_slam_action import poses_from_trajectory
 
 
@@ -99,6 +103,137 @@ class EnsureSlamPoseTests(unittest.TestCase):
         self.assertTrue(all(len(row["observation.state"]) == 4 for row in rows))
         # 位置分量是本帧相对本集第一帧的偏移 —— 首帧必须为原点
         self.assertTrue(np.allclose(rows[0]["observation.state"][:3], 0.0))
+
+
+class ForceMatrixSemanticsTests(unittest.TestCase):
+    """源 info.json → 导出 features 的力矩阵语义元数据搬运。
+
+    这些字段(scale/encoding)决定数值怎么还原:力矩阵存的是「放大 scale 倍
+    再取行内差分」的整数,少任何一个,产物里的力矩阵都无法解读。它们只写在
+    info.json 里,parquet 本身不带,所以导出必须显式搬运。
+    """
+
+    def _root(self, features: dict) -> Path:
+        root = Path(tempfile.mkdtemp())
+        (root / "meta").mkdir(parents=True)
+        (root / "meta" / "info.json").write_text(
+            json.dumps({"features": features}), encoding="utf-8")
+        return root
+
+    def test_carries_scale_and_encoding(self):
+        root = self._root({
+            "observation.gripper_left_force_matrix": {
+                "dtype": "int16", "shape": [250, 250, 3],
+                "encoding": "row_diff_quantized", "scale": 100,
+                "names": ["fx", "fy", "fz"], "units": ["mN", "mN", "mN"],
+            },
+        })
+        self.assertEqual(_force_matrix_semantics(root), {
+            "observation.gripper_left_force_matrix": {
+                "encoding": "row_diff_quantized", "scale": 100,
+                "names": ["fx", "fy", "fz"], "units": ["mN", "mN", "mN"],
+            },
+        })
+
+    def test_does_not_carry_shape_or_dtype(self):
+        """shape/dtype 由导出自己按实际写入值声明,不能被源覆盖。
+
+        源声明 shape [250,250,3] 是逻辑形状,而 parquet 里存的是展平的
+        187500 长列表;照搬声明会让官方加载器按 3 维 reshape 而失败。
+        """
+        root = self._root({
+            "observation.gripper_left_force_matrix": {
+                "dtype": "int16", "shape": [250, 250, 3], "scale": 100,
+            },
+        })
+        carried = _force_matrix_semantics(root)["observation.gripper_left_force_matrix"]
+        self.assertNotIn("shape", carried)
+        self.assertNotIn("dtype", carried)
+
+    def test_ns_columns_keep_their_encoding(self):
+        """_ns 采集时刻列同样靠 encoding 声明时基,int64 裸列无法解读。"""
+        root = self._root({
+            "observation.gripper_left_force_matrix_ns": {
+                "dtype": "int64", "encoding": "host_monotonic_ns",
+            },
+        })
+        self.assertEqual(
+            _force_matrix_semantics(root)["observation.gripper_left_force_matrix_ns"],
+            {"encoding": "host_monotonic_ns"})
+
+    def test_ignores_unrelated_features(self):
+        root = self._root({
+            "observation.gripper_state": {"dtype": "float32", "scale": 100},
+            "action": {"dtype": "float32"},
+        })
+        self.assertEqual(_force_matrix_semantics(root), {})
+
+    def test_missing_or_broken_source_degrades_to_empty(self):
+        """源元数据读不到时返回空字典 —— 导出照常进行,不因缺元数据中断。"""
+        self.assertEqual(_force_matrix_semantics(Path("/nonexistent/nope")), {})
+        broken = Path(tempfile.mkdtemp())
+        (broken / "meta").mkdir()
+        (broken / "meta" / "info.json").write_text("{not json", encoding="utf-8")
+        self.assertEqual(_force_matrix_semantics(broken), {})
+
+
+class WriteStatsDataSourceTests(unittest.TestCase):
+    """stats.json 的两种取数路径必须产出同一份统计量。
+
+    ``_write_stats`` 原先一律把整个 data/ 目录从磁盘重读一遍;调用方手里
+    其实就有刚写完的 arrow table,传进去可省掉这次全量往返。但两条路径的
+    DataFrame 必须逐列同 dtype、同值 —— 否则归一化统计会悄悄漂移,而训练
+    侧不会报错,只会训出偏差。
+    """
+
+    def _build(self, root: Path):
+        """造一份含标量列/定长向量列/字符串列的 data/,返回写入的 table。"""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        rows = [
+            {"frame_index": i,
+             "timestamp": i / 30.0,                    # 标量浮点
+             "observation.state": float(i % 3),        # 标量浮点
+             "action": [float(i), float(i) * 2, -1.0],  # 定长向量(走逐维 stats)
+             "gesture": "open" if i % 2 else ""}       # 字符串(应被跳过)
+            for i in range(20)
+        ]
+        table = pa.Table.from_pylist(rows)
+        data_dir = root / "data" / "chunk-000"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        pq.write_table(table, data_dir / "file-000.parquet")
+        return table
+
+    def test_table_path_matches_disk_path(self):
+        disk_root = Path(tempfile.mkdtemp())
+        table_root = Path(tempfile.mkdtemp())
+        table = self._build(disk_root)
+        self._build(table_root)
+
+        _write_stats(disk_root)                    # 旧路径:从磁盘重读
+        _write_stats(table_root, None, table)      # 新路径:直接用写入的表
+
+        from_disk = json.loads((disk_root / "meta" / "stats.json").read_text())
+        from_table = json.loads((table_root / "meta" / "stats.json").read_text())
+        self.assertEqual(from_disk, from_table)
+        # 别退化成"两边都空"的假通过
+        self.assertIn("observation.state", from_disk)
+        self.assertIn("action", from_disk)
+
+    def test_string_columns_are_not_given_numeric_stats(self):
+        """官方加载器会把 stats 每一项转张量,字符串列必须跳过。"""
+        root = Path(tempfile.mkdtemp())
+        table = self._build(root)
+        _write_stats(root, None, table)
+        stats = json.loads((root / "meta" / "stats.json").read_text())
+        self.assertNotIn("gesture", stats)
+
+    def test_missing_data_dir_degrades_quietly(self):
+        """没有 data/ 时直接返回,不抛异常(旧路径原有的容错)。"""
+        root = Path(tempfile.mkdtemp())
+        _write_stats(root)
+        self.assertFalse((root / "meta" / "stats.json").exists())
 
 
 if __name__ == "__main__":

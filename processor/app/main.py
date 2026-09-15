@@ -16,6 +16,7 @@ from app.api import workflows, worker, projects, exceptions
 from app.api import users
 from app.middleware import AuthMiddleware
 from app.paths import STATIC_DIR
+from app.version import __version__
 
 
 @asynccontextmanager
@@ -62,9 +63,11 @@ async def lifespan(app: FastAPI):
         print("[Shutdown] Done")
 
 
+# 版本号取自 app/version.py —— 此前这里硬编码 "0.1.0",与 version.py 的
+# 1.7.0 长期不一致,/docs 的 OpenAPI 版本与 /health 报的是两个数。
 app = FastAPI(
     title="processor Service",
-    version="0.1.0",
+    version=__version__,
     lifespan=lifespan,
 )
 

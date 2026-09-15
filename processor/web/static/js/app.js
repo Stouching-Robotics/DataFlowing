@@ -17,6 +17,15 @@ let _listLoadController = null; // abort obsolete hierarchy requests on fast nav
 let _episodesLoadedAt = 0;      // snapshot freshness for background reconciliation
 let selectMode = false;  // selection mode toggle — hides checkboxes by default
 
+// 视图缓存。筛选结果只依赖 [筛选条件 + 排序模式 + 层级快照],与勾选状态无关;
+// 但勾选一行原先要重算三遍(visibleEpisodes → hierarchy → updateBatchUI),
+// 每次都 spread 复制全部 episode。缓存后勾选只改 Set 和那一行 DOM。
+// _hierarchyRev 在层级数据变化时自增 —— 快照替换、局部增删、局部改字段都要加。
+let _hierarchyRev = 0;
+let _viewCache = { key: null, groups: [], visible: [], visibleIds: new Set(), reviewedIds: [] };
+// 上一次渲染所依据的服务端快照指纹;一致就跳过一次整表重绘。
+let _hierarchySignatureAt = null;
+
 // A short-lived cross-navigation snapshot makes the Review page paint
 // immediately after leaving Projects/Workflow. The server remains
 // authoritative: loadEpisodes still refreshes in the background.
@@ -40,15 +49,42 @@ function saveReviewSnapshotCache(projects) {
     } catch (_) { /* storage quota/private mode — network refresh still works */ }
 }
 
+// 渲染只依赖这些字段;其余字段(如 duration、camera_streams)变了不影响卡片。
+function _episodeRenderSignature(ep) {
+    return [ep.id, ep.status, ep.ai_quality_status, ep._uiWorkflowState,
+            ep.frame_count, ep.fps, ep.name, ep.episode_index,
+            (ep.camera_names || []).length, ep.timestamp, ep.created_at].join(':');
+}
+
+function _hierarchySignature(projects) {
+    let parts = [];
+    (projects || []).forEach(node => {
+        parts.push(`P${node.project?.id}:${node.project?.name}`);
+        (node.episodes || []).forEach(ep => parts.push(_episodeRenderSignature(ep)));
+    });
+    return parts.join(';');
+}
+
 function applyHierarchySnapshot(projects, savedAt = Date.now()) {
-    hierarchyData = projects || [];
+    const incoming = projects || [];
+    // 15 秒轮询每次都会走到这里。卡片渲染只依赖上面那些字段,内容没变时
+    // 直接返回 —— 否则用户正勾选着,列表被整表重建,会闪、丢焦点、丢点击。
+    const signature = _hierarchySignature(incoming);
+    if (signature === _hierarchySignatureAt) {
+        _episodesLoadedAt = savedAt;
+        return;
+    }
+    _hierarchySignatureAt = signature;
+    hierarchyData = incoming;
+    _hierarchyRev++;
     _episodesLoadedAt = savedAt;
     allEpisodes = hierarchyData.flatMap(node =>
         (node.episodes || []).map(e => ({ ...e, task_description: node.project.name })));
-    const visible = visibleEpisodesForCurrentView();
-    updateTaskFilter(visible);
+    // updateTaskFilter 可能清掉已失效的 filter-task —— 必须在算视图之前调用,
+    // 否则 currentView() 会按一个已经不存在的筛选条件构建缓存。
+    updateTaskFilter(visibleEpisodesForCurrentView());
     updateEpisodeListCount(allEpisodes, '', document.getElementById('filter-task')?.value || '');
-    renderEpisodeCards(hierarchyForCurrentView(), '', document.getElementById('filter-task')?.value || '');
+    renderEpisodeCards();
 }
 
 // ── Nav tree → filter bridge (called from base.html) ──
@@ -194,20 +230,14 @@ function extractEpisodeNumber(name) {
 function toggleSelectMode() {
     selectMode = !selectMode;
     if (!selectMode) {
-        selectedEpisodes.clear();  // exit selection → clear all
-    } else {
-        // 批量选择模式:自动展开所有项目,否则折叠状态下无法勾选视频
-        (hierarchyData || []).forEach(node => {
-            if (node.project && node.project.id) _expandedProjects.add(node.project.id);
-        });
+        // 退出选择模式:清空选择,但**不动项目的展开/折叠状态** ——
+        // 用户展开过哪些项目是他自己的布局,不该被模式切换重置。
+        selectedEpisodes.clear();
     }
-    const btn = document.getElementById('btn-toggle-select');
-    if (btn) {
-        btn.textContent = selectMode ? 'Cancel' : 'Select';
-        btn.className = selectMode
-            ? 'bg-blue-600 hover:bg-blue-500 text-white text-xs px-2 py-0.5 rounded flex-shrink-0 transition-colors'
-            : 'bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-gray-200 text-xs px-2 py-0.5 rounded flex-shrink-0 transition-colors';
-    }
+    // 进入选择模式**不再自动展开所有项目**。项目行本身就有三态全选框,
+    // 折叠状态下点一下即可选中整批(卡片仍在 DOM 里),所以没有展开的必要;
+    // 自动展开会让几十个项目同时铺开,列表瞬间变长、滚动位置也丢了。
+    // 退出时的按钮态与批量栏显隐统一交给 updateBatchUI。
     renderEpisodeListFromMemory();
 }
 
@@ -261,9 +291,45 @@ function hierarchyForCurrentView() {
     }));
 }
 
+// 缓存后的视图模型:分组(已按 task 筛选并按当前排序模式排好)+ 扁平的
+// 可见 / 已审核 id 列表。渲染、勾选、计数全部读这一份,不再各自重算。
+function currentView() {
+    const status = currentReviewStatus();
+    const search = document.getElementById('search-input')?.value || '';
+    const taskFilter = document.getElementById('filter-task')?.value || '';
+    const dir = currentSortMode().dir === 'asc' ? 1 : -1;
+    const key = [_hierarchyRev, status, search, taskFilter, dir].join('|');
+    if (_viewCache.key === key) return _viewCache;
+
+    const groups = hierarchyForCurrentView()
+        .filter(node => !taskFilter || (node.project?.name || '') === taskFilter)
+        .map(node => ({
+            project: node.project,
+            // 组内按尾部序号排序(Test1_000012 → 12),只排副本不动原始数据
+            episodes: [...(node.episodes || [])].sort((a, b) =>
+                (extractEpisodeNumber(a.name) - extractEpisodeNumber(b.name)) * dir),
+        }));
+
+    const visible = [];
+    const visibleIds = new Set();
+    const reviewedIds = [];
+    const framesById = new Map();
+    groups.forEach(group => {
+        group.episodes.forEach(ep => {
+            visible.push({ ...ep, task_description: group.project?.name });
+            visibleIds.add(String(ep.id));
+            framesById.set(String(ep.id), Number(ep.frame_count) || 0);
+            if (ep.status === 'reviewed' || ep.status === 'approved') {
+                reviewedIds.push(String(ep.id));
+            }
+        });
+    });
+    _viewCache = { key, groups, visible, visibleIds, reviewedIds, framesById };
+    return _viewCache;
+}
+
 function visibleEpisodesForCurrentView() {
-    return hierarchyForCurrentView().flatMap(node =>
-        (node.episodes || []).map(ep => ({ ...ep, task_description: node.project?.name })));
+    return currentView().visible;
 }
 
 async function loadEpisodes(options = {}) {
@@ -352,7 +418,7 @@ function updateTaskFilter(episodes) {
 }
 
 
-function renderEpisodeCards(hierarchy, search, taskFilter) {
+function renderEpisodeCards() {
     const listEl = document.getElementById('episode-list-inline');
     if (!listEl) return;
 
@@ -363,69 +429,138 @@ function renderEpisodeCards(hierarchy, search, taskFilter) {
         selectedEpisodes.clear();
     }
 
+    // 分组、筛选、排序都来自缓存的视图模型 —— 渲染只负责拼 HTML。
+    const view = currentView();
+
     // 项目文件夹**始终渲染**(含空项目/刚创建的项目):几个项目就显示几个
     // 文件夹,哪怕里面没有批次;只有没有任何项目时才显示 No data。
-    if (hierarchy.length === 0) {
+    if (view.groups.length === 0) {
         listEl.innerHTML = `<div class="p-4 text-center text-gray-500 text-sm">${t('no_data')}</div>`;
-        updateBatchUI(visibleEpisodesForCurrentView());
+        updateBatchUI();
         return;
     }
 
-    // 任务概念已移除:项目 → Episodes 两层;组内按 Name 1→N / N→1 按钮排序
-    const sortMode = currentSortMode();
-    const dir = sortMode.dir === 'asc' ? 1 : -1;
+    // 任务概念已移除:项目 → Episodes 两层(组内排序已在 currentView 完成)
     let html = '';
-    hierarchy.forEach((node) => {
-        const episodes = (node.episodes || []).filter(ep => {
-            if (taskFilter && (node.project.name || '') !== taskFilter) return false;
-            return true;
-        });
-        if (taskFilter && (node.project.name || '') !== taskFilter) return;
-        // 组内按尾部序号排序(Test1_000012 → 12),只排副本不动原始数据
-        const sorted = [...episodes].sort((a, b) =>
-            (extractEpisodeNumber(a.name) - extractEpisodeNumber(b.name)) * dir);
+    view.groups.forEach((group) => {
+        const sorted = group.episodes;
+        const projectId = String(group.project?.id ?? '');
         // 默认折叠:只在用户点击展开过的项目才展开视频卡片
-        const pCollapsed = !_expandedProjects.has(node.project.id);
+        const pCollapsed = !_expandedProjects.has(group.project?.id);
         html += `
-        <div class="project-group border-b border-gray-800">
+        <div class="project-group border-b border-gray-800" data-project-id="${escHtml(projectId)}">
             <div class="project-header px-3 py-2 flex items-center gap-2 cursor-pointer hover:bg-gray-800/50 select-none"
-                 onclick="toggleProjectCollapse('${node.project.id}')">
+                 onclick="toggleProjectCollapse('${escHtml(projectId)}')">
+                ${projectSelectBoxHtml(projectId, sorted)}
                 <iconify-icon icon="ant-design:folder-outlined" class="text-blue-500"></iconify-icon>
-                <span class="text-sm font-medium text-gray-200 truncate">${node.project.name}</span>
+                <span class="text-sm font-medium text-gray-200 truncate">${escHtml(group.project?.name || '')}</span>
                 <span class="text-xs text-gray-500 flex-shrink-0">${sorted.length}</span>
-                <iconify-icon icon="ant-design:${pCollapsed ? 'right' : 'down'}-outlined" class="text-gray-600 ml-auto"></iconify-icon>
+                <span class="project-select-count text-xs text-blue-400 flex-shrink-0"></span>
+                <iconify-icon icon="ant-design:${pCollapsed ? 'right' : 'down'}-outlined"
+                              class="project-caret text-gray-600 ml-auto"></iconify-icon>
             </div>
             <div class="project-body ${pCollapsed ? 'hidden' : ''}">`;
         if (sorted.length === 0) {
             html += `<div class="text-center text-gray-600 text-xs py-2">${t('no_tasks_in_project')}</div>`;
         }
-        sorted.forEach(ep => { html += episodeCardHtml(ep, node.project.name); });
+        sorted.forEach(ep => { html += episodeCardHtml(ep, group.project?.name); });
         html += `</div></div>`;
     });
     listEl.innerHTML = html;
-    updateBatchUI(visibleEpisodesForCurrentView());
+    syncProjectSelectDom();
+    updateBatchUI();
+}
+
+// 项目行左侧的三态全选框。只作用于当前筛选下该项目可见的已审核批次;
+// 折叠状态照常可点 —— 卡片仍在 DOM 里,只是 .project-body 被 hidden,
+// 所以点一下就能选中折叠中的整批,不必先展开。
+function projectSelectBoxHtml(projectId, episodes) {
+    const statusFilter = document.getElementById('filter-status')?.value || '';
+    if (!selectMode || statusFilter !== 'reviewed') return '';
+    const reviewed = episodes.filter(ep => ep.status === 'reviewed' || ep.status === 'approved');
+    const disabled = reviewed.length === 0 ? ' disabled' : '';
+    return `<input type="checkbox" class="project-checkbox w-3.5 h-3.5 rounded accent-blue-600 flex-shrink-0"
+                   data-project-id="${escHtml(projectId)}"${disabled}
+                   title="${escHtml(t('select_project_all'))}"
+                   onclick="event.stopPropagation();toggleProjectSelect('${escHtml(projectId)}', this.checked)">`;
+}
+
+// 该项目在当前视图下可见的、可勾选的批次 id。
+function projectReviewedIds(projectId) {
+    const group = currentView().groups.find(
+        item => String(item.project?.id ?? '') === String(projectId));
+    if (!group) return [];
+    return group.episodes
+        .filter(ep => ep.status === 'reviewed' || ep.status === 'approved')
+        .map(ep => String(ep.id));
+}
+
+function toggleProjectSelect(projectId, checked) {
+    projectReviewedIds(projectId).forEach(id => {
+        if (checked) selectedEpisodes.add(id);
+        else selectedEpisodes.delete(id);
+    });
+    syncProjectSelectionDom(projectId);
+    updateBatchUI();
+}
+
+// 把选中状态同步回 DOM:项目行三态框 + 该项目下每张卡片。只碰受影响的项目,
+// 不重建整个列表 —— 这是勾选不再"闪一下"的关键。
+function syncProjectSelectionDom(onlyProjectId) {
+    document.querySelectorAll('#episode-list-inline .project-group').forEach(group => {
+        if (onlyProjectId !== undefined
+                && String(group.dataset.projectId) !== String(onlyProjectId)) return;
+        group.querySelectorAll('input.batch-checkbox').forEach(box => {
+            box.checked = selectedEpisodes.has(String(box.dataset.episodeId));
+            box.closest('.episode-card')?.classList.toggle('selected', box.checked);
+        });
+        syncProjectSelectBox(group);
+    });
+}
+
+function syncProjectSelectBox(group) {
+    const box = group.querySelector('.project-checkbox');
+    if (!box) return;
+    const ids = projectReviewedIds(box.dataset.projectId);
+    const selected = ids.filter(id => selectedEpisodes.has(id)).length;
+    box.checked = ids.length > 0 && selected === ids.length;
+    box.indeterminate = selected > 0 && selected < ids.length;
+    const badge = group.querySelector('.project-select-count');
+    if (badge) badge.textContent = selected > 0 ? `${selected}/${ids.length}` : '';
+}
+
+function syncProjectSelectDom() {
+    syncProjectSelectionDom();
 }
 
 function toggleProjectCollapse(projectId) {
     if (_expandedProjects.has(projectId)) _expandedProjects.delete(projectId);
     else _expandedProjects.add(projectId);
-    renderEpisodeListFromMemory();
+    // 只切这一个项目的 body 与箭头:整表重绘会丢掉滚动位置和焦点,
+    // 大列表上肉眼可见地闪。
+    document.querySelectorAll('#episode-list-inline .project-group').forEach(group => {
+        if (String(group.dataset.projectId) !== String(projectId)) return;
+        const collapsed = !_expandedProjects.has(projectId);
+        group.querySelector('.project-body')?.classList.toggle('hidden', collapsed);
+        group.querySelector('.project-caret')
+            ?.setAttribute('icon', collapsed ? 'ant-design:right-outlined' : 'ant-design:down-outlined');
+    });
 }
 
 // Apply small action results locally so the list responds immediately. The
 // server remains authoritative; a coalesced silent refresh reconciles state
 // after the filesystem-backed hierarchy has caught up.
 function renderEpisodeListFromMemory() {
-    const taskFilter = document.getElementById('filter-task')?.value || '';
-    const visible = visibleEpisodesForCurrentView();
-    updateTaskFilter(visible);
-    updateEpisodeListCount(allEpisodes, '', taskFilter);
-    renderEpisodeCards(hierarchyForCurrentView(), '', taskFilter);
+    // updateTaskFilter 可能清掉已失效的 filter-task,所以要在取视图之前调用。
+    updateTaskFilter(visibleEpisodesForCurrentView());
+    updateEpisodeListCount(allEpisodes, '', document.getElementById('filter-task')?.value || '');
+    renderEpisodeCards();
 }
 
 function removeEpisodeFromLocalList(episodeId) {
     const id = String(episodeId);
     selectedEpisodes.delete(id);
+    _hierarchyRev++;
     hierarchyData.forEach(node => {
         node.episodes = (node.episodes || []).filter(ep => String(ep.id) !== id);
     });
@@ -435,6 +570,7 @@ function removeEpisodeFromLocalList(episodeId) {
 
 function updateEpisodeInLocalList(episodeId, patch) {
     const id = String(episodeId);
+    _hierarchyRev++;
     hierarchyData.forEach(node => {
         const ep = (node.episodes || []).find(item => String(item.id) === id);
         if (ep) Object.assign(ep, patch);
@@ -618,54 +754,38 @@ function renderInputWarning(ep) {
 // ── Batch selection ──────────────────────────────────
 
 function toggleBatchSelect(episodeId, checked) {
-    if (checked) {
-        selectedEpisodes.add(episodeId);
-    } else {
-        selectedEpisodes.delete(episodeId);
-    }
-    // Filter consistently with renderEpisodeCards: taskFilter + search
-    const taskFilter = document.getElementById('filter-task')?.value || '';
-    const search = (document.getElementById('search-input')?.value || '').toLowerCase();
-    let visible = visibleEpisodesForCurrentView();
-    if (taskFilter) visible = visible.filter(ep => (ep.task_description || '') === taskFilter);
-    if (search) {
-        const s = search.toLowerCase();
-        visible = visible.filter(ep =>
-            (ep.name || '').toLowerCase().includes(s) ||
-            (ep.task_description || '').toLowerCase().includes(s) ||
-            String(ep.id).toLowerCase().includes(s));
-    }
-    updateBatchUI(visible);
+    const id = String(episodeId);
+    if (checked) selectedEpisodes.add(id);
+    else selectedEpisodes.delete(id);
+    // 只同步这一行与它所属项目的三态框 —— 不重算筛选、不重建列表。
+    const card = document.querySelector(
+        `#episode-list-inline .episode-card[data-episode-id="${CSS.escape(id)}"]`);
+    card?.classList.toggle('selected', checked);
+    const group = card?.closest('.project-group');
+    if (group) syncProjectSelectBox(group);
+    updateBatchUI();
 }
 
 
 function toggleSelectAll(checked) {
     if (!selectMode) return;
-    const statusFilter = document.getElementById('filter-status')?.value || '';
-    if (statusFilter !== 'reviewed') return;
+    if ((document.getElementById('filter-status')?.value || '') !== 'reviewed') return;
 
-    const search = (document.getElementById('search-input')?.value || '').toLowerCase();
-    const taskFilter = document.getElementById('filter-task')?.value || '';
-    let filtered = visibleEpisodesForCurrentView();
-    if (taskFilter) filtered = filtered.filter(ep => (ep.task_description || '') === taskFilter);
-    if (search) {
-        filtered = filtered.filter(ep =>
-            (ep.name || '').toLowerCase().includes(search) ||
-            (ep.task_description || '').toLowerCase().includes(search) ||
-            String(ep.id).toLowerCase().includes(search)
-        );
-    }
-
-    if (checked) {
-        filtered.forEach(ep => selectedEpisodes.add(ep.id));
-    } else {
-        filtered.forEach(ep => selectedEpisodes.delete(ep.id));
-    }
-    renderEpisodeListFromMemory();
+    currentView().reviewedIds.forEach(id => {
+        if (checked) selectedEpisodes.add(id);
+        else selectedEpisodes.delete(id);
+    });
+    // 直接写已渲染的 checkbox,不重建整个列表。
+    document.querySelectorAll('#episode-list-inline input.batch-checkbox').forEach(box => {
+        box.checked = selectedEpisodes.has(String(box.dataset.episodeId));
+        box.closest('.episode-card')?.classList.toggle('selected', box.checked);
+    });
+    syncProjectSelectDom();
+    updateBatchUI();
 }
 
 
-function updateBatchUI(filteredEpisodes) {
+function updateBatchUI() {
     const selectAllBar = document.getElementById('select-all-bar');
     const batchBar = document.getElementById('batch-bar');
     const selectBtn = document.getElementById('btn-toggle-select');
@@ -673,37 +793,32 @@ function updateBatchUI(filteredEpisodes) {
     const isReviewedMode = statusFilter === 'reviewed';
     const showSelection = selectMode && isReviewedMode;
 
-    // Select button: only visible in Reviewed/Approved category
+    // 「Select」只在非选择模式出现 —— 进入选择模式后由批量栏里的 Cancel 接管。
     if (selectBtn) {
-        selectBtn.classList.toggle('hidden', !isReviewedMode);
+        selectBtn.classList.toggle('hidden', !isReviewedMode || selectMode);
     }
     // Force-exit selection mode when switching away from Reviewed
     if (!isReviewedMode && selectMode) {
         selectMode = false;
         selectedEpisodes.clear();
-        if (selectBtn) {
-            selectBtn.textContent = 'Select';
-            selectBtn.className = 'bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-gray-200 text-xs px-2 py-0.5 rounded flex-shrink-0 transition-colors';
-        }
     }
 
-    // Show/hide select-all bar only in selection mode
     if (selectAllBar) {
         selectAllBar.classList.toggle('hidden', !showSelection);
     }
-
+    // 批量栏只要在选择模式就显示(哪怕一集都没选)—— 否则 Cancel 没地方放。
+    if (batchBar) {
+        batchBar.classList.toggle('hidden', !showSelection);
+    }
     if (!showSelection) {
         if (!selectMode) selectedEpisodes.clear();
-        if (batchBar) batchBar.classList.add('hidden');
         return;
     }
 
     // Update counts
-    const reviewedList = filteredEpisodes.filter
-        ? filteredEpisodes.filter(ep => ep.status === 'reviewed' || ep.status === 'approved')
-        : [];
-    const reviewedCount = reviewedList.length;
-    const selCount = reviewedList.filter(ep => selectedEpisodes.has(ep.id)).length;
+    const view = currentView();
+    const reviewedCount = view.reviewedIds.length;
+    const selCount = view.reviewedIds.filter(id => selectedEpisodes.has(id)).length;
 
     const selectCount = document.getElementById('select-count');
     if (selectCount) selectCount.textContent = `(${selCount}/${reviewedCount})`;
@@ -714,20 +829,60 @@ function updateBatchUI(filteredEpisodes) {
         selectAllCb.indeterminate = selCount > 0 && selCount < reviewedCount;
     }
 
-    // Show/hide batch bar
-    if (batchBar) {
-        batchBar.classList.toggle('hidden', selCount === 0);
-    }
+    // 选中规模:让用户在点之前知道这一下要跑多久 —— 打包下载是秒级原样 zip,
+    // 导出数据集是整库重建(实测约 30 秒/集)。
+    let frames = 0;
+    view.reviewedIds.forEach(id => {
+        if (selectedEpisodes.has(id)) frames += view.framesById.get(id) || 0;
+    });
     const batchCount = document.getElementById('batch-count');
-    if (batchCount) batchCount.textContent = selCount + ' selected';
+    if (batchCount) {
+        batchCount.textContent = t('batch_selected_summary')
+            .replace('%s', String(selCount))
+            .replace('%f', frames.toLocaleString());
+    }
+    const exportBtnLabel = document.getElementById('batch-export-label');
+    if (exportBtnLabel) {
+        const minutes = Math.max(1, Math.round(selCount * 30 / 60));
+        exportBtnLabel.textContent = selCount >= 5
+            ? `${t('batch_export_dataset')} ~${minutes}${t('minutes_short')}`
+            : t('batch_export_dataset');
+    }
+    // 一集都没选时两个动作按钮禁用(Cancel 仍可点,否则退不出去)。
+    const exportBtn = document.getElementById('batch-export-btn');
+    if (exportBtn) exportBtn.disabled = selCount === 0;
+    const zipBtn = document.getElementById('batch-zip-btn');
+    if (zipBtn) zipBtn.disabled = selCount === 0;
 }
 
 
+// 导出数据集:合并成一个可训练数据集。整库重建 —— 每路视频重编码、
+// 逐帧重采样、全量重算 stats,实测约 30 秒/集。
 async function batchDownload(button = null) {
     if (selectedEpisodes.size === 0) return;
     const ids = Array.from(selectedEpisodes);
     const done = await startReviewExport(ids, null, null, button);
     if (done && selectMode) toggleSelectMode();
+}
+
+// 打包下载:每集一个目录原样 zip,不重建,秒级返回。
+// 用原生表单提交而非 fetch + blob —— 浏览器自己流式写盘,不会把整个
+// zip 缓冲进内存(几十集的包很容易上 GB)。
+function batchZipDownload(button = null) {
+    if (selectedEpisodes.size === 0) return;
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = '/api/v1/export/batch-download';
+    form.style.display = 'none';
+    const field = document.createElement('input');
+    field.type = 'hidden';
+    field.name = 'episode_ids';
+    field.value = Array.from(selectedEpisodes).join(',');
+    form.appendChild(field);
+    document.body.appendChild(form);
+    form.submit();
+    form.remove();
+    if (button) button.blur();
 }
 
 
@@ -1268,13 +1423,6 @@ async function downloadEpisode(episodeId) {
 }
 
 
-async function exportSelected() {
-    const reviewed = allEpisodes.filter(e => e.status === 'reviewed');
-    if (reviewed.length === 0) return alert(t('no_reviewed'));
-    window.location.href = '/api/v1/export/download-reviewed';
-}
-
-
 // ── Export Page ───────────────────────────────────────
 
 async function loadExportJobs() {
@@ -1358,6 +1506,11 @@ document.addEventListener('DOMContentLoaded', () => {
         loadEpisodes();
         setInterval(() => { loadEpisodes({ silent: true }); updateTrashBadge(); }, 15000);
         updateTrashBadge();
+        // 两个批量按钮的提示:说清一个是重建、一个是原样打包。
+        const exportBtn = document.getElementById('batch-export-btn');
+        if (exportBtn) exportBtn.title = t('batch_export_hint');
+        const zipBtn = document.getElementById('batch-zip-btn');
+        if (zipBtn) zipBtn.title = t('batch_zip_hint');
     }
     if (document.getElementById('export-list')) {
         loadExportJobs();

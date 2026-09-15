@@ -6,11 +6,11 @@
     {% set boot_user = request.state.auth_user|default({}) %}
     <title>{% block title %}processor{% endblock %}</title>
     <link rel="stylesheet" href="/static/plyr.css" />
-    <link rel="stylesheet" href="/static/tailwind-generated.css?v=202608191021">
+    <link rel="stylesheet" href="/static/tailwind-generated.css?v={{ asset_version }}">
     <script src="/static/iconify-preload.js"></script>
     <script src="/static/iconify-icon.min.js"></script>
     <script src="/static/plyr.js"></script>
-    <script src="/static/js/i18n.js?v=202608281501"></script>
+    <script src="/static/js/i18n.js?v={{ asset_version }}"></script>
     <style>
         :root {
             --plyr-color-main: #3b82f6;

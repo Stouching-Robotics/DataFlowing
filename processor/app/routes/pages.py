@@ -19,6 +19,13 @@ router = APIRouter(tags=["pages"])
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 _static_dir = STATIC_DIR
 
+# 静态资源缓存键的唯一来源:模板里写 ``?v={{ asset_version }}``。
+# 以前每个模板各写各的日期串,发版时靠人记得逐个改 —— 漏一个,那个页面
+# 就会继续发浏览器缓存里的旧脚本。现在只 bump app/version.py 一处。
+from app.version import __version__ as _asset_version
+
+templates.env.globals["asset_version"] = _asset_version
+
 
 @router.get("/", response_class=HTMLResponse)
 async def index_page(request: Request):

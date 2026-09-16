@@ -45,7 +45,7 @@
 }
 ```
 
-- **key**：设备稳定标识 `DeviceInfo.stable_key`，形式如 `uvc:{by-id 前缀}`、
+- **key**：设备稳定标识 `DeviceInfo.stable_key`，形式如 `uvc:{by-id 前缀}`（同型号同序列号两台并存时 udev 的 by-id 链接名相撞、只有一台拿得到链接，**且谁拿到取决于注册顺序、重枚举时会翻转** ⇒ 两台都退到 `uvc:usb-<USB 拓扑路径>` 如 `uvc:usb-1-5`，同样跨重启稳定）、
   `d435:{serial}`、`ble:{MAC}` 等（含设备序列号/MAC，属本地敏感信息，不入库）。
 - **value**：规范形式为 `{"name": str, "sensor"?: str}`；旧版本可能是纯字符串，
   读取时自动兼容升级。

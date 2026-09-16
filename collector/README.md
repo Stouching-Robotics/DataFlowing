@@ -1,6 +1,6 @@
 # collector — Multimodal Data Acquisition SDK · 多模态数据采集 SDK
 
-![Version](https://img.shields.io/badge/version-1.3.6-blue)
+![Version](https://img.shields.io/badge/version-1.3.8-blue)
 ![Python](https://img.shields.io/badge/python-3.12-blue)
 ![License](https://img.shields.io/badge/license-TBD-lightgrey)
 
@@ -375,6 +375,63 @@ are documented in [docs/index.md](docs/index.md#开发约定).
 
 ### Changelog
 
+- **v1.3.8** — fixes a leftover from v1.3.7: the two DECXINs' by-id link
+  **ownership flips on re-enumeration**. Both report serial `01.00.00`, so both
+  want the same link name, only one gets it — and *which* one depends on
+  registration order. v1.3.7 pushed only the **link-less** camera down to the
+  topology path and left the link holder on by-id, so when the link flipped
+  both cameras changed key at once and the bug survived. Caught live in
+  `logs/main.log`: `Connected: DECXIN_head` immediately followed by
+  `Disconnected: DECXIN DECXIN CAMERA` — the panel drops the device along with
+  the name the user gave it. `list_v4l_devices()` now reports
+  `by_id_ambiguous`, and **both** cameras fall back to the topology path, so
+  each keeps a single key whoever wins the link.
+  The detection deliberately is *not* "count duplicate prefixes": at any
+  instant only one camera holds a link, so the other never enters the count and
+  that check would never fire. The rule is instead "a link-less physical device
+  whose (vendor, model) matches a **linked** one" — two cameras of the same
+  model with **different** serials each keep their own link and are not
+  downgraded. `by_id_path` is untouched (still a real path or `None`;
+  `ui/lite_window.py` opens the device with it). One-time cost: the standalone
+  DECXIN keys as `uvc:usb-1-5`, so the `DECXIN_head` entry saved under the old
+  by-id-shaped key no longer matches — rename it once.
+- **v1.3.7** — a standalone DECXIN camera no longer disappears from the device
+  panel while the gripper rig is plugged in.
+  **Two independent root causes — fixing only the first looks like it works
+  until the rig is plugged in again:**
+  (1) v1.3.0 added `1bcf:2d4f` to the gripper-component blacklist wholesale, so
+  the camera could never enter the generic UVC list — while the "gripper" group
+  that should have claimed it requires the ESP32 control board to be present.
+  Rejected by both, it vanished. `data/device_names.json` still carries
+  `uvc:usb-DECXIN_DECXIN_CAMERA_01.00.00` = `"DECXIN_head"`, proof that plugged
+  in alone it was a plain UVC camera. Ownership is now decided by **USB root
+  hub**: the board sits at `1-2.2.1` and the rig's DECXIN at `1-2.2.2` (both
+  root hub `1-2`), while a standalone DECXIN sits at `1-5` — only a DECXIN on
+  the board's root hub counts as part of the rig. `gripper_root_hubs()` derives
+  that set from the board's tty path, and a camera whose own root hub cannot be
+  read is conservatively excluded (better hidden than opened twice against the
+  rig). Sightac and the FT602 are *not* released: the former has no standalone
+  use, the latter is already covered by `is_sdk`.
+  (2) more fundamentally, **udev's by-id link names collide**. The two DECXINs
+  report identical vendor / model / serial strings (`DECXIN` / `DECXIN CAMERA` /
+  `01.00.00`), so their by-id link names are identical too — and a link name is
+  unique, so whichever registers last wins and the other becomes an orphan with
+  no link at all. `core.camera.list_v4l_devices()` used **by-id as its
+  enumeration entry point**, so the orphan never even reached the filter. It now
+  groups by **physical USB device** (`_v4l_nodes_by_physical_device`, keyed on
+  the topology path such as `1-5`, falling back to the sysfs realpath for
+  non-USB nodes) and keeps the lowest stream index per device; with no link the
+  display name falls back to the USB vendor/product strings, which decode to the
+  same name the by-id path produced. `by_id_path` stays "a real path, or None" —
+  `ui/lite_window.py` uses it as the path to *open* the device, so it must never
+  be fabricated. Device keys now degrade from the by-id prefix to
+  `usb-<topology path>` (also stable across reboots) before falling back to the
+  drifting video index. Known side effect: with both cameras plugged in the
+  standalone one keys as `uvc:usb-1-5` and does **not** inherit the saved
+  `DECXIN_head` name (that key is by-id-shaped and now belongs to the filtered
+  rig camera); name it once in each configuration if it must stay stable. The
+  Lite edition now scans the gripper first so it has the root hubs before
+  filtering UVC.
 - **v1.3.6** — the Lite edition records the UMI gripper, and every SLAM point now
   carries the host timestamp of the frame it came from.
   **Lite + gripper:** the Lite edition did not record the gripper at all; that
@@ -1029,6 +1086,43 @@ i18n 文案经 `tr()` 翻译、PyQt5 信号参数用 `object` 封送大整数、
 
 ### 更新记录
 
+- **v1.3.8** — 修 v1.3.7 的遗留：两颗 DECXIN 的 by-id 链接**归属会在重新枚举时
+  翻转**。两颗序列号都是 `01.00.00`，都要同一个链接名，而只有一颗拿得到——**谁
+  拿到取决于注册顺序**。v1.3.7 只把**没链接**那颗压到拓扑路径、拿到链接那颗仍用
+  by-id，于是链接一翻转两颗一起换 key，问题照旧。真机 `logs/main.log` 抓到：
+  `Connected: DECXIN_head` 紧跟 `Disconnected: DECXIN DECXIN CAMERA`——面板上
+  设备连同用户起的名字一起消失。现由 `list_v4l_devices()` 报 `by_id_ambiguous`，
+  **两颗都退拓扑路径**，谁拿到链接都各守一个 key。
+  判据**刻意不是「数前缀重复」**：任一时刻只有一颗真拿到链接，另一颗压根进不了
+  计数，那么数永远数不出来。改为「一台没链接的物理设备，其 (厂商, 型号) 与另一台
+  **有链接**的相同」——同型号但**序列号不同**的两台各有各的链接，不会被误判降级。
+  `by_id_path` 不动（仍是「真路径或 None」，`ui/lite_window.py` 拿它开设备）。
+  一次性代价：单插那颗 DECXIN 的 key 变成 `uvc:usb-1-5`，挂在旧 by-id 形式 key
+  下的 `DECXIN_head` 不再匹配——重命名一次即可。
+- **v1.3.7** — 单插的 DECXIN 相机在夹爪 rig 插着时不再从设备面板消失。
+  **两层独立根因，只修第一层会看起来「好了」、rig 一插就复发**：
+  ①v1.3.0 把 `1bcf:2d4f` 整颗加进夹爪组件黑名单，它永远进不了通用 UVC
+  列表；而本该收它的「夹爪」分组又要求 ESP32 控制板在场——两边都不收就消失了。
+  `data/device_names.json` 里躺着 `uvc:usb-DECXIN_DECXIN_CAMERA_01.00.00`
+  = `"DECXIN_head"`，证明它单插时本来就是普通 UVC 相机。改按 **USB 根端口**
+  判归属：控制板在 `1-2.2.1`、rig 那颗 DECXIN 在 `1-2.2.2`（同属根端口 `1-2`），
+  单插那颗在 `1-5`——只有挂在控制板根端口下的 DECXIN 才算 rig 的。`gripper_root_hubs()`
+  从控制板的 tty 路径取该集合；相机自身根端口取不到时**保守排除**（宁可藏，
+  不可与 rig 双开）。Sightac 与 FT602 不放开：前者单插无用，后者另有 `is_sdk`
+  兜底。
+  ②更底层：**udev 的 by-id 链接名会撞**。两颗 DECXIN 的厂商/型号/序列号字符串
+  完全相同（`DECXIN` / `DECXIN CAMERA` / `01.00.00`），by-id 链接名也就完全相同
+  ——而链接名唯一，**只有后注册那颗有链接，另一颗成孤儿**。
+  `core.camera.list_v4l_devices()` 原本**以 by-id 为枚举入口**，孤儿压根进不了
+  枚举，轮不到过滤器。改按**物理 USB 设备**分组（`_v4l_nodes_by_physical_device`，
+  键取拓扑路径如 `1-5`，非 USB 节点退回 sysfs realpath），每个物理设备只留最小
+  流索引；无链接时显示名退回 USB 厂商+型号字符串（与 by-id 解码同名）。
+  `by_id_path` 保持「有就是真路径、没有就是 None」——`ui/lite_window.py` 拿它当
+  **打开设备**的路径，不能伪造。设备 key 从 by-id 前缀退到 `usb-<拓扑路径>`
+  （同样跨重启稳定），最后才退到会漂移的 video 索引。已知副作用：两套都插时
+  单插那颗 key 是 `uvc:usb-1-5`、**不会自动接上旧的 `DECXIN_head`**（那个 key
+  是 by-id 形式、此时归已被过滤的 rig 那颗）；要名字稳定就在两种配置下各命名
+  一次。极简版改为先扫夹爪、拿到根端口再过滤 UVC。
 - **v1.3.6** — 极简版能录 UMI 夹爪了；每个 SLAM 点带上了它那张取样帧的宿主时刻。
   **极简版 + 夹爪**：极简版此前完全不录夹爪，本次推翻该排除。夹爪整条链（力 /
   10×10×3 力矩阵 / 夹爪状态 / SLAM 轨迹）全部落盘，但界面**不显示**任何夹爪

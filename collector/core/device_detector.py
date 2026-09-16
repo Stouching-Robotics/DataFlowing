@@ -147,12 +147,15 @@ def _list_uvc_devices_windows(max_index: int) -> List[DeviceInfo]:
     return infos
 
 
-def _list_uvc_devices(max_index: int = settings.DEVICE_SCAN_MAX_INDEX) -> List[DeviceInfo]:
+def _list_uvc_devices(max_index: int = settings.DEVICE_SCAN_MAX_INDEX,
+                      *, gripper_hubs=None) -> List[DeviceInfo]:
     """UVC 网络摄像头（排除 RealSense UVC 节点、FTDI SDK 设备与夹爪组件）。
 
     夹爪组件的 Sightac/DECXIN/FTDI 相机由 libuvc 服务或 Fays 桥接独占，
-    绝不作为通用 UVC 相机出现。Linux: sysfs 只读枚举（/dev/v4l/by-id
-    分组，轮询安全）。Windows: pygrabber DirectShow 枚举。
+    绝不作为通用 UVC 相机出现；但只有与控制板同根端口的那颗才算 rig 的，
+    单插的 DECXIN 按普通 UVC 放出来（见 _is_gripper_component_camera）。
+    Linux: sysfs 只读枚举（/dev/v4l/by-id 分组，轮询安全）。
+    Windows: pygrabber DirectShow 枚举。
     """
     if os.name == "nt":
         return _list_uvc_devices_windows(max_index)
@@ -162,12 +165,19 @@ def _list_uvc_devices(max_index: int = settings.DEVICE_SCAN_MAX_INDEX) -> List[D
             continue
         if d.get("is_realsense"):
             continue
-        if _is_gripper_component_camera(d):
+        if _is_gripper_component_camera(d, gripper_hubs=gripper_hubs):
             continue
-        # key 用 by-id 前缀（跨插拔稳定）；无 by-id 时退化为索引
+        # key 用 by-id 前缀（跨插拔稳定）；同型号同序列号两台并存时 udev 的
+        # by-id 链接名唯一、被对方顶掉，退化为 USB 拓扑路径（同样跨重启
+        # 稳定），最后才退到可能漂移的 video 索引。
+        # by_id_ambiguous＝该前缀被多台共用，**链接归属会在重新枚举时翻转**
+        # （谁后注册谁拿到），此时前缀本身就不再稳定 —— 拿到链接的那台也得
+        # 放弃它，否则同一台相机在两个 key 之间跳、面板上设备消失又出现。
         prefix = str(d["video_index"])
-        if d.get("by_id_path"):
+        if d.get("by_id_path") and not d.get("by_id_ambiguous"):
             prefix = os.path.basename(d["by_id_path"]).rsplit("-video-index", 1)[0]
+        elif d.get("usb_path"):
+            prefix = f"usb-{d['usb_path']}"
         infos.append(DeviceInfo(
             key=f"uvc:{prefix}",
             kind="uvc",
@@ -436,7 +446,11 @@ def detect_devices(max_index: int = settings.DEVICE_SCAN_MAX_INDEX) -> List[Devi
     except Exception:
         gripper_devices = []
     try:
-        devices += _list_uvc_devices(max_index)
+        # rig 的组件相机（DECXIN/Sightac/FT602）归 libuvc 服务独占，不进通用
+        # 列表；只有与控制板同根端口的那颗才算 rig 的，单插的 DECXIN 放行。
+        devices += _list_uvc_devices(
+            max_index, gripper_hubs=gripper_root_hubs(gripper_devices)
+        )
     except Exception:
         pass
     try:
@@ -554,21 +568,101 @@ _GRIPPER_USB_PID = 0x1001
 # 夹爪组件相机（Sightac 触觉 ×2 / DECXIN RGB / Fays FT602），libuvc 服务与
 # Fays 桥接独占，绝不进通用 UVC 列表
 _GRIPPER_COMPONENT_UVC = {("0c45", "636f"), ("1bcf", "2d4f"), ("0403", "602e")}
+_GRIPPER_COMPONENT_TOKENS = ("0c45_636f", "1bcf_2d4f", "0403_602e",
+                             "sightac", "decxin", "ftdi superspeed")
+# 组件里唯一有独立用途的一颗：DECXIN 单插时跑 USB-DECXIN--- 手部关键点任务
+# （v1.3.0 前它是普通 UVC 相机，device_names.json 里还留着 "DECXIN_head"）。
+# rig 上那颗与 Sightac 一起挂在控制板的根端口下，单插那颗在别的根端口 ——
+# 真机实测：控制板 1-2.2.1、rig 的 DECXIN 1-2.2.2（同属根端口 1-2），
+# 单插的 DECXIN 1-5。原生 discover-uvc-config 按同一拓扑分组，把单插那颗
+# 标成 ungrouped。Sightac/FT602 不放开：前者单插无用，后者另有 is_sdk 兜底。
+_GRIPPER_STANDALONE_UVC = {("1bcf", "2d4f")}
+_GRIPPER_STANDALONE_TOKENS = ("1bcf_2d4f", "decxin")
 
 
-def _is_gripper_component_camera(d: dict) -> bool:
-    """按 VID/PID 识别夹爪组件相机；VID/PID 缺失时用 by-id 字符串兜底。"""
+def _usb_root_hub_from_sysfs(sysfs_node: str) -> Optional[str]:
+    """从 sysfs 设备节点取 USB 根端口（"1-2.2.1" → "1-2"）；取不到返回 None。
+
+    与 core/gripper/devices/usb_camera_sets.py 的 _root_hub_from_physical
+    同一约定。此处自带一份，是因为本模块必须能在 Windows 上 import（见
+    core/gripper_codec.py 的 fcntl 陷阱），不反向依赖 core.gripper。
+    """
+    try:
+        resolved = os.path.realpath(sysfs_node)
+    except OSError:
+        return None
+    for component in reversed(resolved.split(os.sep)):
+        physical = component.split(":", 1)[0]
+        match = re.fullmatch(r"(\d+-\d+)(?:\.\d+)*", physical)
+        if match is not None:
+            return match.group(1)
+    return None
+
+
+def _v4l_root_hub(video_index) -> Optional[str]:
+    """V4L2 节点（/dev/videoN）所在的 USB 根端口。"""
+    if video_index is None:
+        return None
+    return _usb_root_hub_from_sysfs(
+        f"/sys/class/video4linux/video{video_index}/device"
+    )
+
+
+def _tty_root_hub(device_path: str) -> Optional[str]:
+    """ttyACM 控制板所在的 USB 根端口；用来定位夹爪 rig 占了哪个根端口。"""
+    basename = os.path.basename(str(device_path or "").strip())
+    if not re.fullmatch(r"ttyACM\d+", basename):
+        return None
+    return _usb_root_hub_from_sysfs(f"/sys/class/tty/{basename}/device")
+
+
+def gripper_root_hubs(gripper_devices) -> set:
+    """夹爪控制板占用的 USB 根端口集合；空集＝本次没接 rig。
+
+    rig 的 DECXIN/Sightac 与控制板同根端口，据此把单插的 DECXIN 从夹爪
+    组件的排除名单里摘出来（见 _is_gripper_component_camera）。
+    """
+    hubs = set()
+    for info in gripper_devices or ():
+        hub = _tty_root_hub(getattr(info, "address", "") or "")
+        if hub:
+            hubs.add(hub)
+    return hubs
+
+
+def _is_gripper_component_camera(d: dict, *, gripper_hubs=None) -> bool:
+    """按 VID/PID 识别夹爪组件相机；VID/PID 缺失时用 by-id 字符串兜底。
+
+    gripper_hubs 是控制板占用的根端口集合（gripper_root_hubs()）:
+      None     → 未知，一律按组件处理（保守，维持旧契约）
+      set()    → 没接 rig，没有 libuvc 服务独占 → 可独立使用的 DECXIN 放行
+      {"1-2"}  → 只放行不在这些根端口下的 DECXIN，即单插的那颗
+    相机自身根端口取不到时同样按组件处理 —— 宁可藏，不可与 rig 双开。
+    """
+    releasable = gripper_hubs is not None
+    hubs = set(gripper_hubs or ())
     vid = str(d.get("vid") or "").lower()
     pid = str(d.get("pid") or "").lower()
-    if vid and pid:
-        return (vid, pid) in _GRIPPER_COMPONENT_UVC
-    by_id = (d.get("by_id_path") or "").lower()
-    name = (d.get("name") or "").lower()
-    return any(
-        token in by_id or token in name
-        for token in ("0c45_636f", "1bcf_2d4f", "0403_602e",
-                      "sightac", "decxin", "ftdi superspeed")
-    )
+    if not (vid and pid):
+        by_id = (d.get("by_id_path") or "").lower()
+        name = (d.get("name") or "").lower()
+        if releasable and any(
+            token in by_id or token in name
+            for token in _GRIPPER_STANDALONE_TOKENS
+        ):
+            hub = _v4l_root_hub(d.get("video_index"))
+            if hub is not None and hub not in hubs:
+                return False
+        return any(
+            token in by_id or token in name
+            for token in _GRIPPER_COMPONENT_TOKENS
+        )
+    key = (vid, pid)
+    if key in _GRIPPER_STANDALONE_UVC and releasable:
+        hub = _v4l_root_hub(d.get("video_index"))
+        if hub is not None and hub not in hubs:
+            return False
+    return key in _GRIPPER_COMPONENT_UVC
 
 
 def _list_gripper_devices() -> List[DeviceInfo]:

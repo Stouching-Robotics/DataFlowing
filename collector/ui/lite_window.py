@@ -49,6 +49,7 @@ from core.device_detector import (DeviceInfo, _list_ble_devices,
                                   _list_gripper_devices,
                                   _list_usb_glove_devices,
                                   _list_uvc_devices,
+                                  gripper_root_hubs,
                                   set_ble_scan_suppressed,
                                   usb_glove_prefer_side)
 from core.encoder_probe import list_working_ffmpegs
@@ -593,12 +594,14 @@ class LiteWindow(QMainWindow):
             d435 = _list_d435_devices()
             usb = _list_usb_glove_devices()
             ble = _list_ble_devices()
-            uvc = _list_uvc_devices()
             # 夹爪：_list_gripper_devices 内部先查 paths.gripper_resources_available()
             # （native/ 未随包交付 → 空列表 → 组框照建、里面空着；Windows 上
             # core.gripper 因顶层 import fcntl 直接导入失败，同样被它内部
             # 的 except 兜成空列表）
             gripper = _list_gripper_devices()
+            # rig 的 DECXIN 与单插的同 VID/PID，按控制板根端口区分后再放行
+            # （见 _is_gripper_component_camera）；先扫夹爪才拿得到根端口
+            uvc = _list_uvc_devices(gripper_hubs=gripper_root_hubs(gripper))
             try:
                 self._scan_result.emit(d435, usb, ble, uvc, gripper)
             except RuntimeError:

@@ -100,6 +100,59 @@ def _main():
     check(infos[0].video_index == 2 and infos[0].serial == "2024010100",
           f"webcam 索引/序号正确: idx={infos[0].video_index} serial={infos[0].serial}")
 
+    print("── 2b. list_v4l_devices 按物理设备分组（by-id 被顶掉也可见） ──")
+    # 两颗同型号同序列号 DECXIN：udev 的 by-id 链接名唯一（厂商_型号_序列号
+    # 完全相同），只有后注册那颗有链接，另一颗成孤儿。以 by-id 为枚举入口
+    # 会让孤儿**整个从面板消失**（真机：video8/9 曾是这种孤儿）。
+    nodes = {"1-5": [8, 9], "1-2.2.2": [10, 11]}
+    hub_of = {8: "1-5", 9: "1-5", 10: "1-2.2.2", 11: "1-2.2.2"}
+    with patch("core.camera._v4l_nodes_by_physical_device",
+               return_value=nodes), \
+         patch("core.camera._physical_usb_path",
+               side_effect=lambda i: hub_of.get(i)), \
+         patch("core.camera._find_persistent_v4l_path",
+               side_effect=lambda i: ("/dev/v4l/by-id/usb-DECXIN_DECXIN_CAMERA"
+                                      "_01.00.00-video-index0" if i == 10 else None)), \
+         patch("core.camera._usb_vid_pid", return_value=("1bcf", "2d4f")), \
+         patch("core.camera._usb_ident_strings",
+               return_value=("DECXIN", "DECXIN CAMERA")), \
+         patch("core.camera._is_sdk_device", return_value=False), \
+         patch("core.camera._is_realsense_node", return_value=False):
+        devs = cam.list_v4l_devices(16)
+    check(sorted(d["video_index"] for d in devs) == [8, 10],
+          f"两颗各取主视频流（不是聚成一颗）: {[d['video_index'] for d in devs]}")
+    orphan = next(d for d in devs if d["video_index"] == 8)
+    check(orphan["by_id_path"] is None and orphan["usb_path"] == "1-5"
+          and orphan["name"] == "DECXIN DECXIN CAMERA",
+          f"孤儿靠 USB 拓扑+字符串兜底: {orphan}")
+    # 同型号 + 有一台拿不到链接 ⇒ 那个前缀不能当 key：**谁拿链接取决于注册
+    # 顺序、重新枚举时会翻转**，于是拿到链接的 video10 自己也得放弃 by-id
+    # 前缀。注意判据不能是「数前缀重复」—— 任一时刻只有一台有链接，另一台
+    # 压根进不了计数，这么写永远数不出来。
+    check(next(d for d in devs if d["video_index"] == 10)["by_id_ambiguous"] is True,
+          "同型号无链接设备在场 → 该 by-id 前缀标记有歧义（拿链接的也要退）")
+    check(orphan["by_id_ambiguous"] is False,
+          "孤儿无前缀，不参与歧义标记（by_id_path=None 本就退拓扑）")
+
+    # 对照：同型号**不同序列号**两台各有各的链接 → 前缀唯一，不许误判降级
+    link2 = {8: "/dev/v4l/by-id/usb-DECXIN_DECXIN_CAMERA_01.00.00-video-index0",
+             10: "/dev/v4l/by-id/usb-DECXIN_DECXIN_CAMERA_01.00.01-video-index0"}
+    with patch("core.camera._v4l_nodes_by_physical_device", return_value=nodes), \
+         patch("core.camera._physical_usb_path",
+               side_effect=lambda i: hub_of.get(i)), \
+         patch("core.camera._find_persistent_v4l_path",
+               side_effect=lambda i: link2.get(i)), \
+         patch("core.camera._usb_vid_pid", return_value=("1bcf", "2d4f")), \
+         patch("core.camera._usb_ident_strings",
+               return_value=("DECXIN", "DECXIN CAMERA")), \
+         patch("core.camera._is_sdk_device", return_value=False), \
+         patch("core.camera._is_realsense_node", return_value=False):
+        devs2 = cam.list_v4l_devices(16)
+    check(all(d["by_id_ambiguous"] is False for d in devs2)
+          and len({d["by_id_path"] for d in devs2}) == 2,
+          f"同型号不同序列号各持前缀 → 不降级: "
+          f"{[(d['video_index'], d['by_id_ambiguous']) for d in devs2]}")
+
     print("── 3. _list_s80m_devices 多台按序列号区分（mock _ftdi_camera_groups） ──")
     fake_cams = [
         {"usb_path": "1-3.4.1", "serial": "000000000001", "stereo_index": 0},
@@ -173,6 +226,94 @@ def _main():
         {"by_id_path": "/dev/v4l/by-id/usb-Sightac_SN0001-video-index0",
          "name": "Sightac"}),
         "VID/PID 缺失时 by-id 兜底排除")
+
+    print("── 4c. 单插 DECXIN 按 USB 根端口与 rig 区分 ──")
+    # 真机：控制板 1-2.2.1、rig 的 DECXIN 1-2.2.2（同根端口 1-2），
+    # 单插的 DECXIN 1-5。同 VID/PID 只能靠拓扑分开。
+    decxin = {"vid": "1bcf", "pid": "2d4f", "video_index": 8}
+    with patch("core.device_detector._v4l_root_hub", return_value="1-5"):
+        check(not det._is_gripper_component_camera(decxin, gripper_hubs=set()),
+              "没接 rig → 单插 DECXIN 放行")
+        check(not det._is_gripper_component_camera(decxin,
+                                                   gripper_hubs={"1-2"}),
+              "与控制板不同根端口 → 单插 DECXIN 放行")
+    with patch("core.device_detector._v4l_root_hub", return_value="1-2"):
+        check(not det._is_gripper_component_camera(decxin, gripper_hubs=set()),
+              "没接 rig → rig 位置的 DECXIN 也放行")
+        check(det._is_gripper_component_camera(decxin, gripper_hubs={"1-2"}),
+              "与控制板同根端口 → rig 的 DECXIN 排除")
+    with patch("core.device_detector._v4l_root_hub", return_value=None):
+        check(det._is_gripper_component_camera(decxin, gripper_hubs={"1-2"}),
+              "根端口取不到 → 保守排除，不与 rig 双开")
+    check(det._is_gripper_component_camera(decxin),
+          "不传 gripper_hubs（未知）→ 维持旧契约排除")
+    with patch("core.device_detector._v4l_root_hub", return_value="1-5"):
+        check(det._is_gripper_component_camera(
+            {"vid": "0c45", "pid": "636f", "video_index": 9},
+            gripper_hubs=set()), "Sightac 单插也无独立用途 → 始终排除")
+
+    # 端到端：两颗同型号 DECXIN 同时在位，只放行单插那颗
+    def _mk_decxin(idx, tail):
+        return {"video_index": idx, "name": "DECXIN DECXIN CAMERA 01.00.00",
+                "serial": "01.00.00",
+                "by_id_path": f"/dev/v4l/by-id/usb-DECXIN_DECXIN_CAMERA_{tail}"
+                              f"-video-index0",
+                "vid": "1bcf", "pid": "2d4f",
+                "is_sdk": False, "is_realsense": False}
+    # hub_of 按 _v4l_root_hub 的契约给**根端口**（1-2.2.2 的根端口是 1-2）
+    hub_of = {8: "1-5", 10: "1-2"}
+    with patch("core.device_detector.list_v4l_devices",
+               return_value=[_mk_decxin(8, "01.00.00"), _mk_decxin(10, "01.00.01")]), \
+         patch("core.device_detector._v4l_root_hub",
+               side_effect=lambda i: hub_of.get(i)):
+        infos = _list_uvc_devices(16, gripper_hubs={"1-2"})
+    check([i.video_index for i in infos] == [8]
+          and infos[0].key == "uvc:usb-DECXIN_DECXIN_CAMERA_01.00.00",
+          f"只放行单插那颗且 key 与 device_names 稳定: "
+          f"{[(i.video_index, i.key) for i in infos]}")
+
+    # by-id 被顶掉时 key 退到 USB 拓扑路径（跨重启稳定），不是会漂移的索引
+    with patch("core.device_detector.list_v4l_devices", return_value=[
+            {"video_index": 8, "name": "DECXIN DECXIN CAMERA", "serial": "",
+             "by_id_path": None, "usb_path": "1-5",
+             "vid": "1bcf", "pid": "2d4f",
+             "is_sdk": False, "is_realsense": False}]), \
+         patch("core.device_detector._v4l_root_hub", return_value="1-5"):
+        infos = _list_uvc_devices(16, gripper_hubs={"1-2"})
+    check([i.key for i in infos] == ["uvc:usb-1-5"],
+          f"by-id 被顶掉 → key 退到 USB 拓扑路径: {[i.key for i in infos]}")
+
+    # by-id 前缀有歧义（被同型号两台共用，链接归属会在重枚举时翻转）→
+    # **拿到链接的那台也不能用**，否则同一台相机在 by-id key 与拓扑 key 之间
+    # 跳，面板表现为设备消失又出现、并把用户起的名字丢掉
+    with patch("core.device_detector.list_v4l_devices", return_value=[
+            {**_mk_decxin(8, "01.00.00"), "usb_path": "1-5",
+             "by_id_ambiguous": True},
+            {**_mk_decxin(10, "01.00.00"), "usb_path": "1-2.2.2",
+             "by_id_ambiguous": True}]), \
+         patch("core.device_detector._v4l_root_hub", return_value="1-5"):
+        infos = _list_uvc_devices(16, gripper_hubs={"1-2"})
+    keys = sorted(i.key for i in infos)
+    check(keys == ["uvc:usb-1-2.2.2", "uvc:usb-1-5"] and len(set(keys)) == 2,
+          f"前缀有歧义 → 两颗都退拓扑路径且 key 互不相同: {keys}")
+
+    # 歧义 + 连拓扑路径都取不到 → 退到索引（最后一档兜底，不许抛异常）
+    with patch("core.device_detector.list_v4l_devices", return_value=[
+            {**_mk_decxin(8, "01.00.00"), "usb_path": "",
+             "by_id_ambiguous": True}]), \
+         patch("core.device_detector._v4l_root_hub", return_value="1-5"):
+        infos = _list_uvc_devices(16, gripper_hubs={"1-2"})
+    check([i.key for i in infos] == ["uvc:8"],
+          f"歧义且无拓扑路径 → 退索引兜底: {[i.key for i in infos]}")
+
+    # gripper_root_hubs：从控制板 tty 路径取根端口
+    with patch("core.device_detector._tty_root_hub",
+               side_effect=lambda p: "1-2" if p == "/dev/ttyACM0" else None):
+        check(det.gripper_root_hubs(
+            [DeviceInfo(key="gripper:s", kind="gripper", display_name="g",
+                        address="/dev/ttyACM0")]) == {"1-2"},
+              "控制板根端口取自 tty 路径")
+    check(det.gripper_root_hubs([]) == set(), "没接 rig → 空集")
 
     # 夹爪枚举：mock 串口枚举 + 资源可用 → 一条 gripper 条目
     class _Port:

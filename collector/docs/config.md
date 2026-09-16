@@ -117,7 +117,7 @@ config/ 是应用全局配置、国际化与版本号所在的配置包。版本
 **JSON 字段约定**（由本模块的读写函数定义）：
 
 - `data/server_config.json`：`server_url`（str）、`username`（str）、`password`（str）、`upload_auto_sync`（bool，缺省 `True`）、`upload_delete_after`（bool，缺省 `False`）。
-- `data/device_names.json`：key = `DeviceInfo.stable_key`（形如 `"uvc:{by-id前缀}"` / `"d435:{serial}"` / `"ble:{MAC}"` 等），value = `{"name": str, "sensor"?: str}`（`sensor` 仅 `data_ble` 设备用，绑定 parquet 列名 `right_glove`/`left_glove`，按 MAC 持久化）；旧版纯字符串自动升级为 `{"name": …}`。
+- `data/device_names.json`：key = `DeviceInfo.stable_key`（形如 `"uvc:{by-id前缀}"` / `"uvc:usb-1-5"`（无 by-id 链接、或该前缀被同型号多台共用而归属会翻转时，退到 USB 拓扑路径）/ `"d435:{serial}"` / `"ble:{MAC}"` 等），value = `{"name": str, "sensor"?: str}`（`sensor` 仅 `data_ble` 设备用，绑定 parquet 列名 `right_glove`/`left_glove`，按 MAC 持久化）；旧版纯字符串自动升级为 `{"name": …}`。
 - `data/device_params.json`：key 同 `stable_key`，value = `{"exposure": {"auto": bool, "value": float}, "original": {同结构}}`；`auto=True` 时 `value` 忽略；`original` 首次看到才写入、之后永不覆盖，供"恢复默认"回到开机原厂曝光。
 
 **调用关系**：被 `core/`（`pipeline.py`、`camera.py`、`hand_tracking.py`、`stereo_depth.py`、`device_detector.py`、`d435_camera.py`、`egodata_writer.py`、`task_record.py`、`render_engine.py`、`helpers.py`（`as _settings`）等）、`ui/`（`main_window.py`、`camera_widget.py`、`device_panel.py`、`playback_dialog.py`、`upload_dialog.py`、`task_page.py`）以及 `tools/tests/` 多个用例 import。自身仅依赖 `os` 与 `config.__version__`。

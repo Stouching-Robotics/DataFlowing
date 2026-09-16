@@ -71,11 +71,13 @@
 | 名称 | 签名要点 | 作用 | 返回/副作用 |
 |---|---|---|---|
 | `CameraState` | 类常量 | 状态枚举 | `DISCONNECTED/IDLE/RECORDING/ERROR` |
-| `list_v4l_devices` | `(max_index=16)` | sysfs 只读枚举 V4L2 设备，by-id 分组、每物理设备只留主视频流 | 每项 `{video_index, name, serial, by_id_path, vid, pid, is_sdk, is_realsense}` |
+| `list_v4l_devices` | `(max_index=16)` | sysfs 只读枚举 V4L2 设备，**按物理 USB 设备**分组（键取拓扑路径如 `1-5`，非 USB 节点退回 realpath）、每物理设备只留主视频流 | 每项 `{video_index, name, serial, by_id_path, by_id_ambiguous, usb_path, vid, pid, is_sdk, is_realsense}`；无对应链接时 `by_id_path` 为 `None`。`by_id_ambiguous=True` = 该前缀被同型号多台共用、链接归属会在重枚举时翻转，**不能当 key**（见 `_ambiguous_by_id_prefixes`）；`by_id_path` 本身不受影响，仍是「真路径或 None」，照旧可用于打开设备 |
 | `detect_cameras` | `(max_index=8)` | 打开测试（test_read）枚举可用相机 | `[(idx, backend), ...]` |
 | `_try_open_camera`（内部） | `(index, test_read=False, fallback_all_by_id=False)` | 按后端列表（Linux: V4L2/FFMPEG/ANY；Windows: DShow/MSMF/ANY）尝试打开 | `(VideoCapture, backend名)` 或 `(None, "")` |
 | `_is_sdk_device` / `_is_realsense_node`（内部） | `(index)` | sysfs name/VID:PID 判 FTDI SDK 设备与 RealSense 节点 | `bool` |
 | `_usb_vid_pid`（内部） | `(video_index)` | 沿 sysfs 设备树向上（≤6 层）找 `idVendor`/`idProduct` | `(vid, pid)` 小写十六进制或 `None` |
+| `_physical_usb_path` / `_usb_ident_strings`（内部） | `(index)` | 节点所属物理 USB 设备的拓扑路径 / 沿 sysfs 向上（≤6 层）找 USB `manufacturer`+`product` 字符串 | `str`（如 `"1-5"`）或 `None` / `(厂商, 型号)`，取不到给空串 |
+| `_v4l_nodes_by_physical_device`（内部） | `(max_index)` | sysfs 里**所有** v4l 节点按物理设备分组——同型号同序列号两台并存时 udev 的 by-id 链接名会相撞，只有拓扑分得开 | `{物理设备键: [video_index, ...]}` |
 | `CameraWorker` | `(camera_index=0, resolution=None, record_queue=None)` | UVC 采集 worker；默认分辨率 `settings.DEFAULT_RESOLUTION`（1280×960@30，MJPG） | 信号：`frame_ready(ndarray)`、`state_changed(str)`、`error_occurred(str)`、`fps_updated(float)`、`camera_opened(int,int,str)` |
 | `CameraWorker.start` / `stop` / `pause` / `resume` | 无参 | 生命周期控制（stop join ≤5s） | 无 |
 | `CameraWorker.state` / `is_connected` / `resolution` / `latest_capture_ts_us` | property | 状态、连接、实际分辨率、最新帧采集时间戳（Unix 微秒，线程安全） | 对应值 |
@@ -134,10 +136,13 @@ RGB（BGR 三通道）+ 深度（uint16，归一化毫米）两路信号。左�
 | `detect_devices` | `(max_index=settings.DEVICE_SCAN_MAX_INDEX)` | 四段枚举（UVC+D435+S80M+BLE），各自容错整体不崩 | `List[DeviceInfo]` |
 | `DeviceScanner` | `(parent=None, max_index=None)` | 后台线程扫描，`_busy` 守卫防轮询堆积 | 信号 `scan_finished(list)`；`request_scan()`/`stop()` |
 | `set_ble_scan_suppressed` | `(on: bool)` | 抑制 bleak 主动发现（手套连接中防扫描挤占吞吐），不影响 bluetoothctl 列表 | 无 |
-| `_list_uvc_devices` / `_list_d435_devices` / `_list_s80m_devices` / `_list_ble_devices`（内部） | 各自 max_index | 分段枚举 | `List[DeviceInfo]` |
+| `_list_uvc_devices`（内部） | `(max_index, *, gripper_hubs=None)` | UVC 分段枚举；`gripper_hubs`＝夹爪控制板占用的 USB 根端口集合，用来把单插的 DECXIN 与 rig 那颗同 VID/PID 的相机分开（`None`＝未知，一律按组件排除） | `List[DeviceInfo]` |
+| `_list_d435_devices` / `_list_s80m_devices` / `_list_ble_devices`（内部） | 各自 max_index | 分段枚举 | `List[DeviceInfo]` |
+| `gripper_root_hubs` | `(gripper_devices)` | 从夹爪控制板的 tty 路径取它占用的 USB 根端口集合；空集＝本次没接 rig | `set[str]` |
+| `_is_gripper_component_camera`（内部） | `(d, *, gripper_hubs=None)` | 按 VID/PID 判夹爪组件相机；DECXIN 若在非控制板根端口下则放行（单插那颗，有独立用途），Sightac/FT602 始终排除；相机自身根端口取不到时保守排除 | `bool` |
 | `_is_glove_name`（内部） | `(name)` | 广播名判手套：含 "matrix" 或单字母 `l/r/left/right/l_glove/r_glove/left_glove/right_glove` | `bool` |
 
-**关键数据**：`DeviceInfo.key` 格式约定：`"uvc:{by-id前缀或索引}"`、`"d435:{serial}"`、`"s80m:ftdi"`、`"ble:{MAC}"`；`kind` 取值 `uvc | d435 | s80m | data_ble | ble`（`data_ble`=手套）。BLE 常量 `BLE_DISCOVERY_INTERVAL_S=20.0`、`BLE_DISCOVERY_TIMEOUT_S=5.0`。S80M：FTDI 命中一次即返回单条（SDK 配置写死 video0/video2）。RealSense UVC 节点判定：vendor 8086 且 PID 0b07（D435）或驱动 name 含 "RealSense"（D435i 为 0b3a、其余型号 PID 各异，name 兜底）。
+**关键数据**：`DeviceInfo.key` 格式约定：`"uvc:{by-id前缀 | usb-<拓扑路径> | 索引}"`（无链接、**或前缀被同型号多台共用**（`by_id_ambiguous`，链接归属会在重枚举时翻转）→ 退到拓扑路径，两者都跨重启稳定，索引兜底但会漂移）、`"d435:{serial}"`、`"s80m:ftdi"`、`"ble:{MAC}"`；`kind` 取值 `uvc | d435 | s80m | data_ble | ble`（`data_ble`=手套）。BLE 常量 `BLE_DISCOVERY_INTERVAL_S=20.0`、`BLE_DISCOVERY_TIMEOUT_S=5.0`。S80M：FTDI 命中一次即返回单条（SDK 配置写死 video0/video2）。RealSense UVC 节点判定：vendor 8086 且 PID 0b07（D435）或驱动 name 含 "RealSense"（D435i 为 0b3a、其余型号 PID 各异，name 兜底）。
 
 **调用关系**：被 `ui/main_window.py`（`DeviceScanner`）、`ui/device_panel.py`、`tools/tests/device_panel_gui_smoke_test.py`（`DeviceInfo`/`detect_devices`）、`tools/tests/glove_widget_test.py`、`tools/tests/multi_device_registry_test.py` 引用；调用了 `core/camera.py`。
 

@@ -294,34 +294,149 @@ def _discover_indices(max_index: int = 8) -> list:
     return sorted(all_indices)
 
 
+def _usb_ident_strings(index: int) -> tuple:
+    """USB 设备节点的 (厂商, 型号) 字符串；取不到给空串。
+
+    无 by-id 链接时用它拼显示名 —— 同型号同序列号两台并存会被 udev 顶掉
+    链接，此时只剩 sysfs 字符串可读。
+    """
+    node = os.path.realpath(f"/sys/class/video4linux/video{index}")
+    for _ in range(6):
+        try:
+            with open(os.path.join(node, "product")) as f:
+                product = f.read().strip()
+            if product:
+                try:
+                    with open(os.path.join(node, "manufacturer")) as f:
+                        manufacturer = f.read().strip()
+                except OSError:
+                    manufacturer = ""
+                return manufacturer, product
+        except OSError:
+            pass
+        parent = os.path.dirname(node)
+        if parent == node:
+            break
+        node = parent
+    return "", ""
+
+
+def _physical_usb_path(index: int) -> Optional[str]:
+    """videoN 所属物理 USB 设备的拓扑路径（如 "1-5"）；非 USB/取不到返回 None。
+
+    同一台相机的多个流（videoN / videoN+1）共享同一路径，可当分组键 ——
+    与 by-id 不同，**同型号同序列号两台并存时不会撞**。
+    """
+    try:
+        node = os.path.realpath(f"/sys/class/video4linux/video{index}/device")
+    except OSError:
+        return None
+    for component in reversed(node.split(os.sep)):
+        physical = component.split(":", 1)[0]
+        if re.fullmatch(r"\d+-\d+(?:\.\d+)*", physical):
+            return physical
+    return None
+
+
+def _v4l_nodes_by_physical_device(max_index: int) -> dict:
+    """{物理设备键: [video_index, ...]}，覆盖 sysfs 里**所有** v4l 节点。
+
+    键优先取 USB 拓扑路径，非 USB 节点退回 sysfs realpath，保证同一物理
+    设备的多个流聚到一组。
+    """
+    groups: dict = {}
+    root = "/sys/class/video4linux"
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return groups
+    for entry in entries:
+        if not re.fullmatch(r"video\d+", entry):
+            continue
+        idx = int(entry[len("video"):])
+        if idx >= max_index:
+            continue
+        key = _physical_usb_path(idx) or os.path.realpath(
+            os.path.join(root, entry, "device")
+        )
+        groups.setdefault(key, []).append(idx)
+    return groups
+
+
+def _ambiguous_by_id_prefixes(groups: dict) -> set:
+    """by-id 前缀不可当稳定标识的那些前缀（被多台物理设备共用）。
+
+    udev 的 by-id 链接名 = `usb-<厂商>_<型号>_<序列号>`，而链接名在一个目录
+    内唯一：同型号**同序列号**的两台并存时，**只有一台真拿到链接**，另一台
+    by_id_path 为 None。要命的是**谁拿到取决于注册顺序**，重新枚举时会在两台
+    之间翻转 ⇒ 同一台相机在两个 key（by-id 形式 / usb-<拓扑路径>）之间跳，
+    面板表现为设备消失又出现、并把用户起的名字丢掉（真机 logs/main.log 抓到
+    `Connected: DECXIN_head` 紧跟 `Disconnected: DECXIN DECXIN CAMERA`）。
+
+    **判据不能是「数前缀重复」**：任一时刻只有一台有链接，另一台压根进不了
+    计数。改为 —— 一台**没链接**的物理设备，其 (厂商, 型号) 与另一台**有
+    链接**的相同，说明那台的链接是踩了它才拿到的。同型号**不同序列号**的两台
+    各有各的链接、不会被误判（它们的 by-id key 仍然是稳的，不降级）。
+    """
+    linked = {}         # (厂商, 型号) → [前缀, ...]
+    unlinked = set()    # 拿不到链接的物理设备的 (厂商, 型号)
+    for idx_list in groups.values():
+        idx = min(idx_list)
+        ident = tuple(s.strip().lower() for s in _usb_ident_strings(idx))
+        if not any(ident):
+            continue        # 读不到厂商/型号 → 无从判定，不参与（保守）
+        path = _find_persistent_v4l_path(idx)
+        if not path:
+            unlinked.add(ident)
+            continue
+        prefix = os.path.basename(path).rsplit("-video-index", 1)[0]
+        linked.setdefault(ident, []).append(prefix)
+    ambiguous = set()
+    for ident in unlinked:
+        ambiguous.update(linked.get(ident, ()))
+    return ambiguous
+
+
 def list_v4l_devices(max_index: int = 16) -> list:
     """sysfs 只读枚举 V4L2 设备（不 open、不 test_read，轮询安全）。
 
-    以 /dev/v4l/by-id 分组识别物理设备，每个物理设备只保留主视频流
-    （最小索引）。返回列表每项:
-      {video_index, name, serial, by_id_path, vid, pid, is_sdk}
-    name 从 by-id 前缀解码（去 "usb-" 前缀、字段分隔符转空格）;
+    按**物理 USB 设备**分组（不是 by-id）：同型号同序列号两台并存时 udev
+    的 by-id 链接名唯一（`usb-<厂商>_<型号>_<序列号>` 完全相同），后注册的
+    那台会顶掉前一台的链接 —— 以 by-id 为枚举入口会让被顶掉那台**整个从
+    面板消失**。每个物理设备只保留主视频流（最小索引）。返回列表每项:
+      {video_index, name, serial, by_id_path, by_id_ambiguous, usb_path,
+       vid, pid, is_sdk}
+    by_id_path 尽力而为：无对应链接（被顶掉/无 by-id 规则）时为 None，
+    调用方须回退到 video_index 打开。**by_id_ambiguous 为真表示这个前缀被
+    多台共用、归属会在重新枚举时翻转，不能当 key**（见
+    _ambiguous_by_id_prefixes）；注意它只影响「能不能拿前缀当标识」，
+    by_id_path 本身仍是真路径、照旧可用于打开设备。name 优先从 by-id 前缀
+    解码（去 "usb-" 前缀、字段分隔符转空格），无链接时回退 sysfs name 文件;
     serial 启发式取前缀最后一段（仅纯字母数字且 ≥8 字符才认作序号）。
     被占用的设备不会被打开，仍会稳定出现在列表中。
     """
     devices = []
-    for prefix, idx_list in sorted(_by_id_device_streams().items()):
-        idx_list = sorted(idx_list)
-        idx = idx_list[0]           # 主视频流
-        if idx >= max_index:
-            continue
+    groups = _v4l_nodes_by_physical_device(max_index)
+    ambiguous = _ambiguous_by_id_prefixes(groups)
+    for _key, idx_list in sorted(groups.items()):
+        idx = min(idx_list)         # 主视频流
+        by_id_path = _find_persistent_v4l_path(idx)
+        prefix = (os.path.basename(by_id_path).rsplit("-video-index", 1)[0]
+                  if by_id_path else "")
+        name, serial = "", ""
         if prefix.startswith("usb-"):
             # usb-<vendor>_<model>_<serial> → 分段转空格
             segments = [s for s in re.split(r"[-_]", prefix[len("usb-"):]) if s]
-            serial = ""
             if segments and segments[-1].isalnum() and len(segments[-1]) >= 8:
                 serial = segments[-1]   # 序号单独显示，不进名称
                 segments = segments[:-1]
             name = " ".join(segments).strip()
-        else:
-            name, serial = "", ""
         if not name:
-            # 非 USB 前缀无法解码，回退 sysfs name 文件
+            # 无 by-id（被 udev 顶掉/无规则）→ 退回 USB 厂商+型号字符串，
+            # 与 by-id 解码结果同名；再取不到才用 sysfs name 文件
+            manufacturer, product = _usb_ident_strings(idx)
+            name = " ".join(p for p in (manufacturer, product) if p).strip()
+        if not name:
             try:
                 with open(f"/sys/class/video4linux/video{idx}/name") as f:
                     name = f.read().strip()
@@ -332,7 +447,9 @@ def list_v4l_devices(max_index: int = 16) -> list:
             "video_index": idx,
             "name": name,
             "serial": serial,
-            "by_id_path": _find_persistent_v4l_path(idx),
+            "by_id_path": by_id_path,
+            "by_id_ambiguous": prefix in ambiguous,
+            "usb_path": _physical_usb_path(idx),
             "vid": vp[0] if vp else None,
             "pid": vp[1] if vp else None,
             "is_sdk": _is_sdk_device(idx),

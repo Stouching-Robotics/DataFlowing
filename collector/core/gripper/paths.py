@@ -48,6 +48,12 @@ CAMERA_SERVICE_BINARY = os.path.join(
 DISCOVER_UVC_CONFIG_BINARY = os.path.join(
     CAMERA_SERVICE_DIR, "build", "discover-uvc-config",
 )
+# 相机服务学到的等时档位就存在这里：按「机型 × 控制器 PCI 路径 × 相机序列号」
+# 一个键一个文件。放在 GRIPPER_DIR 下而不是服务的 runtime_dir 里，因为后者
+# 每次租约释放都会被整个删掉（见 uvc_camera_service._release_lease），存那儿
+# 等于没存。C 侧按 state_dir 这个 ini 键收到它，见 camera_service.c 的
+# persist_mode_choice。
+CAMERA_MODE_STATE_DIR = os.path.join(GRIPPER_DIR, "camera_modes")
 SIGHTAC_SDK_ROOT = os.path.abspath(os.environ.get(
     "KSQ_SIGHTAC_ROOT",
     os.path.join(PACKAGE_ROOT, "sightac_sdk"),

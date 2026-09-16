@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from typing import Callable, Optional
@@ -21,7 +22,9 @@ class GripperSerial:
     CONNECT_BAUD = 115200
     CONNECT_TIMEOUT = 0.5
     CONNECT_WRITE_TIMEOUT = 0.5
-    CONNECT_BOOT_DELAY = 2.0
+    # 握手不再固定白等 2 秒：在最长 CONNECT_BOOT_TIMEOUT 内反复发 ``?``，
+    # 收到 STATE 立刻返回。刚上电的 ESP32 仍在窗口内，已就绪的不必空等。
+    CONNECT_BOOT_TIMEOUT = 2.0
     CONNECT_ATTEMPTS = 8
     CONNECT_RETRY_DELAY = 0.3
     COMMAND_TIMEOUT = 1.0
@@ -65,21 +68,28 @@ class GripperSerial:
             return self._last_error
 
     def connect(self, port: str, baud: int = CONNECT_BAUD) -> bool:
-        """打开串口并用原有的八次 ``?`` 握手确认主控在线。"""
+        """独占打开串口，在有限窗口内用 ``?`` 握手确认主控在线。"""
         with self._io_lock:
             self._disconnect_locked()
             self._last_error = None
             try:
+                # 独占模式：串口被其他进程占用时立刻失败，而不是两个进程
+                # 各自读走半条响应，把「被占用」伪装成「握手超时」。
                 opened = self._serial_factory(
                     port,
                     baud,
                     timeout=self.CONNECT_TIMEOUT,
                     write_timeout=self.CONNECT_WRITE_TIMEOUT,
+                    exclusive=True,
                 )
                 self._serial = opened
-                self._sleep(self.CONNECT_BOOT_DELAY)
                 opened.reset_input_buffer()
+                deadline = self._clock() + self.CONNECT_BOOT_TIMEOUT
+                attempts_made = 0
                 for attempt in range(self.CONNECT_ATTEMPTS):
+                    if attempt and self._clock() >= deadline:
+                        break
+                    attempts_made = attempt + 1
                     opened.write(b"?\r\n")
                     line = opened.readline().decode(
                         errors="ignore").strip()
@@ -89,16 +99,18 @@ class GripperSerial:
                     )
                     if line.startswith("STATE"):
                         return True
-                    self._sleep(self.CONNECT_RETRY_DELAY)
+                    if self._clock() < deadline:
+                        self._sleep(self.CONNECT_RETRY_DELAY)
             except Exception as exc:
                 self._last_error = (
                     f"serial open/handshake failed: {exc}"
                 )
                 self._disconnect_locked()
                 return False
+            # 报实际尝试次数，不报上限：被抢占/占用时上限是误导
             self._last_error = (
                 "serial handshake timeout after "
-                f"{self.CONNECT_ATTEMPTS} attempts"
+                f"{attempts_made} attempts"
             )
             self._disconnect_locked()
             return False
@@ -135,6 +147,30 @@ class GripperSerial:
             # 关闭失败时也不能把已经失效的句柄重新暴露给调用方。
             pass
 
+    def query_fays_serial(self) -> str:
+        """读取 ESP32 NVS 中绑定的 Fays 产品序列号；未绑定/无效返回空串。"""
+        response = self.send("QF")
+        prefix = "FAYS_SERIAL:"
+        if not response.startswith(prefix):
+            return ""
+        return response[len(prefix):].strip()
+
+    def set_fays_serial(self, serial: str) -> bool:
+        """写入并持久化 ESP32 绑定的 Fays 产品序列号。"""
+        value = str(serial or "").strip()
+        if (
+            not value
+            or len(value) > 64
+            or re.fullmatch(r"[A-Za-z0-9._-]+", value) is None
+        ):
+            raise ValueError("Fays 序列号只能是 1-64 位字母、数字、点、下划线或短横线")
+        response = self.send(f"WF:{value}")
+        if response.startswith("OK FAYS_SERIAL_SET:"):
+            return True
+        if response.startswith("ERR "):
+            raise RuntimeError(f"ESP32 写入 Fays 序列号失败: {response}")
+        raise RuntimeError(f"ESP32 写入 Fays 序列号无有效响应: {response or '<empty>'}")
+
     def send(self, command: str) -> str:
         """发送一条文本命令并返回匹配的完整响应行。"""
         with self._io_lock:
@@ -149,16 +185,32 @@ class GripperSerial:
                 except Exception:
                     pass
                 opened.write((str(command) + "\r\n").encode())
-                expected = {
-                    "?": ("STATE",),
-                    "G": ("AS5048A", "AS5048A ERR"),
-                    "C": ("OK CONNECT", "ERR"),
-                    "I": ("OK INIT", "ERR"),
-                    "F": ("OK READY", "ERR"),
-                    "E": ("OK ERROR", "ERR"),
-                    "R": ("OK ASR", "AS5048A ERR"),
-                    "S": ("OK START", "ERR"),
-                }.get(str(command)[:1], ())
+                command_text = str(command)
+                if command_text.startswith("WF:"):
+                    # 写绑定：三种终态都算「本条命令的响应」，其余行继续等，
+                    # 免得把固件周期性的 STATE 当成写入结果。
+                    expected = (
+                        "OK FAYS_SERIAL_SET:",
+                        "ERR FAYS_SERIAL_INVALID",
+                        "ERR FAYS_SERIAL_SAVE",
+                    )
+                else:
+                    table = {
+                        "QF": ("FAYS_SERIAL:", "ERR FAYS_SERIAL_NOT_SET"),
+                        "?": ("STATE",),
+                        "G": ("AS5048A", "AS5048A ERR"),
+                        "C": ("OK CONNECT", "ERR"),
+                        "I": ("OK INIT", "ERR"),
+                        "F": ("OK READY", "ERR"),
+                        "E": ("OK ERROR", "ERR"),
+                        "R": ("OK ASR", "AS5048A ERR"),
+                        "S": ("OK START", "ERR"),
+                    }
+                    # 先按完整命令查（QF 是两字符命令），再退回首字符。
+                    # 只按 [:1] 查会让 "QF" 这条永远命中不到，等于宣布
+                    # 「第一行就是响应」——固件周期性的 STATE 会顶替真响应。
+                    expected = table.get(command_text, table.get(
+                        command_text[:1], ()))
                 deadline = self._clock() + self.COMMAND_TIMEOUT
                 last_line = ""
                 while self._clock() < deadline:

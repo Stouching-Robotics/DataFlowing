@@ -87,8 +87,13 @@ def probe_product_serial(
     probe_binary: Optional[str] = None,
     timeout: float = 60.0,
     environment: Optional[Mapping[str, str]] = None,
+    serial_only_fast: bool = False,
 ) -> str:
     """Run the official calibration probe and return ``device.serial``.
+
+    ``serial_only_fast`` 只允许用于身份扫描：探针读一次 SDK 设备信息、停掉
+    自己持有的 IMU 流后直接退出进程，跳过厂商 SDK 较慢的 handle 析构。标定
+    与运行路径必须走完整生命周期，不得使用该参数。
 
     timeout 同时是 SDK 全局初始化锁的等待上限与子进程运行上限：双夹爪
     并发打开时，第二台的探针要等第一台 SLAM 初始化（最长 45s）释放锁，
@@ -113,15 +118,31 @@ def probe_product_serial(
             # and the device_setup manifest below.
             with device_access_guard(FAYS_SDK_INITIALIZATION_LOCK, timeout=timeout), \
                     fays_device_guard(ports["stereo_dev_port"]):
+                command = [executable]
+                if serial_only_fast:
+                    command.append("--serial-only-fast")
+                command.append(config_path)
                 completed = subprocess.run(
-                    [executable, config_path], capture_output=True, text=True,
+                    command, capture_output=True, text=True,
                     timeout=timeout,
                     env=dict(os.environ if environment is None else environment),
                     check=False,
                 )
         except subprocess.TimeoutExpired as exc:
+            # TimeoutExpired 在 text=True 下也可能带着 bytes。超时发生在
+            # SDK 释放阶段时，前半段（身份/序列号）往往已经成功，把子进程
+            # 最后 20 行留下来，别让一句「超时」把底层证据丢掉。
+            def _text(value):
+                return (
+                    value.decode("utf-8", errors="replace")
+                    if isinstance(value, bytes) else (value or "")
+                )
+            diagnostic = "\n".join(
+                (_text(exc.stdout) + "\n" + _text(exc.stderr)).splitlines()[-20:]
+            )
             raise RuntimeError(
-                f"Fays 标定探测超时: {ports} ({exc.timeout}s)"
+                f"Fays 标定探测超时（含 SDK 资源释放）: {ports} "
+                f"({exc.timeout}s)\n{diagnostic}"
             ) from exc
         output = (
             (completed.stdout or "") + "\n" + (completed.stderr or "")

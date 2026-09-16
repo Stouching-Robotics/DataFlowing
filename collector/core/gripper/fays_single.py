@@ -1,16 +1,21 @@
 """单夹爪场景的 Fays S80M 租约（无 device_setup 清单版本）。
 
 主程序一次只服务一套夹爪 rig，设备身份全部来自运行时探测：
-    1. ESP32 串口（VID/PID + USB serial）唯一匹配；
-    2. discover_fays_device_groups() 发现且仅发现一台完整 S80M；
-    3. USB 链路速度 >= FAYS_MIN_USB_SPEED_MBPS，否则拒绝（提示换 USB3 口）；
-    4. probe_product_serial() 通过官方 SDK 探针读取真实产品序列号；
-    5. 按序列号定位 fays_config/fays_vikit_{serial}.yaml 与
+    1. ESP32 按 USB serial 唯一匹配（不看 /dev/ttyACMN 编号）；
+    2. 从该 ESP32 的 NVS 读它绑定的 Fays 产品序列号（串口命令 QF）；
+    3. 枚举在线完整 S80M，先逐台做 USB SuperSpeed 预检，再用官方 SDK 的
+       serial-only-fast 读出真实产品序列号（FT602 描述符和枚举顺序都不算
+       身份）；
+    4. 绑定的序列号必须唯一命中一台在线 Fays —— **不按根端口猜归属**；
+       被其他会话占用的 Fays 不参与匹配，但要写进错误文案；
+    5. 对选中的那台再走一次完整 SDK 生命周期，复核序列号与 ESP32 绑定值
+       一致（Connect 路径的完整校验）；
+    6. 按序列号定位 fays_config/fays_vikit_{serial}.yaml 与
        dist/fays_opencv48/s80m_{serial}_stereo_inertial.yaml；缺任一个就**现场
        用厂商导出程序从这只夹爪读出厂标定补齐**（见 calibration.py），不必再
        人工跑上位机 device_setup + 导入；
-    6. flock 租约 /tmp/ksq-gripper-fays-locks/{serial}.lock 防多开；
-    7. materialize 当前端口的运行时 SDK yaml，并在 /dev/shm 建 IPC 目录。
+    7. flock 租约 /tmp/ksq-gripper-fays-locks/{serial}.lock 防多开；
+    8. materialize 当前端口的运行时 SDK yaml，并在 /dev/shm 建 IPC 目录。
 
 返回的 selected 字典携带 SlamProcessController 与相机服务组合所需字段
 （ports/runtime_config/ipc_dir/trajectory/settings/executable/...）。
@@ -29,6 +34,7 @@ import time
 
 from config import settings
 from core.gripper import calibration, paths
+from core.gripper.devices.gripper_serial import GripperSerial
 from core.gripper.fays_runtime import (
     FAYS_MIN_USB_SPEED_MBPS,
     build_fays_probe_env,
@@ -37,8 +43,10 @@ from core.gripper.fays_runtime import (
     discover_fays_device_groups,
     materialize_fays_device_config,
     validate_fays_sdk_access,
+    validate_fays_superspeed,
 )
 from core.gripper.fays_serial_probe import probe_product_serial
+from core.gripper.runtime.device_access import fays_device_guard
 
 _INSTANCE_IPC_FILES = (
     "orb_pose.json.tmp", "orb_pose.json", "orb_meta.json",
@@ -138,11 +146,15 @@ class SingleFaysLease:
             )
 
     def _match_esp(self, esp_serial):
-        """按 USB serial 唯一匹配 ESP32 控制板，返回其 tty 设备路径。"""
+        """按 USB serial 唯一匹配 ESP32 控制板，返回其设备信息。"""
+        wanted = str(esp_serial or "").strip()
+        if not wanted:
+            raise GripperFaysError(
+                "未提供 ESP32 USB serial，拒绝按端口号或枚举顺序猜测控制板")
         devices = discover_esp32_devices()
         matches = [
             info for info in devices
-            if str(info.get("serial") or "").strip() == str(esp_serial).strip()
+            if str(info.get("serial") or "").strip() == wanted
         ]
         if len(matches) != 1:
             available = ", ".join(
@@ -150,68 +162,154 @@ class SingleFaysLease:
             )
             raise GripperFaysError(
                 "ESP32 控制板未唯一匹配: 期望 serial={} 当前=[{}]".format(
-                    esp_serial, available)
+                    wanted, available)
             )
         return matches[0]
 
-    def _discover_unique_fays_group(self, esp):
-        """按 ESP 的根端口关联 rig 内的 S80M，要求唯一命中。
+    def _query_esp_bound_fays_serial(self, esp):
+        """读 ESP32 NVS 里绑定的 Fays 产品序列号（串口命令 ``QF``）。
 
-        Fays 是 USB3/FT602：插在 USB3 口时走 5000M 伴生总线，与 ESP/
-        触觉相机的 480M 总线 bus 号不同（如 ESP=7-2、Fays=8-2 是同一
-        物理口的双总线伴生），因此原程序的拓扑规则只按根端口关联
-        （见 uvc_camera_service._associate_group 的同名注释）。
-        同一台机器可能还插着主程序自己的独立 S80M（不同根端口），
-        必须按夹爪 rig 的拓扑范围区分，不能全机枚举；多台命中即报错
-        不猜归属。rig 内仍只允许 1 台完整 S80M。
-        多控制器机器（双夹爪）还必须带控制器身份比较：两套 rig 可能
-        都插在各自控制器的同号根端口上（实测都是根端口 2，控制器
-        0000:0a:00.0 与 0000:74:00.4），只比端口号会互相误配。
+        串口是独占资源：查询完立刻归还，随后运行时的桥接还要独占打开。
+        未绑定、空值、ERR 一律失败关闭 —— 不允许回退到拓扑猜测。
         """
-        esp_controller, esp_root = self._bus_root(
-            str(esp.get("physical_usb_path") or ""))
-        if not esp_controller or not esp_root:
+        device = str(esp.get("device") or "").strip()
+        esp_serial = str(esp.get("serial") or "<unknown>").strip()
+        if not device:
             raise GripperFaysError(
-                "ESP32 物理 USB 路径无效: {!r}".format(
-                    esp.get("physical_usb_path")))
-        groups = tuple(discover_fays_device_groups())
-        same_rig = [
-            group for group in groups
-            if self._bus_root(group["physical_usb_path"])
-            == (esp_controller, esp_root)
-        ]
-        if len(same_rig) != 1:
-            found = ", ".join(
-                str(g["physical_usb_path"]) for g in same_rig)
+                "ESP32 {} 缺少串口节点，无法查询绑定的 Fays 序列号".format(
+                    esp_serial))
+        bridge = GripperSerial(logger=self._logger)
+        if not bridge.connect(device):
             raise GripperFaysError(
-                "夹爪 rig（控制器 {} 根端口 {}）内发现 {} 台 Fays S80M，"
-                "只允许 1 台: [{}]".format(
-                    esp_controller, esp_root, len(same_rig), found))
-        return same_rig[0]
+                "ESP32 {} 串口连接失败，无法查询绑定的 Fays 序列号: {}".format(
+                    esp_serial, bridge.last_error or "unknown error"))
+        try:
+            response = ""
+            for attempt in range(3):
+                response = bridge.send("QF")
+                if response.startswith(("FAYS_SERIAL:", "ERR FAYS_SERIAL")):
+                    break
+                if response.startswith("STATE") and attempt < 2:
+                    # 固件周期性状态行插在命令响应前面：重试，别把串口
+                    # 收发竞态误判成「没有绑定」。
+                    time.sleep(0.05)
+                    continue
+                break
+        finally:
+            bridge.disconnect()
+        prefix = "FAYS_SERIAL:"
+        if response.startswith(prefix):
+            serial = response[len(prefix):].strip()
+            if serial:
+                return serial
+        if response.startswith("ERR FAYS_SERIAL_NOT_SET"):
+            raise GripperFaysError(
+                "ESP32 {} 尚未写入 Fays 序列号，拒绝按端口猜测配对；"
+                "请先使用 WF:<serial> 写入后再扫描".format(esp_serial))
+        raise GripperFaysError(
+            "ESP32 {} 查询 Fays 序列号失败: {}".format(
+                esp_serial, response or "<empty>"))
 
     @staticmethod
-    def _bus_root(physical):
-        """"1-3.4.1" → (controller, "3")。
+    def _device_in_use(group):
+        """这台 Fays 是否已被运行中的会话独占（另一套 rig 的 SLAM）。
 
-        controller 取 /sys/bus/usb/devices/usb{bus} 的 realpath 父路径
-        （usbN 节点之上的 PCI devpath，如 .../0000:0a:00.0）——多控制器
-        机器上不同控制器的同号根端口必须区分；USB2/USB3 伴生双总线
-        （同一物理口 ESP=7-2、Fays=8-2）仍只按控制器+根端口关联，
-        不比较总线号，伴生容忍不变。
+        双夹爪时另一套 rig 的 SLAM 会把本设备锁一直持有到会话结束，
+        它按定义不可能是本次要打开的夹爪，但探测不了就得如实记下来。
         """
-        bus, separator, ports = str(physical or "").partition("-")
-        root = ports.split(".")[0] if separator else ""
-        if not separator:
-            return "", ""
+        port = str((group.get("ports") or {}).get("stereo_dev_port") or "")
+        if re.fullmatch(r"/dev/video[0-9]+", port) is None:
+            return False        # 节点无效留给后面的 SDK 预检去报错
         try:
-            real = os.path.realpath(
-                os.path.join("/sys", "bus", "usb", "devices", f"usb{bus}"))
-        except OSError:
-            return f"bus-{bus}", root   # sysfs 不可读时退回总线区分
-        return os.path.dirname(real), root
+            with fays_device_guard(port, timeout=0.0):
+                return False
+        except RuntimeError:
+            return True
 
-    def _probe_serial(self, group):
-        """官方 SDK 探针读取产品序列号；USB 速度不足时给出换口提示。"""
+    def _probe_fays_groups_by_serial(self, groups):
+        """SuperSpeed 预检 + ``serial-only-fast`` 读出每台 Fays 的产品序列号。
+
+        预检在启动 SDK **之前**逐台做（只读 sysfs）：降级到 USB2 的设备
+        根本不该进 SDK。返回 ``(by_serial, skipped)``：skipped 是被其他
+        会话占用的设备，它们不参与匹配，但要写进错误文案。
+        """
+        for group in groups:
+            try:
+                validate_fays_superspeed(group)
+            except Exception as exc:
+                raise GripperFaysError(
+                    "Fays USB 链路预检失败，拒绝启动 SDK: "
+                    "physical={} error={}".format(
+                        group.get("physical_usb_path"), exc)) from exc
+        by_serial = {}
+        skipped = []
+        for group in groups:
+            if self._device_in_use(group):
+                skipped.append(group)
+                continue
+            ports = dict(group.get("ports") or {})
+            if not ports:
+                raise GripperFaysError(
+                    "Fays 设备组缺少 SDK 端口: {!r}".format(group))
+            try:
+                serial = str(probe_product_serial(
+                    ports,
+                    environment=build_fays_probe_env(),
+                    serial_only_fast=True,
+                ) or "").strip()
+            except Exception as exc:
+                raise GripperFaysError(
+                    "Fays SDK 产品序列号探测失败，拒绝回退到拓扑猜测: "
+                    "physical={} error={}".format(
+                        group.get("physical_usb_path"), exc)) from exc
+            if not serial:
+                raise GripperFaysError(
+                    "Fays SDK 返回空产品序列号，拒绝继续: physical={}".format(
+                        group.get("physical_usb_path")))
+            if serial in by_serial:
+                raise GripperFaysError(
+                    "Fays SDK 返回重复产品序列号，拒绝猜测归属: "
+                    "serial={}".format(serial))
+            by_serial[serial] = group
+        return by_serial, skipped
+
+    def _resolve_fays_group(self, esp):
+        """唯一 ESP32 → ``QF`` 绑定序列号 → 按 SDK serial 唯一匹配 Fays。
+
+        返回 ``(group, bound_serial)``。**不再按 USB 根端口关联**：Fays 是
+        USB3/FT602，插在 USB3 口时走 5000M 伴生总线，bus 号与 ESP/触觉
+        相机的 480M 总线不同；多控制器机器上两套 rig 又经常落在同号根
+        端口，按端口关联只会互相误配。
+        """
+        groups = tuple(discover_fays_device_groups())
+        if not groups:
+            raise GripperFaysError(
+                "未发现完整的 Fays S80M（stereo + IMU 两个节点必须同时在线）")
+        bound = self._query_esp_bound_fays_serial(esp)
+        by_serial, skipped = self._probe_fays_groups_by_serial(groups)
+        group = by_serial.get(bound)
+        if group is None:
+            online = ", ".join(sorted(by_serial)) or "<无>"
+            detail = ""
+            if skipped:
+                detail = "；另有正在被占用的 Fays 未能探测: [{}]".format(
+                    ", ".join(
+                        "{}({})".format(
+                            item.get("physical_usb_path"),
+                            (item.get("ports") or {}).get("stereo_dev_port"))
+                        for item in skipped))
+            raise GripperFaysError(
+                "ESP32 {} 绑定的 Fays 序列号 {} 不在当前在线的 Fays 中，"
+                "拒绝按端口或枚举顺序猜测配对：在线 serial=[{}]{}".format(
+                    esp.get("serial"), bound, online, detail))
+        return group, bound
+
+    def _probe_serial(self, group, expected_serial=None):
+        """官方 SDK 完整生命周期读序列号；USB 速度不足时给出换口提示。
+
+        ``expected_serial`` 是 ESP32 NVS 里的绑定值：Connect 路径必须复核
+        两者一致，不允许一台「碰巧在线」的 Fays 顶替绑定设备。
+        """
         try:
             speed = validate_fays_sdk_access(group)
         except Exception as exc:
@@ -234,6 +332,13 @@ class SingleFaysLease:
             raise GripperFaysError(
                 f"Fays SDK 产品序列号探测失败: {exc}"
             ) from exc
+        if expected_serial is not None and \
+                str(serial).strip() != str(expected_serial).strip():
+            raise GripperFaysError(
+                "Fays SDK 序列号与 ESP32 绑定值不一致，拒绝连接: "
+                "physical={} bound={} actual={}".format(
+                    group.get("physical_usb_path"),
+                    expected_serial, serial))
         return serial, speed
 
     def _ensure_calibration(self, serial, group):
@@ -273,8 +378,9 @@ class SingleFaysLease:
         """
         with self._lock:
             esp = self._match_esp(esp_serial)
-            group = self._discover_unique_fays_group(esp)
-            serial, _speed = self._probe_serial(group)
+            group, bound = self._resolve_fays_group(esp)
+            serial, _speed = self._probe_serial(
+                group, expected_serial=bound)
             self._logger(
                 f"[Gripper-Fays] 正在重新读取 {serial} 的厂商出厂标定…"
             )
@@ -293,8 +399,8 @@ class SingleFaysLease:
                 return dict(self._selected)
             self.release()
             esp = self._match_esp(esp_serial)
-            group = self._discover_unique_fays_group(esp)
-            serial, speed = self._probe_serial(group)
+            group, bound = self._resolve_fays_group(esp)
+            serial, speed = self._probe_serial(group, expected_serial=bound)
             sdk_yaml, orb_yaml = self._ensure_calibration(serial, group)
 
             os.makedirs(paths.FAYS_LOCK_DIR, mode=0o700, exist_ok=True)
@@ -384,23 +490,6 @@ class SingleFaysLease:
                 finally:
                     stream.close()
                 raise
-
-    def resolve_assignment(self, esp_serial):
-        """相机服务所需的身份 assignment（不探测、不锁租约、不校验速度）。
-
-        UvcCameraServiceManager 只把 fays identity 用作同根端口关联与
-        错误文案，从不打开 Fays 相机；此处用实时拓扑推导的物理路径即可，
-        S80M 的官方 SDK 串行探测留给 acquire()（P3 全链，含 USB3 校验）。
-        """
-        esp = self._match_esp(esp_serial)
-        group = self._discover_unique_fays_group(esp)
-        return {
-            "esp32": {"serial": str(esp["serial"])},
-            "fays": {
-                "product_serial": "runtime-unprobed",
-                "physical_usb_path": group["physical_usb_path"],
-            },
-        }
 
     def snapshot(self):
         with self._lock:

@@ -28,6 +28,8 @@ venv_lite/
 .claude/
 keypoints_output/
 exports/
+# 本地取回的录制素材与上色产物（双目原视频等，体积大且属外部数据）
+rec001(1)/
 tools/weights/
 wheels/          # scripts/pack_wheels.py 生成的离线部署包（不入库，拷给客户用）
 imgui.ini

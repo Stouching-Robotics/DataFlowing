@@ -1,6 +1,6 @@
 # collector — Multimodal Data Acquisition SDK · 多模态数据采集 SDK
 
-![Version](https://img.shields.io/badge/version-1.3.4-blue)
+![Version](https://img.shields.io/badge/version-1.3.5-blue)
 ![Python](https://img.shields.io/badge/python-3.12-blue)
 ![License](https://img.shields.io/badge/license-TBD-lightgrey)
 
@@ -361,6 +361,128 @@ are documented in [docs/index.md](docs/index.md#开发约定).
 
 ### Changelog
 
+- **v1.3.5** — the camera service heals itself, and gripper scan pairing moved
+  from USB root ports to NVS serials.
+  **Cameras:** the UVC cameras (DECXIN `1bcf:2d4f` plus two Sightac `0c45:636f`)
+  can wedge silently with no process touching them — on 2026-09-15 the right
+  Sightac was streaming normally at 21:53 and simply refused to start at 09:24,
+  with no usbfs or uvcvideo message in between and the machine awake all night.
+  What the user sees ("RGB shows only the first frame", "camera-service did not
+  obtain valid MJPG frames from all cameras within the time limit") is really a
+  failure to recover, not a failure to stay up. Two different wedges need two
+  different cures: a **stall** (stream running, `received` freezes, not a single
+  kernel message, 6–82 s at random, load-correlated) recovers from rebuilding
+  the libusb context alone (6/6 and 5/5 measured — a USB reset is a wasted
+  cost), while a **hard failure** (`uvc_start_streaming failed: I/O error`,
+  `UVC format/interface negotiation failed: Invalid mode`, or
+  `negotiated_payload` alternating 3072/0) does not (9 consecutive attempts
+  failed; the device firmware is wedged) and only a USB reset / re-enumeration
+  clears it. Added a 3-second stall watchdog (`STREAM_STALL_TIMEOUT_SECONDS`,
+  4 s for the first frame); stalls rebuild the libusb context, hard failures
+  escalate to a USB reset after **2 consecutive** attempts (capped at
+  `USB_RESET_LIMIT` 3, since without a cap a genuinely dead device would reset
+  every 2 seconds and pin the two neighbours on the same hub), and a stall
+  clears that counter so stalls can never add up into a spurious reset. The
+  reset now happens **before** `uvc_stop_streaming` (`teardown_failed_open`):
+  on a wedged device `uvc_stop_streaming` waits for isochronous transfers that
+  never return, which measurably burns the client's 2-second grace period and
+  gets the process SIGKILLed mid-teardown, leaving the device on an active alt
+  setting so the next start fails the same way. Every threshold is derived
+  backwards from the client's `SERVICE_START_TIMEOUT_S = 10.0` (second failure
+  at t≈2 s → reset → frames by t≈3 s); the old "reset after 20 s of zero
+  frames" gate could never fire in a real start, and was attached to the
+  zero-frame branch the observed `I/O error` never reaches. Measured reset
+  semantics: on a healthy device it is an in-place port reset (kernel logs
+  `reset high-speed USB device number N`, devnum unchanged); on a wedged device
+  the device drops and re-enumerates (devnum changes) — that is what heals it,
+  and libusb reports `rc=-4 (No such device)` during that window, which is
+  misleading but harmless. Also fixed the per-second fps reporting baseline
+  (it counted from zero, so a restart reported the whole process lifetime as
+  one window: 164/207/251 fake fps).
+  **RGB disconnects, root cause:** self-healing was only half the story — the
+  camera still dropped out afterwards. DECXIN stalls silently every 68–116 s
+  while running the high-bandwidth isochronous setting alt7, on **both**
+  controllers tested (AMD `1022:43fc`/PCI `0000:0a:00.0` and
+  `1022:15b7`/`0000:74:00.4`). The mechanism is **not determined**: measured
+  throughput at the moment of the stalls was only 1.66 MB/s mean / 2.63 peak,
+  far under the 10.24 MB/s alt7 reserves, so "not enough bandwidth" does not
+  explain it. alt6 holds, and both rungs deliver **identical 30.00 fps**, so
+  alt7's extra per-frame headroom (327680 vs 241664 B) buys nothing observable.
+  Two earlier conclusions are retracted: *"alt7 is fine on bus 1"* — that
+  supposedly clean leg never ran at alt7 at all, because the old binary's ini
+  fields were inert and the service merely echoed them, so the only trustworthy
+  indicator of a leg's real setting is the `[LIBUVC-QUIRK] ... alt=N payload=M
+  ... xfers=` line; and the controller-specific claim that followed from it.
+  `forced_altsetting`/`forced_payload` are now **authoritative** through a new
+  libuvc runtime API `uvc_set_altsetting_override()` (declared in `libuvc.h`,
+  implemented in `device.c`) — before this they were only validated and
+  printed, so editing the ini changed nothing, which is very easy to misread.
+  The starting rung is chosen in Python, not hardcoded per machine: learned >
+  the table's most conservative rung > the scanner's preferred one, because the
+  rack's bus is not permanent. A ladder then steps down one rung and persists
+  the conclusion under `vid:pid × controller PCI path × camera serial` after 2
+  consecutive stalls or 3 consecutive failed opens (the latter covers a
+  setting that will not fit at STREAMON, where the stream never starts and the
+  stall path can never fire); `CLEAN_RUN_SECONDS = 300` clears the stall
+  counter. A downgrade must clear **both** counters — the thresholds are
+  equality tests, so a counter left standing on its threshold never fires
+  again and the failed-open path would jam after a single step. Both log lines
+  capture the count *before* the downgrade clears it. The scanner truthfully
+  reports the descriptor's preferred rung (alt7); the app checks it is *any*
+  rung of the ladder and refuses only on a genuine desync. The C source and its
+  build recipe moved into `core/gripper/camera_service_src/` (`./build.sh` is
+  the single entry point), and `--test` now runs `ctest` — the ladder test was
+  registered with `add_test` but had never actually been executed, and the
+  jam-bug above fell exactly inside what it should have covered. Verified on
+  hardware: forced alt7 stalled at 78 s and 116 s, the service logged the
+  downgrade and recovered to alt6 for 169 s at 30 fps with zero stalls; the
+  app-generated ini (alt6 default) then ran **600 s across three legs with 0
+  stalls / 0 rebuilds / 0 failed opens / 0 resets** (17513/17496/17487 frames),
+  and a post-install 300 s regression on the deployed binary was clean too. The
+  ladder test was reverse-verified as non-vacuous: removing the counter reset
+  makes it abort.
+  **Grippers:** ported the scan chain from the delivery package
+  `设备扫描逻辑与程序_20260914`. Pairing used to go through USB root
+  ports/controllers — a premise that was simply wrong, since the Fays is a
+  USB3/FT602 device on its own 5000M bus and never shared a root with the
+  UVC/ESP32 devices. The chain is now: UVC group → the unique ESP32 (path
+  starting `bus-outer.`) → send `QF` over serial to read the Fays serial bound
+  in its NVS → match against the official SDK's enumerated `device.serial`,
+  with a clear refusal when any step is not unique and no fallback to guessing
+  by port or enumeration order. The SDK probe is preceded by a
+  `validate_fays_superspeed` pre-check and then enumerates serials fast
+  (`--serial-only-fast`; a timeout now decodes stdout/stderr and appends the
+  last 20 lines instead of reporting a bare timeout). Dual-rig runs skip a
+  device another rig holds instead of claiming it. On the serial side the fixed
+  boot delay became a 2-second polling `?` handshake, the port is opened
+  `exclusive=True`, and `QF` (query) / `WF:<serial>` (write) commands were
+  added; `GripperSerial.send()` looked commands up by their first character
+  only (`[:1]`), so `"QF"` could never match its own expected list. Prerequisite:
+  the ESP32 firmware must understand `QF`/`WF:` — the current `online/esp32_proc`
+  firmware does not, and will fail closed with "查询 Fays 序列号失败: ERR".
+  Added the offline self-check `tools/tests/test_gripper_fays_pairing.py`.
+  **s80c colorize tool:** fixed a duplicated-every-other-frame bug in
+  `tools/s80c_arm_convert/convert_arm_dataset.py` (an independent fix committed
+  after v1.3.4). `pooled_episodes_v1` recordings write **two rows per frame**
+  (`frame_index` = 0,0,1,1,…, with identical `timestamp`/`hardware_ns` in both
+  rows) while the video has one frame; the tool used the row count as the frame
+  count and then indexed `hw_ns[i]` by video frame number, so every timestamp
+  was sent twice — and the offline ISP reuses the previous output for a
+  duplicate timestamp, which is what duplicated every other frame. Measured on
+  rec001's lossless output: 394 of 833 frames byte-identical to their
+  predecessor, all 394 at odd positions (the second of each timestamp pair),
+  versus 0 in the source video. The same root cause also **halved the IMU
+  sidecar** — `hw_ns[:n_frames]` only reached the 417th timestamp and every
+  later IMU sample was dropped by the "later than the last frame" rule, leaving
+  416 rows / 13.8 s; after the fix, 832 rows / 27.7 s against a 27.8 s video.
+  Redundant rows are now folded by `frame_index`, but **only when every row
+  under that index has identical `timestamp` and `hardware_ns`**; otherwise it
+  warns and leaves the data untouched. Of the 142 parquets carrying
+  `frame_index`, 129 already had one row per frame (no-op), 1 was genuinely
+  redundant (rec001, 1666 rows → 833 frames), and 12 had differing timestamps
+  between rows (folding would lose them, so they are warn-only). The colorize
+  chain itself is untouched: same config, same offline ISP, `--sdk-wb-auto` as
+  before, with grey-world gains bit-identical to the pre-fix run.
 - **v1.3.4** — a newly plugged-in gripper now generates its own runtime
   calibration and connects, with no manual step. Previously onboarding a new
   Fays S80M took two manual steps — click `device_setup` on the gripper's host
@@ -833,6 +955,47 @@ i18n 文案经 `tr()` 翻译、PyQt5 信号参数用 `object` 封送大整数、
 
 ### 更新记录
 
+- **v1.3.5** — 相机服务能自愈了；夹爪扫描配对从 USB 根端口改走 NVS 序列号。
+  **相机侧**：UVC 相机（DECXIN `1bcf:2d4f` 与两个 Sightac `0c45:636f`）会**静默
+  卡死、且不需要任何进程碰它**——2026-09-15 实证右目 Sightac 是自己夜里坏的
+  （21:53 还在正常推流，09:24 启动就坏，中间没有任何进程打开过它、内核无
+  usbfs/uvcvideo 消息，机器整夜没睡）。用户看到的「RGB 只剩第一帧」「未在限定
+  时间取得全部相机的有效 MJPG 帧」，根子是**服务不会自愈**，不是**服务会倒**。
+  两种卡死要分开治：**停摆**（开着流突然不出帧、`received` 冻住、内核一条消息
+  都没有，6~82 秒随机、与负载正相关）**重建 libusb 上下文就够**（实测 6/6、5/5
+  全恢复，USB 复位是白付的代价）；**开不起来**（`uvc_start_streaming failed:
+  I/O error`、`UVC format/interface negotiation failed: Invalid mode`、
+  `negotiated_payload` 在 3072↔0 之间跳）**重建上下文救不回来**（实测连试 9 次
+  全败，设备固件侧卡死了），只有 USB 复位/重枚举能洗。新增 3 秒停滞看门狗
+  （`STREAM_STALL_TIMEOUT_SECONDS`，首帧 4 秒）；停摆（`rc>0`）重建 libusb
+  上下文；开不起来（`rc<0`）**连续 2 次**升级成 USB 复位，`USB_RESET_LIMIT` 3 次
+  封顶（设备真坏了时不设上限会变成每 2 秒复位一次、把同 Hub 的另外两路一直按在
+  地上），而停摆会清零该计数，免得几次停摆凑数误触发复位去打扰邻居。**复位要抢在
+  `uvc_stop_streaming` 之前**（`teardown_failed_open`）——卡死设备上
+  `uvc_stop_streaming` 会一直等它那批永远回不来的等时传输，实测能把客户端那 2 秒
+  宽限耗光而被 SIGKILL，进程死在这中间、设备就停在激活的 alt setting 上，下一轮
+  照样起不来（09:24 的日志正是断在 startup failed 与 usb reset 之间）。所有阈值由
+  客户端窗口 `SERVICE_START_TIMEOUT_S = 10.0` 倒推：第 2 次失败在 t≈2 秒触发复位、
+  t≈3 秒就能出帧；旧的「重开 20 秒零帧才复位」在真实启动场景**永远够不到**，且只
+  挂在零帧分支上。复位语义实测：打在**健康**设备上是原地端口复位（devnum 不变），
+  打在**卡死**设备上是掉线重枚举（devnum 变了）**这才会好**，libusb 在那窗口里返回
+  `rc=-4 (No such device)` 是报错但事办了。真机验证：第 1 次失败不复位、第 2 次
+  `usb reset: rc=0 (Success)`、打满 3 次后停手；三路 90 秒回归 0 停摆 0 误复位
+  （2694/2683/2684 帧 ≈29.9fps）；SIGTERM 退出 1.16 秒，不超客户端 2 秒宽限。
+  **夹爪侧**：移植交付包「设备扫描逻辑与程序_20260914」。配对从 **USB 根端口/
+  控制器**改走 **NVS 序列号**——旧规则（外加「同一 USB2 总线出现双 rig 就拒扫」）
+  的前提就是错的：Fays 是 USB3/FT602 挂在配套的 5000M 总线上，跟 UVC/ESP32 本来
+  就不共根，只能靠猜。新链路：UVC 组 → 唯一 ESP32（`bus-outer.` 开头）→ 串口发
+  `QF` 读它 NVS 里绑定的 Fays 序列号 → 与官方 SDK 枚举出的 `device.serial` 比对，
+  任一步不唯一就明确拒绝，不再按端口或枚举顺序猜。SDK 探测前先做超速预检，再以
+  `--serial-only-fast` 快速枚举序列号（超时不再只报一句 timeout，解码
+  stdout/stderr 并附最后 20 行）；双 rig 会「在用时跳过」另一 rig 正持有的设备
+  而不是占用。串口侧：固定 2 秒死等改成轮询 `?` 握手，端口加 `exclusive=True`，
+  新增 `QF` 查询 / `WF:<serial>` 写入；顺带修 `send()` 只拿首字符查命令表
+  （`[:1]`）导致 `"QF"` 永远匹配不上自己期望表的 bug。**前置条件：ESP32 固件必须
+  认识 `QF`/`WF:`，当前 `online/esp32_proc` 的固件还不认识，会失败关闭并报
+  「查询 Fays 序列号失败: ERR」，需先烧固件。** 新增离线自检
+  `tools/tests/test_gripper_fays_pairing.py`。
 - **v1.3.4** — 新夹爪接入即自动生成运行标定并连接，不再需要任何人工步骤。
   此前接入一只新 Fays S80M 要人工两步——先在夹爪上位机点 `device_setup`、
   再在采集机跑 `tools/import_gripper_calibration.py` 导入，漏掉任一步主程序

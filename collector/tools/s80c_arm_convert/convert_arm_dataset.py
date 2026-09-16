@@ -139,6 +139,40 @@ def extract_frame_meta(pq_path):
         if lc in ("hardwarens", "hwns", "hwts", "hardwaretimestamp"):
             hcol = c
             break
+    # 每帧多行的 parquet 折叠成每帧一行。pooled_episodes_v1 这版录制每帧写两行
+    # （frame_index = 0,0,1,1,…；timestamp / hardware_ns 在两行里逐值相同），
+    # 但视频只有一帧。下游 pair_gen 按视频帧号 1:1 取 hw_ns[i]，多出来的行会让
+    # 同一时间戳被连送两遍 —— 离线 ISP 对重复时间戳复用上一帧的输出，表现为
+    # 输出视频隔帧重复。
+    # 只在**组内帧元数据逐值相同**（纯冗余行）时才折叠: 库里有若干录制的同一
+    # frame_index 挂着互不相同的 hardware_ns / timestamp、或每帧三行，那些行不是
+    # 冗余，折叠会丢时间戳，一律不动、只告警。每帧一行的常规数据集是空操作。
+    # （IMU 不受影响: 样本按行分摊、冗余行为空，extract_parquet_imu 仍读全部行。）
+    n_raw = tbl.num_rows
+    if fcol is not None:
+        fv = tbl[fcol].to_numpy()
+        if len(np.unique(fv)) < n_raw:
+            order = np.argsort(fv, kind="stable")
+            fvs = fv[order]
+            first = np.flatnonzero(np.concatenate(
+                ([True], fvs[1:] != fvs[:-1])))
+            counts = np.diff(np.append(first, len(fvs)))
+            varying = []
+            for c in (tcol, hcol):
+                if c is None:
+                    continue
+                cv = tbl[c].to_numpy()[order]
+                if not np.array_equal(cv, np.repeat(cv[first], counts)):
+                    varying.append(c)
+            if not varying:
+                tbl = tbl.take(np.sort(order[first]))       # 保持文件顺序
+                print(f"[INFO] 帧 parquet 每帧多行（{n_raw} 行 / {len(first)} 帧）"
+                      f"且组内帧元数据相同，已按 {fcol} 折叠为每帧一行")
+            else:
+                print(f"[WARN] 帧 parquet 每帧多行（{n_raw} 行 / "
+                      f"{len(np.unique(fv))} 帧），且同一 {fcol} 的行挂着不同的 "
+                      f"{'/'.join(varying)} —— 不是纯冗余行，不折叠；时间戳仍按行 "
+                      f"1:1 取用，视频帧可能对不上", file=sys.stderr)
     n = tbl.num_rows
     if tcol is not None:
         t = tbl[tcol].to_numpy()

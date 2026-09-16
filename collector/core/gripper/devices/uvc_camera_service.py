@@ -25,6 +25,7 @@ import sys
 import cv2
 
 from core.gripper.fays_runtime import PROJECT_ROOT
+from core.gripper.paths import CAMERA_MODE_STATE_DIR
 from core.gripper.runtime.device_access import device_access_guard
 
 # camera_service/python is a checkout-local transport module, not an ambient
@@ -68,12 +69,23 @@ _LIBUVC_DIR = Path(
     PROJECT_ROOT, "camera_service", "build", "third_party", "libuvc")
 
 
-def _native_env():
+def _native_env(binary=None):
+    """只给这个子进程用交付目录里的 libuvc，绝不动主进程的环境。
+
+    ``binary`` 自带 ``third_party/libuvc`` 时优先用它（KSQ_UVC_*_BINARY
+    被指向别处的构建树时仍然自洽），再兜底交付目录内的副本。
+    """
     env = dict(os.environ)
-    existing = env.get("LD_LIBRARY_PATH", "")
-    if _LIBUVC_DIR.is_dir() and str(_LIBUVC_DIR) not in existing:
-        env["LD_LIBRARY_PATH"] = (
-            str(_LIBUVC_DIR) + (f":{existing}" if existing else ""))
+    directories = []
+    if binary is not None:
+        directories.append(
+            str(Path(binary).resolve().parent / "third_party" / "libuvc"))
+    directories.append(str(_LIBUVC_DIR))
+    directories.extend(
+        part for part in env.get("LD_LIBRARY_PATH", "").split(os.pathsep)
+        if part
+    )
+    env["LD_LIBRARY_PATH"] = os.pathsep.join(dict.fromkeys(directories))
     return env
 
 
@@ -81,11 +93,87 @@ class UvcCameraServiceError(RuntimeError):
     """The live libusb/libuvc camera set cannot be used."""
 
 
-def _root_port(physical_path):
-    text = str(physical_path or "").strip()
-    if "-" not in text:
+# 每个机型允许的档位对（altsetting, payload），按从好到差排列，必须与服务端
+# camera_service.c 的档位表逐项一致。服务认不出的档位对会直接 rc=2 退出，
+# 把整个夹爪一起带走，所以这里必须先挡一道，把「配置写错」变成一条看得懂的
+# 报错，而不是一个哑掉的服务进程。
+_MODE_LADDERS = {
+    (0x0C45, 0x636F): ((3, 800),),
+    (0x1BCF, 0x2D4F): ((7, 1280), (6, 944)),
+}
+
+# 起始档位一律取档位表里最保守的那一档（＝表的最后一档），不认控制器。
+#
+# 曾经这里有一张「已知扛不住的控制器 → 起始档位」的表（0000:74:00.4 → alt6）。
+# 2026-09-15 实测把它推翻了：alt7 停摆不是某块控制器的毛病，0000:0a:00.0 上
+# 整机三路一起出流时一样在 78 秒内停摆（两次独立运行、共 3 次停摆，全落在
+# 68~116 秒）。当初判它「总线 1 没事」是拿一次根本没真的跑在 alt7 上的运行
+# 当基准——那时 ini 里的 forced_* 还是死的，服务只是把 ini 的值原样打进了
+# 日志。控制器不是变量，就没必要按机器写死。
+
+
+def _usb_controller_for_bus(bus):
+    """这台相机所在 USB 控制器的 PCI 路径，例如 ``0000:0a:00.0``。
+
+    ``/sys/bus/usb/devices/usbN`` 是指向根 Hub 的符号链接，解开的上一级就是
+    控制器；用 PCI 路径而不是总线号，因为总线号会随插口变。
+
+    它只进落盘键，不参与「选哪一档」的判断——**控制器是不是变量并没有定论**
+    （2026-09-15 实测 alt7 在 74:00.4 与 0a:00.0 上都停摆，但机制没查清），所
+    以不拿它做任何决策。键里带上它只是取保守：学到的东西严格绑在「学它的那条
+    物理路径」上，换机器/换口自然是新键。代价为零——新键没有记忆值，就退回档
+    位表里最保守的那一档，那本来就是我们要的默认。取不到返回空串，调用方退化
+    成「不区分控制器」，功能不受影响。
+    """
+    link = Path(f"/sys/bus/usb/devices/usb{int(bus)}")
+    try:
+        return link.resolve(strict=True).parent.name
+    except (OSError, ValueError):
         return ""
-    return text.split("-", 1)[1].split(".", 1)[0]
+
+
+def _mode_state_key(vid, pid, controller, serial):
+    """「这台相机 × 这条物理路径」的落盘键，规则必须与 C 侧 ``mode_state_key``
+    逐字一致：只保留 ``[A-Za-z0-9-]``，其余一律换成 ``_``。"""
+    raw = (
+        f"{int(vid):04x}_{int(pid):04x}_"
+        f"{controller or 'unknown'}_{serial or 'noserial'}"
+    )
+    return "".join(
+        char if (char.isascii() and (char.isalnum() or char == "-")) else "_"
+        for char in raw
+    )
+
+
+def _pair_is_known(vid, pid, pair):
+    return pair in _MODE_LADDERS.get((int(vid), int(pid)), ())
+
+
+def _read_learned_mode(state_dir, vid, pid, controller, serial):
+    """读服务上一轮学到的档位。文件坏了 / 越界了一律当没学到。"""
+    if not state_dir:
+        return None
+    path = Path(state_dir) / (
+        _mode_state_key(vid, pid, controller, serial) + ".mode"
+    )
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    values = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        try:
+            values[key.strip()] = int(value.strip())
+        except ValueError:
+            return None
+    pair = (values.get("altsetting"), values.get("payload"))
+    if not _pair_is_known(vid, pid, pair):
+        return None
+    return pair
 
 
 def _path_contains(bus, outer_path, child_path):
@@ -323,7 +411,17 @@ class UvcCameraServiceManager:
         self._lock = threading.RLock()
         self._services = {}
 
-    def _run_discovery(self, *, usb_bus=None, port_prefix=None):
+    def _run_discovery(self, *, usb_bus=None, port_prefix=None,
+                       skip_flash=False, identity_only=False,
+                       topology_only=False):
+        """Run the live libusb/libuvc discovery pass.
+
+        Three depths, mutually exclusive: ``topology_only`` (enumeration
+        only), ``identity_only`` (also opens UVC control, verifies mode and
+        reads Flash side/serial, skipping the five calibration tables) and
+        the default full read.  ``skip_flash`` is the diagnostic alias for
+        the first two.  Only the full mode can emit a usable config.
+        """
         if not self._discovery_binary.is_file():
             raise UvcCameraServiceError(
                 f"libusb/libuvc 发现程序不存在: {self._discovery_binary}"
@@ -332,16 +430,27 @@ class UvcCameraServiceManager:
             raise UvcCameraServiceError(
                 f"libusb/libuvc 发现程序不可执行: {self._discovery_binary}"
             )
+        if sum(bool(flag) for flag in (
+                skip_flash, identity_only, topology_only)) > 1:
+            raise UvcCameraServiceError(
+                "discover-uvc-config 的扫描深度参数互斥，只能选一个"
+            )
         command = [str(self._discovery_binary), "--json"]
         if usb_bus is not None and port_prefix is not None:
             command += ["--bus", str(usb_bus), "--port-prefix", str(port_prefix)]
+        if topology_only:
+            command.append("--topology-only")
+        elif identity_only:
+            command.append("--identity-only")
+        elif skip_flash:
+            command.append("--skip-flash")
         completed = subprocess.run(
             command,
             capture_output=True,
             text=True,
             timeout=DISCOVERY_TIMEOUT_S,
             check=False,
-            env=_native_env(),
+            env=_native_env(self._discovery_binary),
         )
         if completed.returncode != 0:
             details = "\n".join(
@@ -368,25 +477,27 @@ class UvcCameraServiceManager:
     def _assignment_identity(assignment):
         if not isinstance(assignment, dict):
             raise UvcCameraServiceError(
-                "Fays 尚未完成 device_setup 身份分配"
+                "Fays 尚未完成身份分配"
             )
         esp = assignment.get("esp32") or {}
         fays = assignment.get("fays") or {}
         esp_serial = str(esp.get("serial") or "").strip()
         fays_serial = str(fays.get("product_serial") or "").strip()
-        fays_path = str(
-            fays.get("physical_usb_path") or ""
-        ).strip()
-        if not esp_serial or not fays_serial or not fays_path:
+        if not esp_serial or not fays_serial:
             raise UvcCameraServiceError(
-                "Fays 当前分配缺少 ESP32 serial、Fays serial 或物理路径"
+                "Fays 当前分配缺少 ESP32 serial 或 Fays serial"
             )
-        return esp_serial, fays_serial, fays_path
+        return esp_serial, fays_serial
 
     def _associate_group(self, group, assignment, live_esp):
-        esp_serial, fays_serial, fays_path = self._assignment_identity(
-            assignment
-        )
+        """UVC 组只按 ESP32 serial + bus/outer_path 关联。
+
+        Fays 归属由 ESP32 NVS 里的绑定序列号决定（见 SingleFaysLease），
+        这里不再比较 Fays 的 USB 根端口：Fays 是 USB3/FT602，插在 USB3 口
+        时走 5000M 伴生总线，与触觉/RGB 的 480M 总线 bus 号不同；多控制器
+        机器上两套 rig 还常落在同号根端口，按端口关联只会互相误配。
+        """
+        esp_serial, fays_serial = self._assignment_identity(assignment)
         bus = int(group.get("bus", -1))
         outer_path = str(group.get("outer_path") or "").strip()
         matching_esp = [
@@ -400,15 +511,6 @@ class UvcCameraServiceManager:
                 "当前 UVC 组无法按 ESP32 serial 唯一关联: "
                 f"serial={esp_serial} matches={len(matching_esp)} "
                 f"group={bus}-{outer_path}"
-            )
-        # Fays is USB3/FT602 and may be reported on a different libusb bus;
-        # the existing topology rule intentionally correlates its root port.
-        if _root_port(fays_path) != str(outer_path).split(".", 1)[0].split(
-            "-", 1
-        )[-1]:
-            raise UvcCameraServiceError(
-                "当前 UVC 组与已分配 Fays 不在同一根端口: "
-                f"fays={fays_path} group={bus}-{outer_path}"
             )
         normalized = {
             "bus": bus,
@@ -453,7 +555,7 @@ class UvcCameraServiceManager:
 
     def _discovery_scope(self, assignment, live_esp=None):
         from core.gripper.fays_runtime import discover_esp32_devices
-        serial, _, _ = self._assignment_identity(assignment)
+        serial, _ = self._assignment_identity(assignment)
         devices = tuple(discover_esp32_devices()) if live_esp is None else live_esp
         matches = [d for d in devices if str(d.get("serial", "")).strip() == serial]
         if len(matches) != 1:
@@ -479,7 +581,7 @@ class UvcCameraServiceManager:
             except UvcCameraServiceError:
                 continue
         if len(matches) != 1:
-            esp_serial, fays_serial, _ = self._assignment_identity(assignment)
+            esp_serial, fays_serial = self._assignment_identity(assignment)
             raise UvcCameraServiceError(
                 "当前设备清单身份与动态 UVC 拓扑无法唯一配对: "
                 f"esp32={esp_serial} fays={fays_serial} "
@@ -493,6 +595,10 @@ class UvcCameraServiceManager:
             (
                 int(record["bus"]),
                 record["outer_path"],
+                # ini 里那一行 `usb_controller=` 就是它，而它参与落盘键，所以
+                # 「这份配置长什么样」含控制器：换控制器必须重写 ini，不能复用
+                # 上一个进程。
+                _usb_controller_for_bus(record["bus"]),
                 tuple(sorted(
                     (side, str(candidate["port"]))
                     for side, candidate in record["sightac"].items()
@@ -501,6 +607,44 @@ class UvcCameraServiceManager:
             )
             for record in records
         ))
+
+    @staticmethod
+    def _starting_mode(candidate, controller):
+        """这台相机从哪一档开始。
+
+        优先级：上一轮学到的 > 档位表里最保守的那一档 > 扫描程序报的首选档。
+
+        为什么默认不是首选档：实测 DECXIN 的 alt7（10.24 MB/s）在整机三路一起
+        出流时每 68~116 秒必停摆一次，alt6（7.552 MB/s）同样三路下 30.00 fps
+        长跑不停，而两档出帧率一模一样——首选档多出来的那点每帧余量（327680
+        对 241664 字节）不值一次停摆，用户要的「稳定帧数」也不允许开机就故意
+        赔一次。要那点余量就把 ini 里 forced_altsetting 改回 alt7：真撑不住
+        时服务停两次后会自己退回 alt6 并把结论落盘，下次开机直接用（见
+        camera_service.c 的 maybe_downgrade_altsetting）。学到的值就在这里读
+        回来。"""
+        vid = int(candidate["vid"])
+        pid = int(candidate["pid"])
+        preferred = (int(candidate["altsetting"]),
+                     int(candidate["descriptor_payload"]))
+        if not _pair_is_known(vid, pid, preferred):
+            # 服务对认不出的档位对是 rc=2 直接退出，整个夹爪一起挂。先查
+            # 一遍扫描程序的输出：扫描程序与服务端档位表脱节（比如只装了新
+            # 扫描程序、没重编服务）必须报出来，不能被下面的记忆值盖过去。
+            raise UvcCameraServiceError(
+                f"扫描程序报出服务端不认识的档位 {vid:04x}:{pid:04x} "
+                f"alt={preferred[0]} payload={preferred[1]}；"
+                "扫描程序与服务端档位表已经脱节，需要一起重编"
+            )
+        serial = str(candidate.get("usb_serial") or "").strip()
+        learned = _read_learned_mode(
+            CAMERA_MODE_STATE_DIR, vid, pid, controller, serial
+        )
+        if learned is not None:
+            return learned, "learned"
+        ladder = _MODE_LADDERS[(vid, pid)]
+        if ladder[-1] != preferred:
+            return ladder[-1], "conservative"
+        return preferred, "preferred"
 
     def _write_config(self, records):
         runtime_dir = Path(tempfile.mkdtemp(prefix="ksq-camera-service-"))
@@ -511,12 +655,14 @@ class UvcCameraServiceManager:
         ]
         sockets = {}
         for index, record in enumerate(records, 1):
+            controller = _usb_controller_for_bus(record["bus"])
             for role in ("left", "right", "decxin"):
                 candidate = (
                     record["sightac"][role]
                     if role in {"left", "right"}
                     else record["decxin"]
                 )
+                mode, mode_source = self._starting_mode(candidate, controller)
                 name = f"unit_{index}_{role}"
                 socket_path = runtime_dir / f"{name}.sock"
                 sockets[(index, role)] = str(socket_path)
@@ -527,9 +673,22 @@ class UvcCameraServiceManager:
                     f"usb_bus={int(record['bus'])}",
                     f"usb_port_path={candidate['port']}",
                     f"streaming_interface={int(candidate['streaming_interface'])}",
-                    f"forced_altsetting={int(candidate['altsetting'])}",
-                    "forced_payload=800" if role in {"left", "right"}
-                    else "forced_payload=1280",
+                    # altsetting 和 payload 是一个整体（alt7 的端点就是
+                    # 1280 B/包），必须成对来自同一处：要么都是扫描程序实测的
+                    # 端点描述符，要么都是服务上一轮学到的结论。拆开配会得到
+                    # 一个自相矛盾的档位——2026-09-15 主程序连不上夹爪就是这
+                    # 么来的（alt 取自扫描程序、payload 却是硬编码）。
+                    #
+                    # 这两项现在是**生效的**：服务打开设备后会把它们交给
+                    # libuvc 的 uvc_set_altsetting_override()。在此之前它们
+                    # 只是校验和日志，真正决定档位的是 libuvc 的编译期表，
+                    # 所以「改 ini」曾经完全不改变行为。
+                    f"forced_altsetting={mode[0]}",
+                    f"forced_payload={mode[1]}",
+                    f"# 起始档位来源: {mode_source}",
+                    f"usb_serial={str(candidate.get('usb_serial') or '').strip()}",
+                    f"usb_controller={controller}",
+                    f"state_dir={CAMERA_MODE_STATE_DIR}",
                     "width=640" if role in {"left", "right"}
                     else "width=1280",
                     "height=480" if role in {"left", "right"}
@@ -575,7 +734,7 @@ class UvcCameraServiceManager:
                     stdout=subprocess.DEVNULL,
                     stderr=service_log,
                     start_new_session=True,
-                    env=_native_env(),
+                    env=_native_env(self._service_binary),
                 )
             finally:
                 service_log.close()

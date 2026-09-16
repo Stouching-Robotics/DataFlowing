@@ -9,6 +9,11 @@ build/
 data/recordings/
 data/*.db
 *.log
+# 原生日志归档目录（运行期把 runtime 目录 rmtree 之前的 SLAM 原生日志留档到这里，
+# 保留最近 20 份），连同 tools/dedup_gripper_native.py 的 JSON 报告一起**整体不入库**：
+# 都是本机诊断产物，动辄几十 MB（实测 57MB/22 份）。`.log` 那行只挡住了日志本体，
+# 报告是 .json 会漏网。
+logs/
 .venv/
 venv/
 venv_lite/
@@ -60,7 +65,9 @@ online/
 # ORBvoc.txt 单文件 138MB 超 GitHub 100MB 限制，且为第三方二进制，不入库）
 # 触觉 Sightac SDK 例外：core/gripper/sightac_sdk/ 已 pyarmor 加密，随包入库
 core/gripper/native/
+# 极简版发布目录/本机部署目录，整体不入库。
+# 2026-09-16 起 start_lite.bat/.sh 与 使用说明_lite.md 三个分发壳住在**仓库根**
+# （与 main_lite.py 同级，使根目录直接可运行）；lite_package/ 里那三份是
+# scripts/pack_lite.py 收集时复制进去的产物，同样不入库——原先的 !负向规则
+# 已随之删除，否则每次重打包都会留下未跟踪副本。
 lite_package/*
-!lite_package/start_lite.bat
-!lite_package/start_lite.sh
-!lite_package/使用说明_lite.md

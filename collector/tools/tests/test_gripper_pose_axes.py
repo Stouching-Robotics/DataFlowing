@@ -150,7 +150,19 @@ def main():
                        atol=1e-12):
         failures.append("双应用旋转应为 R_z(+180°)·R")
 
-    # 7. 轨迹形状不变（等距）：相邻点距离一致
+    # 7. host_mono_ns（取样帧宿主时刻）必须原样透传：rotate_pose_z90 是
+    #    纯世界重标、不动时基。丢了它位姿就退回"只能按行号/相机钟对齐"，
+    #    而落盘侧正是靠它与 hardware_ns 直接比较来配 slam 点↔视频帧。
+    stamped = PoseSample(position=(1.0, 2.0, 3.0),
+                         rotation=random_unit_quaternion(rng), timestamp=1.0,
+                         host_mono_ns=287607702508638)
+    if rotate_pose_z90(stamped).host_mono_ns != 287607702508638:
+        failures.append("rotate_pose_z90 丢了 host_mono_ns")
+    # 无戳（旧 native 二进制）透传 None，不能被伪造成 0
+    if rotate_pose_z90(pose).host_mono_ns is not None:
+        failures.append("无戳位姿的 host_mono_ns 应为 None")
+
+    # 8. 轨迹形状不变（等距）：相邻点距离一致
     traj = [
         PoseSample(position=tuple(float(v) for v in rng.uniform(-1, 1, 3)),
                    rotation=random_unit_quaternion(rng), timestamp=float(i))

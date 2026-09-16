@@ -1,6 +1,6 @@
 # collector — Multimodal Data Acquisition SDK · 多模态数据采集 SDK
 
-![Version](https://img.shields.io/badge/version-1.3.5-blue)
+![Version](https://img.shields.io/badge/version-1.3.6-blue)
 ![Python](https://img.shields.io/badge/python-3.12-blue)
 ![License](https://img.shields.io/badge/license-TBD-lightgrey)
 
@@ -104,6 +104,17 @@ start.bat help          open the operation guide and troubleshooting doc
 > procedure: [使用说明.md](使用说明.md) / [使用说明_EN.md](使用说明_EN.md)
 > (offline wheel bundles are produced by `python scripts/pack_wheels.py`).
 
+**Lite edition** (capture + upload only — no login / playback / task page /
+skeleton solving): double-click **`start_lite.bat`** (Windows) or run
+`./start_lite.sh` (Linux); it uses its own `venv_lite/` (~750 MB). Same device
+set as above, including the **UMI gripper on Linux** — there it is recorded
+without any visualization (RGB video + force/tactile/SLAM columns only), and
+the Linux package ships the ~460 MB gripper payload as a *required* resource
+(`start_lite.sh` verifies 7 items up front and refuses to start with
+`[错误 B]` if any is missing). The Windows package deliberately omits that
+payload, so the gripper group there is always empty. See
+[使用说明_lite.md](使用说明_lite.md).
+
 #### Launch the main program
 
 ```bash
@@ -143,6 +154,7 @@ venv/bin/python tools/hand_detection/demo_stereo_hands.py  # stereo + MediaPipe 
 | Intel RealSense D435 / D405 | `pyrealsense2` | RGB + depth dual slots; depth recorded as 12-bit gray HEVC MP4 (log depth codes) + live JET heatmap; built-in stall/framerate watchdog with auto-reconnect; D405 has a dedicated near-range capture profile |
 | S80C / S80M stereo | FaysSense VI Kit SDK (bundled in-repo, incl. FT602 bridge driver) | No SDK install needed; camera profile `STEREO_CAM_FPS` (default 50 fps) decimated to 30 fps recording via wall-clock 1/30 s buckets (burst backfill + empty-bucket watchdog, ~3% empty-bucket rate on healthy recordings); callback frame capture (same as the official GUI); carries hardware nanosecond timestamps and IMU samples; since v1.0.11 the subprocess runs the SDK depth engine → third-tile live depth heatmap + 12-bit gray depth video recording |
 | BLE data gloves | `bleak` | one per hand; parquet column names bound (`right_glove` / `left_glove`) |
+| UMI gripper (Fays S80M) | in-repo native stack (`core/gripper/native/`, ~460 MB, not in git) | Linux only (the native stack is ELF x86-64); up to 2 grippers (second one gets the `gripper_2_*` column prefix); records left-lens RGB video + `observation.gripper_{left,right}_force` / `_force_matrix` (10×10×3 force matrix) + `observation.slam_trajectory` + gripper state, no stereo video / IMU; new grippers auto-generate their per-serial factory calibration on open |
 
 ### Data Formats
 
@@ -319,6 +331,8 @@ file inventory, data flow):
 - [docs/tools.md](docs/tools.md), [docs/demos.md](docs/demos.md) — 3D tools, delivery demos
 - [docs/stereo_s80m.md](docs/stereo_s80m.md), [docs/hand_detection.md](docs/hand_detection.md) — S80M, hand detection
 - [docs/file_format.md](docs/file_format.md) — data file interface contract (authoritative definition of the v1.1.x pooled layout)
+- [使用说明_lite.md](使用说明_lite.md) — Lite edition guide: devices (incl. the UMI gripper), recording, upload, acceptance checklist (Chinese)
+- [使用手册.md](使用手册.md) — full operation manual, Chinese + English
 
 ### Privacy & Local Config
 
@@ -361,6 +375,55 @@ are documented in [docs/index.md](docs/index.md#开发约定).
 
 ### Changelog
 
+- **v1.3.6** — the Lite edition records the UMI gripper, and every SLAM point now
+  carries the host timestamp of the frame it came from.
+  **Lite + gripper:** the Lite edition did not record the gripper at all; that
+  exclusion is now reversed. The whole gripper chain (force, 10×10×3 force
+  matrix, gripper state, SLAM trajectory) is recorded with **no gripper
+  information shown in the UI** — the gripper RGB becomes the main video source
+  directly. The payload is a hard constraint: the Linux package ships the
+  ~460 MB native stack as a *required* resource and `start_lite.sh` verifies 7
+  items up front, refusing to start with `[错误 B]` if any is missing, so an
+  upgrade on an older machine is stopped before it fails halfway; the Windows
+  package deliberately omits that payload (the native stack is ELF x86-64) and
+  its gripper group stays permanently empty. The three distribution shells
+  (`start_lite.bat`, `start_lite.sh`, `使用说明_lite.md`) moved from
+  `lite_package/` to the **repository root** next to `main_lite.py`, so the root
+  is directly runnable; `lite_package/*` is now untracked entirely. Force-matrix
+  encoding moved out of `ui/main_window.py` into the new `core/gripper_codec.py`
+  (re-exported by the UI) — it is a data contract and must not exist twice, and
+  the Lite import blacklist excludes `ui/main_window`, which pulls in the whole
+  main UI. That module may depend only on numpy / `config.settings` /
+  `config.i18n`, never `core.gripper`: `core/gripper/__init__.py` imports
+  `fays_runtime` (top-level `import fcntl`) at import time, and `fcntl` does not
+  exist on Windows.
+  **SLAM host stamps:** each trajectory point's `t` is the camera *sensor* clock
+  while a video row's `hardware_ns` is the *host monotonic* clock — different
+  timebases whose offset can only be fitted (three reverse estimates spread
+  ~104 ms, more than one 33.3 ms frame interval), so aligning SLAM points to
+  video frames 1:1 had been reduced to row-index pairing (median residual
+  83 ms). Native now takes `CLOCK_MONOTONIC` once at the `stereoCallback` entry
+  (before the deep copy — "the frame reached this process", not "processing
+  finished") and carries it through `RawImageFrame` → `PreparedFrame` →
+  `OutputFrame` (the prepared-frame slot is latest-wins, so timestamp and stamp
+  must travel together or they get paired with the wrong frame) out to the
+  `Host:(<ns>)` field on stdout. `protocol.py` parses it as an **optional**
+  group — deployed older binaries do not print it and still parse, with
+  `host_mono_ns = None` — the bridge adds a 5th **object** signal argument
+  (`pyqtSignal(int)` would silently truncate nanoseconds to qint32), and it
+  lands as `observation.{prefix}slam_trajectory_ns` (`list<int64>`, declared
+  `flat_parallel_to_slam_trajectory` / `host_monotonic_ns`), accumulated in
+  lockstep with the point list: one value per point, 0 = unknown, never skipped,
+  and no column at all when a whole segment is unstamped. Verified on real
+  hardware with episode-085/086 (the first two recorded after the deploy; the
+  earlier 128 carry no such column): points = stamps (353/353 and 344/344), zero
+  length mismatches, zero all-zero rows, strictly increasing, stamped range
+  inside the segment's `hardware_ns` range (same timebase) — nearest-neighbour
+  residual median 6.9 ms with **94.6 % / 97.4 % inside half a frame interval**,
+  against 83 ms for row-index pairing. Also adds
+  `tools/dedup_gripper_native.py`, which recovers 339 MB of `.so` files that a
+  ZIP / `cp -rL` transfer had dereferenced from symlinks into full copies (the
+  worst case being one libopenblas stored 7 times in orb48_env).
 - **v1.3.5** — the camera service heals itself, and gripper scan pairing moved
   from USB root ports to NVS serials.
   **Cameras:** the UVC cameras (DECXIN `1bcf:2d4f` plus two Sightac `0c45:636f`)
@@ -721,6 +784,14 @@ start.bat help          打开操作指引与异常排查文档
 > 完整操作指引、错误码对照与内网离线交付方式见 [使用说明.md](使用说明.md) /
 > [使用说明_EN.md](使用说明_EN.md)（离线安装包由 `python scripts/pack_wheels.py` 生成）。
 
+**极简版**（只做连接设备 → 采集 → 上传，无登录/回放/任务页/骨架解算）：
+Windows 双击 **`start_lite.bat`**、Linux 跑 `./start_lite.sh`，用独立环境
+`venv_lite/`（约 750MB）。设备范围同上，**含 UMI 夹爪（仅 Linux）**——夹爪
+**只录不显**（只落 RGB 视频 + 力/触觉/力矩阵/SLAM 轨迹列，界面上不显示），
+且 Linux 包把约 460MB 的夹爪原生载荷当**必需资源**下发（`start_lite.sh`
+启动前逐项校验 7 项，缺了直接报 `[错误 B]` 拒启）；Windows 包有意不带该载荷，
+那边的「UMI 夹爪」组框还在、里面永远是空的。详见 [使用说明_lite.md](使用说明_lite.md)。
+
 #### 启动主程序
 
 ```bash
@@ -758,6 +829,7 @@ venv/bin/python tools/hand_detection/demo_stereo_hands.py  # 双目 + MediaPipe 
 | Intel RealSense D435 / D405 | `pyrealsense2` | RGB + depth 双路槽位；深度以 12-bit 灰度 HEVC MP4 录制（对数深度码）+ 实时 JET 热力图；内置停滞/帧率看门狗自动重连；D405 有独立近距采集配置 |
 | S80C / S80M 双目 | FaysSense VI Kit SDK（仓库自带，含 FT602 桥驱动） | 无需安装 SDK；相机档 `STEREO_CAM_FPS`（默认 50fps）按 wall 时钟 1/30s 桶抽帧录制 30fps（突发补录 + 空桶看门狗，健康录制空桶率 ~3%），回调取帧（官方 GUI 同款）；携带硬件纳秒时间戳与 IMU 样本；v1.0.11 起子进程内置 SDK 深度引擎 → 第三格实时深度热力图 + 12-bit 灰度深度视频录制 |
 | BLE 数据手套 | `bleak` | 左右手各一只，parquet 列名绑定（`right_glove` / `left_glove`） |
+| UMI 夹爪（Fays S80M） | 仓库自带原生栈（`core/gripper/native/`，约 460MB，不入库） | 仅 Linux（原生栈是 ELF x86-64）；最多 2 台（第二台的数据列自动加 `gripper_2_*` 前缀）；录左目 RGB 视频 + `observation.gripper_{left,right}_force` / `_force_matrix`（10×10×3 力矩阵）+ `observation.slam_trajectory` + 夹爪状态，不存双目视频/IMU；新夹爪开启时自动生成逐台出厂标定 |
 
 ### 数据格式
 
@@ -922,6 +994,8 @@ venv/bin/python tools/tests/test_device_detector.py
 - [docs/tools.md](docs/tools.md)、[docs/demos.md](docs/demos.md) — 3D 工具、交付 demo
 - [docs/stereo_s80m.md](docs/stereo_s80m.md)、[docs/hand_detection.md](docs/hand_detection.md) — S80M、手部检测
 - [docs/file_format.md](docs/file_format.md) — 数据文件接口契约（v1.1.x 任务池化布局权威定义）
+- [使用说明_lite.md](使用说明_lite.md) — 极简版使用说明：设备（含 UMI 夹爪）、录制、上传、验收清单
+- [使用手册.md](使用手册.md) — 完整操作手册（中文 + English）
 
 ### 隐私与本地配置
 
@@ -955,6 +1029,40 @@ i18n 文案经 `tr()` 翻译、PyQt5 信号参数用 `object` 封送大整数、
 
 ### 更新记录
 
+- **v1.3.6** — 极简版能录 UMI 夹爪了；每个 SLAM 点带上了它那张取样帧的宿主时刻。
+  **极简版 + 夹爪**：极简版此前完全不录夹爪，本次推翻该排除。夹爪整条链（力 /
+  10×10×3 力矩阵 / 夹爪状态 / SLAM 轨迹）全部落盘，但界面**不显示**任何夹爪
+  信息——夹爪 RGB 直接当主视频源用。载荷是硬约束：Linux 包把约 460MB 的原生
+  栈当**必需资源**下发，`start_lite.sh` 启动前逐项校验 7 项，缺任一项报
+  `[错误 B]` 拒启，老机器升级会在跑炸之前就被拦住；Windows 包**有意不带**该
+  载荷（原生栈是 ELF x86-64），那边的夹爪组框永远是空的。三个分发壳
+  （`start_lite.bat`/`start_lite.sh`/`使用说明_lite.md`）从 `lite_package/`
+  搬到**仓库根**、与 `main_lite.py` 同级，根目录直接可运行；`lite_package/*`
+  随之整体不入库。力矩阵编码从 `ui/main_window.py` 搬到新模块
+  `core/gripper_codec.py`（UI 侧 re-export）——它是数据契约，不能在两份界面
+  代码里各存一份，而极简版的导入黑名单不含 `ui/main_window`（它拖进主程序
+  全部 UI）。该模块只许依赖 numpy / `config.settings` / `config.i18n`，绝不
+  可 import `core.gripper`：`core/gripper/__init__.py` 导入期就拉
+  `fays_runtime`（顶层 `import fcntl`），而 fcntl 在 Windows 上不存在。
+  **SLAM 宿主戳**：轨迹每点的 `t` 是**相机传感器钟**，视频行的 `hardware_ns`
+  是**宿主单调钟**，两者不同源、只差一个只能拟合的偏移（三个反推估计散布
+  ~104ms，已超一个 33.3ms 帧间隔），于是把它们 1:1 对齐此前只能退化成按行号
+  配（中位残差 83ms）。现在 native 在 `stereoCallback` 入口取一次
+  `CLOCK_MONOTONIC`（在深拷贝之前——代表「帧到达本进程」而非「处理完」），
+  随帧走完 `RawImageFrame` → `PreparedFrame` → `OutputFrame`（预处理槽是
+  「最新覆盖」，所以时间戳与宿主戳必须同进同出，否则会配错帧），与位姿一起
+  打在 stdout 的 `Host:(<ns>)` 上。`protocol.py` 按**可选**组解析——现场已
+  部署的旧二进制不打印这段、照旧可读，`host_mono_ns = None`；桥接加第 5 个
+  **object** 信号参（`pyqtSignal(int)` 会把纳秒按 qint32 静默截断）；最终落成
+  `observation.{prefix}slam_trajectory_ns`（`list<int64>`，声明
+  `flat_parallel_to_slam_trajectory` / `host_monotonic_ns`），**与点列表锁步**
+  累加：每点恒定一个值、无戳补 0、绝不跳过，整段全无戳则不建列。真机验收
+  （部署后录的 episode-085/086，正是头两段带该列的；此前 128 段都没有）：
+  点数=戳数（353/353、344/344）、零长度不等、零全 0 行、严格递增、戳区间落在
+  该段 `hardware_ns` 区间内（同一时基）——最近邻残差中位 6.9ms、**≤半帧占比
+  94.6% / 97.4%**，而行号配对是中位 83ms。另新增
+  `tools/dedup_gripper_native.py`，回收 339MB 被 ZIP / `cp -rL` 从软链解引用
+  成实体副本的 `.so`（最夸张的是 orb48_env 里同一个 libopenblas 存了 7 份）。
 - **v1.3.5** — 相机服务能自愈了；夹爪扫描配对从 USB 根端口改走 NVS 序列号。
   **相机侧**：UVC 相机（DECXIN `1bcf:2d4f` 与两个 Sightac `0c45:636f`）会**静默
   卡死、且不需要任何进程碰它**——2026-09-15 实证右目 Sightac 是自己夜里坏的

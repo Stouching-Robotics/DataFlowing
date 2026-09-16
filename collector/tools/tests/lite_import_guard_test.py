@@ -43,7 +43,10 @@ BLACKLIST = [
     "core.task_service", "core.glove_keypoint_solver",
     "core.render_engine", "core.sensor_hand_config",
     "core.hand_tracking", "core.hand_processor", "core.auto_labeler",
-    "core.s80m_manager", "core.session_loader", "core.session_timeline",
+    # 注：core.s80m_manager 2026-09-16 起**在 lite 闭包内**（UMI 夹爪的
+    # core/gripper/bridge.py 顶层 import 它的丢帧常量），已从禁止名单移出，
+    # 与 core/gripper/* 一起由下面的夹爪闭包段断言。
+    "core.session_loader", "core.session_timeline",
     "core.session_catalog", "core.recording_repository",
     "core.task_record", "core.device_manager", "core.device_naming",
     "core.exposure_controller",
@@ -58,6 +61,8 @@ WHITELIST = [
     "core.d435_camera", "core.camera", "core.device_detector",
     "core.ble_engine", "core.usb_glove_engine",
     "core.uploader", "core.api_client", "core.database", "core.helpers",
+    # 力矩阵编码的家（ui.main_window 只是 re-export）—— lite 直接用
+    "core.gripper_codec",
 ]
 
 
@@ -67,6 +72,18 @@ def main():
     win = LiteWindow(pipeline=CameraPipeline(output_dir=OUT_ROOT))
     win.close()
     app.processEvents()
+
+    # 夹爪闭包：扫描线程只在**真有夹爪插着**时才走到 core.gripper.bridge，
+    # 且它在后台线程里（win.close() 早于它完成 → 断言会 flaky），所以这里
+    # 显式导入一遍，让下面的禁止名单覆盖整个夹爪闭包 —— 确认它没把
+    # torch/scipy 之类的重依赖拖进来（那是 lite 体积与客户机装不上的红线）。
+    # 只在 Linux 上有意义：原生栈是 ELF，且 core/gripper 顶层 `import fcntl`
+    # 在 Windows 上直接导入失败——那正是 Windows 包的预期降级路径。
+    gripper_state = "跳过（非 Linux）"
+    if sys.platform.startswith("linux"):
+        import core.gripper.bridge   # noqa: F401
+        import core.s80m_manager     # noqa: F401
+        gripper_state = "已导入并断言"
 
     bad = sorted(m for m in BLACKLIST
                  if any(k == m or k.startswith(m + ".")
@@ -86,7 +103,7 @@ def main():
         print("FAIL")
         return 1
     print(f"PASS: {len(WHITELIST)} 个白名单模块全部就位，"
-          f"禁止名单无导入，编码器探针已关闭")
+          f"禁止名单无导入，编码器探针已关闭，夹爪闭包 {gripper_state}")
     return 0
 
 

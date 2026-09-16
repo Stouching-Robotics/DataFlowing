@@ -16,6 +16,15 @@ rem  只安装 requirements-lite.txt 白名单依赖（独立 venv_lite/，
 rem  与主程序 venv/ 互不影响）；wheels/ 与 data/ 两版本共用。
 rem  依赖安装顺序: wheels\ 离线包 → 阿里云镜像 → 清华镜像 → 官方源
 rem  错误码 A-G 对应 使用说明_lite.md（异常处理章节）
+rem
+rem  【夹爪为什么这里不查】Windows 包**有意不带** UMI/Fays 夹爪的原生资源
+rem  （core/gripper/native，约 460MB）与触觉 SDK（core/gripper/sightac_sdk，
+rem  里面是 pyarmor 运行时的 .so 与 libSonixCamera.so）—— 这些全是 ELF，
+rem  在 Windows 上物理跑不了。夹爪的 Python 代码两个包都带（无平台绑定），
+rem  缺载荷时 core/gripper/paths.py 的 gripper_resources_available() 返回假
+rem  → 设备列表里的「UMI 夹爪」组框还在，但里面是空的（点「开启」提示「列表中没有设备」），属**预期降级**、不是故障。
+rem  Linux 包带载荷，那边 start_lite.sh 有 [错误 B] 逐项校验；两边刻意
+rem  不对称，别在这里补一个「资源缺失」的检查（在这份包里它永远不通过）。
 rem ============================================================
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
@@ -113,7 +122,7 @@ echo  [5/6] 启动极简采集 ...
 echo.
 echo  【操作指引】
 echo    · 设备: 插入后约 2 秒自动出现在列表，选中后点 开启
-echo    · 录制: 先开 D435，再点 开始/停止（正常停止=保存，X 丢弃=作废）
+echo    · 录制: 先开 D435 / UVC 摄像头 / 夹爪（至少一个视频源），再点 开始/停止（正常停止=保存，X 丢弃=作废）
 echo    · 上传: 录制完成后自动上传，或在下方列表手动上传
 echo    · 说明: 双击 start_lite.bat help 打开 使用说明_lite.md
 echo.

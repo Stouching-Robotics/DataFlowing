@@ -166,6 +166,11 @@ class CameraPipeline(QObject):
         # SLAM 轨迹点按帧窗口累积（每点 8 值 [t,x,y,z,qx,qy,qz,qw] 扁平），
         # 行写入时并入 snapshot——轨迹 txt 侧车由此废弃（并入 episode parquet）
         self._gripper_traj: Dict[str, list] = {}
+        # 与 _gripper_traj 逐点同序并行的宿主时刻（int64 纳秒）。**必须与
+        # 点列表锁步**：每点恒定追加一个值，无戳时补 0（= 未知，与
+        # hardware_ns / *_force_ns 的 0 约定一致），这样两列长度恒相等、
+        # 下标即配对。缺戳的点若跳过不追加，两列就会错位且无法察觉。
+        self._gripper_traj_ns: Dict[str, list] = {}
         # 夹爪非视频槽设备 ID（pose/force 槽不走 register_external_source，
         # 单独进 status 列）
         self._gripper_device_ids: set = set()
@@ -589,6 +594,7 @@ class CameraPipeline(QObject):
         with self._gripper_snapshots_lock:
             self._gripper_snapshots.clear()
             self._gripper_traj.clear()
+            self._gripper_traj_ns.clear()
 
         # B+ 方案: 启动独立写入线程（精确 30fps，完全不受主线程 UI 影响）
         self._write_thread = threading.Thread(
@@ -836,7 +842,8 @@ class CameraPipeline(QObject):
         with self._gripper_snapshots_lock:
             self._gripper_snapshots[key] = value
 
-    def write_slam_trajectory(self, pose7, prefix: str = "", timestamp=None):
+    def write_slam_trajectory(self, pose7, prefix: str = "", timestamp=None,
+                              host_ns=None):
         """SLAM 轨迹点 [t,x,y,z,qx,qy,qz,qw] 累积（P3；桥接 pose_ready 回调）。
 
         prefix 为双夹爪命名空间：rig1 空串（旧键 slam_trajectory 不变），
@@ -847,6 +854,13 @@ class CameraPipeline(QObject):
         缺位姿的行会被填成 [0]*7 被下游当真实位姿读；轨迹点带真实时间戳、
         信息严格更多，是 SLAM 位姿的唯一落盘形态。轨迹不再单独落 txt
         侧车，全部信息都在一条 episode parquet 里。
+
+        host_ns：该取样帧的宿主单调钟纳秒（native 侧 CLOCK_MONOTONIC，
+        与 `hardware_ns` 同时基），逐点并行落成
+        `{prefix}slam_trajectory_ns`。**t 与 host_ns 不同源**：t 是相机
+        传感器钟，换算到宿主钟要一个只能拟合的偏移（实测三个反推估计
+        散布 287607.586/.637/.690，跨度 ~104ms，已超一个帧间隔），所以
+        没有 host_ns 就只能靠行号配 slam 点与视频帧。0/None = 无戳。
         """
         if pose7 is None:
             return
@@ -860,11 +874,21 @@ class CameraPipeline(QObject):
                 return
             if not np.isfinite(t):
                 return
+            try:
+                host_value = int(host_ns) if host_ns is not None else 0
+            except (TypeError, ValueError, OverflowError):
+                host_value = 0
+            if host_value < 0:
+                host_value = 0
             with self._gripper_snapshots_lock:
                 if self._writer is None or not self._recording:
                     return
-                self._gripper_traj.setdefault(
-                    f"{prefix}slam_trajectory", []).extend([t, *values])
+                key = f"{prefix}slam_trajectory"
+                self._gripper_traj.setdefault(key, []).extend([t, *values])
+                # 与点列表**锁步**：每点恒定追加一个值（无戳补 0），
+                # 两列长度恒等、下标即配对。缺戳就跳过不追加会让两列
+                # 错位且下游无从察觉。
+                self._gripper_traj_ns.setdefault(key, []).append(host_value)
 
     def write_gripper_state(self, state3, prefix: str = ""):
         """夹爪状态快照 [open_pct, gripped, fz_mn]（P4；GripState 输出）。"""
@@ -934,7 +958,8 @@ class CameraPipeline(QObject):
         """取走并清空本帧窗口内的夹爪快照（写入线程调用）。
 
         轨迹点在此并入：{prefix}slam_trajectory = 本窗口内全部点的
-        扁平 8 值列表（无点则不写键）。
+        扁平 8 值列表（无点则不写键）；其宿主时刻同序并行落
+        {prefix}slam_trajectory_ns（int64 纳秒，逐点对齐）。
         """
         with self._gripper_snapshots_lock:
             snapshot = dict(self._gripper_snapshots)
@@ -942,7 +967,15 @@ class CameraPipeline(QObject):
             for key, points in self._gripper_traj.items():
                 if points:
                     snapshot[key] = points
+                    stamps = self._gripper_traj_ns.get(key) or []
+                    # 长度必须是点数（点=8 值）。全 0 表示本段所有点都
+                    # 没戳（旧 native 二进制不打印 Host 字段）——此时
+                    # 不建列，免得下游拿到一列「看着有、其实全未知」的
+                    # 时刻而误以为可对齐。
+                    if len(stamps) == len(points) // 8 and any(stamps):
+                        snapshot[f"{key}_ns"] = stamps
             self._gripper_traj.clear()
+            self._gripper_traj_ns.clear()
         return snapshot
 
     def _pop_glove_keypoints(self) -> Dict[str, np.ndarray]:

@@ -302,6 +302,7 @@ data/recordings/                          # 录制根目录（settings.RECORDING
 | `observation.gripper_{left,right}_force_matrix` | list<int16> / list<float32> | 250×250×3 力矩阵（档位见下） |
 | `observation.gripper_{left,right}_force_matrix_ns` | int64 | 该力矩阵样本的采集时刻 |
 | `observation.slam_trajectory` | list<double> | 轨迹点 `[t,x,y,z,qx,qy,qz,qw]`×N，变长 |
+| `observation.slam_trajectory_ns` | list<int64> | 每个轨迹点对应取样帧的**宿主时刻**，与 `slam_trajectory` 同序等长 |
 | `observation.gripper_state` | list<float32, 3> | `[open_pct, gripped, fz_mn]` |
 
 力矩阵档位记在**每段一份**的 `meta/episodes` 行（`force_matrix_specs` 列），
@@ -336,6 +337,42 @@ mapping, residual_ns = align_episode("episode-000.parquet", side="left")
 - **v1.3.3 之前录的 episode 无法这样对齐**：那时力侧完全没有时间戳，RGB 侧
   的 `hardware_ns` 还被 `pyqtSignal(int)` 截成 32 位（每 2.147 s 翻符号）。
   脚本对这类 episode 明确报「无法对齐」而不是拿行号或增长率去猜。
+
+### 4.5.2 SLAM 点与视频帧的时间对齐
+
+`slam_trajectory` 每点的第 0 个字段 `t` 是**相机传感器钟**上的时间（native
+侧 `img->timestamp`，相对按下 ENTER 设原点那一刻）。它与 RGB 帧的
+`hardware_ns`（宿主单调钟）**不同源**，两者之间只差一个近似常量但带抖动的
+偏移——只能从数据反推、不能换算。实测同一段数据反推出的偏移有三个估计值
+（`arrival_monotonic − t` 中位、行桶中位、逐点拟合最优），散布约 **104 ms**，
+已超一个帧间隔（33.3 ms）。
+
+因此 v1.3.6 起 native 在每个取样帧进进程时取一次 `CLOCK_MONOTONIC`
+（`RawImageFrame.host_mono_ns`），随帧走完预处理/跟踪/排队全程，最终与位姿
+一起打在 stdout 的 `Host:(<ns>)` 字段上，落成
+`observation.{prefix}slam_trajectory_ns`。
+
+> **改这段 native 代码要认准文件**：构建源是
+> `online/ORB-SLAM/Examples/fays/fayssense_orb_slam.cc`（由
+> `online/dist/fays_opencv48/CMakeLists.txt` 的 `FAYS_BRIDGE_SOURCE` 硬指向）。
+> `core/gripper/native/ORB-SLAM/Examples/fays/` 下那份是**陈旧副本，不是构建源**，
+> 改它不会进二进制——且它缺少 2026-09-11 部署的崩溃修复。两棵树都被
+> `.gitignore`（`online/` 第 58 行、`core/gripper/native/` 第 62 行），桥接源码
+> 没有版本控制兜底，改完必须重编二进制才会生效。
+
+- **与 `slam_trajectory` 同序等长**，下标即配对，所以某帧有 N 个轨迹点就有 N
+  个时刻。这要求时刻列表**锁步**累积：某个点没有戳时补 `0`（= 未知，与
+  `*_force_ns` 的约定一致）而**不是跳过**，跳过会让后续点全部错位且无从察觉。
+- 有了它，配 slam 点↔视频帧退化成一次 `searchsorted`：按 `hardware_ns` 找
+  最近的 `slam_trajectory_ns`。**不需要拟合偏移，更不需要插值**——从实测点里
+  取最近邻是合法的 1:1，不是造假数据。
+- **全段无戳时不建该列**（例如 Python 侧已升级但 native 二进制未重编）。
+  下游按列是否存在判断「本段能否按时间对齐」；列存在但个别值为 0 表示那
+  一个点缺戳。
+- **行数不等于点数。** 写线程在落后超过一帧时会重置时钟并**跳过**那些 tick
+  （`core/pipeline.py` 的 `_write_loop`），实测一段 11.4 s 的录制因此少写
+  11 行；slam 点侧则约丢 0.22%。所以「slam 点数 == 视频帧数」不成立，
+  按时间戳配对后剩下未配对的点/帧是正常现象，不是数据损坏。
 
 ### 4.6 `meta/info.json` 字段概览（LeRobot v3 兼容，上传服务器严格依赖）
 

@@ -57,8 +57,11 @@ def main():
         def on_stereo(slot, frame, hw_ns, s=s):
             s["stereo_l"] += 1
 
-        def on_pose(pos, quat, traj=(), timestamp=None, s=s):
+        def on_pose(pos, quat, traj=(), timestamp=None, host_ns=None, s=s):
             s["pose"] += 1
+            # host_ns 只在签名里显式收下、本探针不消费：PyQt5 会把多余实参
+            # 静默截断给「收得少」的槽，漏写这个参数不会报错只会悄悄丢戳，
+            # 所以宁可显式列出也不靠截断兜底。
             if s["pose_first"] is None:
                 s["pose_first"] = time.monotonic()
                 raw = b._raw_client

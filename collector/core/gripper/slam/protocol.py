@@ -78,6 +78,9 @@ POSE_MAX_ANGULAR_SPEED_RAD_S = math.radians(1080.0)
 _POSE_RE = re.compile(
     r"\[([\d.]+)\]\s*XYZ:\(([-\d.e+]+),([-\d.e+]+),([-\d.e+]+)\)\s*"
     r"Quat:\(w=([-\d.e+]+),x=([-\d.e+]+),y=([-\d.e+]+),z=([-\d.e+]+)\)"
+    # 取样帧的宿主单调钟纳秒（native 打印的 Host:(<ns)>）。**可选**：
+    # 现场已部署的旧 native 二进制不打印这段，缺省即 None，老数据照旧可读。
+    r"(?:\s+Host:\((\d+)\))?"
 )
 _FPS_RE = re.compile(
     r"^\[FPS_DATA\]\s+image=([\d.]+)\s+imu=([\d.]+)\s+"
@@ -115,6 +118,13 @@ class PoseSample:
     sequence: int = 0
     arrival_monotonic: object = None
     arrival_wall_time: object = None
+    # 该取样帧进入 native 进程时的宿主单调钟纳秒（CLOCK_MONOTONIC），与
+    # 主程序侧 `hardware_ns` / `time.monotonic_ns()` **同一时基**。
+    # `timestamp` 是相机传感器钟，与宿主钟不同源：两者只差一个近似常量
+    # 但带抖动的偏移，只能拟合不能换算（实测 offset 反推值散布 ~104ms，
+    # 已超一个帧间隔）。有本字段才能把 slam 点与视频帧按时间直接对齐。
+    # None = 无戳（旧 native 二进制），下游按"未知"处理、退回行号配对。
+    host_mono_ns: object = None
 
     @property
     def valid(self):
@@ -125,6 +135,7 @@ class PoseSample:
         arrival_values = (
             self.arrival_monotonic,
             self.arrival_wall_time,
+            self.host_mono_ns,
         )
         return (
             math.isfinite(self.timestamp)
@@ -354,12 +365,16 @@ def _parse_pose(line):
         qw, qx, qy, qz = (
             float(match.group(index)) for index in range(5, 9)
         )
+        # 组 9 = Host:(<ns>)，旧二进制的位姿行没这段 → None
+        host_group = match.group(9)
+        host_mono_ns = int(host_group) if host_group is not None else None
     except (TypeError, ValueError, OverflowError):
         return None
     return PoseSample(
         position=(x, y, z),
         rotation=(qx, qy, qz, qw),
         timestamp=timestamp,
+        host_mono_ns=host_mono_ns,
     )
 
 
@@ -390,6 +405,9 @@ def rotate_pose_z90(pose):
         rotation=(c * (qx - qy), c * (qy + qx), c * (qz + qw),
                   c * (qw - qz)),
         timestamp=pose.timestamp,
+        # 纯世界重标，不动时基：宿主戳原样透传（丢了它位姿就退回
+        # "只能按行号/相机钟对齐"的状态，落盘侧拿不到真实取样时刻）
+        host_mono_ns=pose.host_mono_ns,
     )
 
 

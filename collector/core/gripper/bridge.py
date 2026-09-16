@@ -183,7 +183,7 @@ class GripperBridge(QObject):
     #   符号，下游拿它做不了任何对齐（且解回卷在 ±2.147s 歧义边界上
     #   猜错会凭空造出上百帧的假漂移）。与 main_window 的
     #   stereo_frame_ready 用 object 同理。
-    pose_ready = pyqtSignal(object, object, object, object)
+    pose_ready = pyqtSignal(object, object, object, object, object)
     # pos(x,y,z), quat(qx,qy,qz,qw), trajectory(位置点不可变元组，新点追加才重建),
     # timestamp(SLAM 秒，与轨迹 txt 第一列同源——轨迹并入 episode parquet 后
     # 每点 8 值 [t,x,y,z,qx,qy,qz,qw] 需要它)
@@ -625,7 +625,12 @@ class GripperBridge(QObject):
                 self._trajectory_points[-TRAJECTORY_POINT_CAP:])
         self._trajectory_cache = tuple(self._trajectory_points)
         self._post("pose", tuple(pose.position), tuple(pose.rotation),
-                   self._trajectory_cache, pose.timestamp)
+                   self._trajectory_cache, pose.timestamp,
+                   # 取样帧的宿主单调钟纳秒（与 hardware_ns 同时基）；旧
+                   # native 二进制不打印 Host 字段 → None，下游按未知处理。
+                   # getattr 而非直接取属性：测试夹具/外部实现可能只有
+                   # pos/quat/ts 三个字段，缺戳不应让整条位姿断流。
+                   getattr(pose, "host_mono_ns", None))
 
     def _on_stereo_packet(
         self, payload, sensor_ts_ns, host_mono_ns, sequence,

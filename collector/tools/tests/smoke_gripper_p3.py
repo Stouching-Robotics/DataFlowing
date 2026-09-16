@@ -54,12 +54,18 @@ def main():
                   f"{'None' if matrix is None else matrix.shape}",
                   flush=True)
 
-    def on_pose(pos, quat, traj=(), timestamp=None):
+    def on_pose(pos, quat, traj=(), timestamp=None, host_ns=None):
         stats["pose"] += 1
         stats["last_pos"] = pos
+        # host_ns 是取样帧的宿主单调钟纳秒（与 hardware_ns 同时基）；None =
+        # 当前 native 二进制未打印 Host 字段（只做了 Python 侧改动、没重编
+        # 原生库时的预期状态）。真机验收时应看到非 None、且逐点单调递增。
+        if host_ns is not None:
+            stats["host_ns_last"] = host_ns
         if stats["pose"] <= 3 or stats["pose"] % 100 == 0:
             print(f"[POSE] #{stats['pose']} pos={tuple(pos)} "
-                  f"quat={tuple(quat)}", flush=True)
+                  f"quat={tuple(quat)} t={timestamp} "
+                  f"host_ns={host_ns}", flush=True)
 
     def on_opened():
         print("[OPENED] 相机 + 触觉 + SLAM 链路就绪", flush=True)

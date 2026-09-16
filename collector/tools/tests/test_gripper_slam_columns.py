@@ -17,6 +17,12 @@ slam_trajectory（变长、每点带真实时间戳）信息严格更多，故�
   3. 双 rig 前缀命名空间互不干扰
   4. 删分支后 state / force / force_matrix 仍各按原类型落盘（没被 else 误吞）
   5. 全空 episode（一帧夹爪数据都没有）不建任何夹爪列，且不抛异常
+  6. slam_trajectory_ns → 类型必须是 list<int64> 而非标量 int64（钉死
+     「专用分支排在通用 _ns 之前」）、与 slam_trajectory 逐行等长、
+     features dtype/shape/encoding
+  7. pipeline 侧 write_slam_trajectory/_pop_gripper_snapshots：时刻与点
+     锁步、缺戳补 0 不跳过、弹出后清空、全程无戳（旧 native 二进制）
+     不建 _ns 列
 退出码 0 = 全部通过。
 """
 
@@ -193,6 +199,78 @@ def main() -> int:
         check("features 无任何 slam 键",
               not [k for k in read_features(os.path.join(tmp, "none"))
                    if "slam_" in k])
+
+        print("[6] slam_trajectory_ns = 逐点并行宿主时刻（list<int64>，非标量）")
+        # 分支顺序陷阱：slam_trajectory_ns 也以 _ns 结尾，若排在通用 _ns
+        # 分支之后就会被落成"每行一个标量 int64"——一行 2 个点只剩 1 个
+        # 时刻，与点列表错位且下游无从察觉。这里用类型把它钉死。
+        NS2 = [287607702508638, 287607702575000]
+        w6 = build(os.path.join(tmp, "trajns"), [
+            {"slam_trajectory": TRAJ, "slam_trajectory_ns": NS2},
+            {},                                        # 空窗口 → []
+            {"slam_trajectory": TRAJ[:8],
+             "slam_trajectory_ns": [287607702641000]},  # 单点窗口
+        ])
+        w6._write_data_parquet()
+        w6._write_info_json()
+        colns = "observation.slam_trajectory_ns"
+        schema6 = read_schema(os.path.join(tmp, "trajns"))
+        check("列类型 = list<int64>（不是标量 int64）",
+              schema6.field(colns).type == pa.list_(pa.int64()),
+              str(schema6.field(colns).type))
+        check("确实是 list 而非标量 —— 分支顺序未被通用 _ns 抢先",
+              not schema6.field(colns).type.equals(pa.int64()))
+        gotns = read_col(os.path.join(tmp, "trajns"), colns)
+        check("多点点值逐位往返（两个点两个时刻）",
+              gotns[0] == NS2, str(gotns[0]))
+        check("无样本帧是 [] 而不是 0", gotns[1] == [], str(gotns[1]))
+        check("单点窗口 = 1 值", gotns[2] == [287607702641000], str(gotns[2]))
+        # 与 slam_trajectory 同序等长是本列的**全部意义**，逐行核对
+        traj6 = read_col(os.path.join(tmp, "trajns"),
+                         "observation.slam_trajectory")
+        check("逐行与 slam_trajectory 等长（下标即配对）",
+              all(len(a) // 8 == len(b) for a, b in zip(traj6, gotns)),
+              str([(len(a) // 8, len(b)) for a, b in zip(traj6, gotns)]))
+        feats6 = read_features(os.path.join(tmp, "trajns"))[colns]
+        check("features dtype=int64 / shape=[1]",
+              feats6["dtype"] == "int64" and feats6["shape"] == [1],
+              str(feats6))
+        check("features encoding=flat_parallel_to_slam_trajectory",
+              feats6.get("encoding") == "flat_parallel_to_slam_trajectory",
+              str(feats6))
+
+        print("[7] pipeline 侧：时刻与点锁步累积、无戳补 0、全无戳不建列")
+        from core.pipeline import CameraPipeline          # noqa: E402
+        p7 = CameraPipeline()
+        p7._writer = object()      # 非 None 即可（write_slam_trajectory 只判非空）
+        p7._recording = True
+        p7.write_slam_trajectory(POSE7, timestamp=10.0,
+                                 host_ns=287607702508638)
+        p7.write_slam_trajectory(POSE7, timestamp=10.02)          # 无戳
+        p7.write_slam_trajectory(POSE7, timestamp=10.04,
+                                 host_ns=287607702575000)
+        snap7 = p7._pop_gripper_snapshots()
+        check("三点窗口点/刻长度同步",
+              len(snap7["slam_trajectory"]) // 8 == 3
+              and len(snap7["slam_trajectory_ns"]) == 3,
+              f"{len(snap7['slam_trajectory']) // 8} vs "
+              f"{len(snap7['slam_trajectory_ns'])}")
+        check("缺戳点补 0 而不是被跳过（否则后续点全部错位）",
+              snap7["slam_trajectory_ns"] == [287607702508638, 0,
+                                              287607702575000],
+              str(snap7["slam_trajectory_ns"]))
+        check("弹出后累加器清空",
+              p7._pop_gripper_snapshots() == {}
+              and not p7._gripper_traj_ns)
+        p7b = CameraPipeline()
+        p7b._writer = object()
+        p7b._recording = True
+        p7b.write_slam_trajectory(POSE7, timestamp=1.0)           # 全程无戳
+        snap7b = p7b._pop_gripper_snapshots()
+        check("旧二进制（全程无戳）不建 _ns 列",
+              "slam_trajectory" in snap7b
+              and "slam_trajectory_ns" not in snap7b,
+              str(sorted(snap7b)))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

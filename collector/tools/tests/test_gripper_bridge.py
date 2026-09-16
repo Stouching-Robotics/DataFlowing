@@ -190,8 +190,8 @@ def _run_open_flow(fail_select=None, wait_ready=True, ready_errors=(),
         lambda s, h, f, m, ns: stats["tactile"].append(
             (s, tuple(f), m, ns)))
     bridge.pose_ready.connect(
-        lambda p, q, t, ts: stats["pose"].append(
-            (tuple(p), tuple(q), tuple(t), ts)))
+        lambda p, q, t, ts, ns: stats["pose"].append(
+            (tuple(p), tuple(q), tuple(t), ts, ns)))
     bridge.gripper_state_ready.connect(
         lambda payload: stats["state"].append(payload))
     bridge.opened.connect(lambda: stats.__setitem__(
@@ -330,21 +330,34 @@ def main():
           "paired 两包配对只发左目、右目包丢弃")
     bridge2.deleteLater()
 
-    # SLAM 位姿投递（pos3 + quat4 + 轨迹元组 + timestamp）
+    # SLAM 位姿投递（pos3 + quat4 + 轨迹元组 + timestamp + 宿主时刻）
     pose_count = len(stats["pose"])
     pose = SimpleNamespace(position=(1.0, 2.0, 3.0),
-                           rotation=(0.0, 0.0, 0.0, 1.0), timestamp=0.5)
+                           rotation=(0.0, 0.0, 0.0, 1.0), timestamp=0.5,
+                           host_mono_ns=287607702508638)
     bridge._on_slam_pose(pose)
     _pump_until(lambda: len(stats["pose"]) == pose_count + 1)
     check(stats["pose"][-1] == ((1.0, 2.0, 3.0), (0.0, 0.0, 0.0, 1.0),
-                                ((1.0, 2.0, 3.0),), 0.5),
-          "pose_ready 信号携带 pos/quat/traj/timestamp")
+                                ((1.0, 2.0, 3.0),), 0.5,
+                                287607702508638),
+          "pose_ready 信号携带 pos/quat/traj/timestamp/host_ns")
+    # 无 host_mono_ns 的位姿（旧 native 二进制 / 外部实现）也必须正常投递，
+    # 戳缺失只是让下游退回行号配对，不该断掉整条位姿流
+    pose_legacy = SimpleNamespace(position=(1.5, 2.5, 3.5),
+                                  rotation=(0.0, 0.0, 0.0, 1.0),
+                                  timestamp=0.55)
+    bridge._on_slam_pose(pose_legacy)
+    _pump_until(lambda: len(stats["pose"]) == pose_count + 2)
+    check(stats["pose"][-1][4] is None,
+          "缺 host_mono_ns 的位姿投递为 None（不抛异常）")
     # 第二个位姿追加进轨迹（同一元组缓存对象随新点重建）
     pose2 = SimpleNamespace(position=(2.0, 3.0, 4.0),
-                            rotation=(0.0, 0.0, 0.0, 1.0), timestamp=0.6)
+                            rotation=(0.0, 0.0, 0.0, 1.0), timestamp=0.6,
+                            host_mono_ns=287607702641000)
     bridge._on_slam_pose(pose2)
-    _pump_until(lambda: len(stats["pose"]) == pose_count + 2)
-    check(stats["pose"][-1][2] == ((1.0, 2.0, 3.0), (2.0, 3.0, 4.0)),
+    _pump_until(lambda: len(stats["pose"]) == pose_count + 3)
+    check(stats["pose"][-1][2] == ((1.0, 2.0, 3.0), (1.5, 2.5, 3.5),
+                                   (2.0, 3.0, 4.0)),
           "轨迹随位姿滚动累积")
 
     # P4 串口链接线：构造注入 on_board_update/on_grip_check，握手用 esp_tty

@@ -730,7 +730,13 @@ class EgoDataWriter(QObject):
         for key, value in (gripper or {}).items():
             if value is None:
                 continue
-            if key.endswith("_ns"):
+            if key.endswith("slam_trajectory_ns"):
+                # 与 slam_trajectory 逐点同序并行的宿主时刻（变长 int64
+                # 纳秒）。**必须排在通用 `_ns` 之前**：后者按"每行一个
+                # 标量 int64"落盘，而一行内可以有多达 10 个轨迹点，
+                # 落成标量就只剩一个时刻、与点列表再也对不上。
+                row[f"observation.{key}"] = [int(v) for v in value]
+            elif key.endswith("_ns"):
                 # 采集时刻列（int64 宿主单调钟纳秒，与 hardware_ns 同时基）。
                 # 后缀判定必须排在 _force_matrix/_force 之前：`_force_matrix_ns`
                 # 不以 `_force_matrix` 结尾只是巧合，靠顺序防止以后改后缀踩雷。
@@ -919,7 +925,12 @@ class EgoDataWriter(QObject):
         # 后者类型按本 episode 实际规格：int16 行差分 / float32 原值）
         for key in sorted(self._present_gripper):
             name = f"observation.{key}"
-            if key.endswith("_ns"):
+            if key.endswith("slam_trajectory_ns"):
+                # 逐点宿主时刻，与 slam_trajectory **同序等长**；某帧无
+                # 轨迹点则空列表（与 slam_trajectory 的空列表同步）。
+                cols[name] = pa.array(
+                    [r.get(name, []) for r in rows], pa.list_(pa.int64()))
+            elif key.endswith("_ns"):
                 # 采集时刻（缺失帧填 0 = 未知，与 hardware_ns 的 0 约定一致）
                 cols[name] = pa.array(
                     [int(r.get(name, 0)) for r in rows], pa.int64())
@@ -1055,7 +1066,15 @@ class EgoDataWriter(QObject):
         # 这里不重写一遍以免两处漂移）
         matrix_features = self._force_matrix_features()
         for key in sorted(self._present_gripper):
-            if key.endswith("_ns"):
+            if key.endswith("slam_trajectory_ns"):
+                # 逐点宿主时刻（int64 ns），与 slam_trajectory 同序等长：
+                # shape [1] 指"每个轨迹点 1 个值"，对齐前者的 [8]。
+                # 下游按它与 hardware_ns 直接比较即可配 slam 点↔视频帧。
+                features[f"observation.{key}"] = {
+                    "dtype": "int64", "shape": [1],
+                    "encoding": "flat_parallel_to_slam_trajectory",
+                    "clock": "host_monotonic_ns"}
+            elif key.endswith("_ns"):
                 # 采集时刻：宿主单调钟纳秒，与 hardware_ns 同一时基。
                 # 下游按此把力样本重采样到 RGB 帧时刻（见 docs/data.md）。
                 features[f"observation.{key}"] = {

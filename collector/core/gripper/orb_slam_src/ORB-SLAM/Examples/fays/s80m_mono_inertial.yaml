@@ -1,0 +1,52 @@
+%YAML:1.0
+# FS-VI-S80M → ORB-SLAM3 单目惯导 (矫正 PinHole, 仅左目)
+# IMU 外参来源: 工厂标定 FS-VI80-S80M_3500000261870088 (dump_config.sh)
+
+File.version: "1.0"
+Camera.type: "PinHole"
+
+Camera1.fx: 182.542
+Camera1.fy: 182.542
+Camera1.cx: 329.164
+Camera1.cy: 185.844
+
+# IMU 外参 (同双目版本)
+IMU.T_b_c1: !!opencv-matrix
+  rows: 4
+  cols: 4
+  dt: f
+  data: [ -0.999905, -0.000750, -0.013752, -0.002246,
+           0.000295, -0.999453,  0.033074,  0.011758,
+          -0.013769,  0.033067,  0.999358, -0.015601,
+           0.000000,  0.000000,  0.000000,  1.000000 ]
+
+IMU.NoiseGyro: 0.00017
+IMU.NoiseAcc:  0.002
+IMU.GyroWalk:  0.000022
+IMU.AccWalk:   0.00086
+IMU.Frequency: 1000.0
+IMU.InsertKFsWhenLost: 0
+
+Camera.width: 640
+Camera.height: 400
+Camera.fps: 50
+Camera.RGB: 1
+
+# 单目适当降低特征数 (减少误匹配)
+ORBextractor.nFeatures: 1500
+ORBextractor.scaleFactor: 1.2
+ORBextractor.nLevels: 8
+ORBextractor.iniThFAST: 14
+ORBextractor.minThFAST: 7
+
+Viewer.KeyFrameSize: 0.05
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.08
+Viewer.CameraLineWidth: 3.0
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -0.7
+Viewer.ViewpointZ: -3.5
+Viewer.ViewpointF: 500.0
+Viewer.imageViewScale: 1.0

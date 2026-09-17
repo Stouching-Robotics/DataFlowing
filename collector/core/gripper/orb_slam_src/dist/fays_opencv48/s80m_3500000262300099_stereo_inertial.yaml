@@ -1,0 +1,50 @@
+%YAML:1.0
+# FS-VI80-S80M serial 3500000262300099
+# IMU 外参来源: 工厂标定 FS-VI80-S80M_3500000261870088 (dump_config.sh)
+
+File.version: "1.0"
+Camera.type: "Rectified"
+
+Camera1.fx: 185.05690407170053
+Camera1.fy: 185.05690407170053
+Camera1.cx: 328.98226784470484
+Camera1.cy: 208.9946879827707
+
+Stereo.b: 0.08044013323374356
+Stereo.ThDepth: 40.0
+
+# IMU 参数
+IMU.T_b_c1: !!opencv-matrix
+  rows: 4
+  cols: 4
+  dt: f
+  data: [ -0.999943235583089, 0.007512350528377, -0.007529965518020, -0.003275507865015, -0.007503597269865, -0.999971020890299, -0.001190109130905, 0.007895204895623, -0.007538688955313, -0.001133540248061, 0.999970934578100, 0.008676005465073, 0.000000000000000, 0.000000000000000, 0.000000000000000, 1.000000000000000 ]
+IMU.NoiseGyro: 0.000806373747996
+IMU.NoiseAcc: 0.007187583066766
+IMU.GyroWalk: 8.271973275e-06
+IMU.AccWalk: 7.1624945534e-05
+IMU.Frequency: 1035.0
+IMU.InsertKFsWhenLost: 1
+
+Camera.width: 640
+Camera.height: 400
+Camera.fps: 30
+Camera.RGB: 1
+
+ORBextractor.nFeatures: 1400
+ORBextractor.scaleFactor: 1.1
+ORBextractor.nLevels: 5
+ORBextractor.iniThFAST: 20
+ORBextractor.minThFAST: 7
+
+Viewer.KeyFrameSize: 0.05
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.08
+Viewer.CameraLineWidth: 3.0
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -0.7
+Viewer.ViewpointZ: -3.5
+Viewer.ViewpointF: 500.0
+Viewer.imageViewScale: 1.0

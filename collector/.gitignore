@@ -65,6 +65,29 @@ online/
 # ORBvoc.txt 单文件 138MB 超 GitHub 100MB 限制，且为第三方二进制，不入库）
 # 触觉 Sightac SDK 例外：core/gripper/sightac_sdk/ 已 pyarmor 加密，随包入库
 core/gripper/native/
+
+# ORB-SLAM 核心源码树（core/gripper/orb_slam_src/）：**源码入库，产物不入库**。
+# 它必须排在 dist/ 那条全局规则（第 5 行）后面：那条规则会把整棵 dist 排掉，
+# 而 dist/fays_opencv48/ 里放的是桥接的 CMakeLists 与 7 份出厂标定，是源码。
+# 注意 git 不会进入被排除的目录，所以只能先把 dist/ 这个目录**整个**捞回来
+# （!.../dist/** 这种写法无效），再逐个排掉里面的产物。
+!core/gripper/orb_slam_src/dist/
+core/gripper/orb_slam_src/dist/fays_opencv48/bin/
+# DBoW2/g2o 都是编译产物（DBoW2 的 LIBRARY_OUTPUT_PATH、g2o 的
+# CMAKE_LIBRARY_OUTPUT_DIRECTORY 都指回源码树）。ORB-SLAM/lib/ 当前构建流程不用
+# （核心库走 -DKSQ_ORB_LIBRARY_OUTPUT_DIRECTORY 落到 build/），留着是防止别的
+# 构型往里写一颗 5.4MB 的 .so。
+core/gripper/orb_slam_src/ORB-SLAM/lib/
+core/gripper/orb_slam_src/ORB-SLAM/Thirdparty/DBoW2/lib/
+core/gripper/orb_slam_src/ORB-SLAM/Thirdparty/g2o/lib/
+# g2o 的 configure_file 写回源码树（删了没关系，cmake 会重新生成）
+core/gripper/orb_slam_src/ORB-SLAM/Thirdparty/g2o/config.h
+# 三个软链由 build.sh 幂等创建，指向 native/（本机必备、不入库），
+# 在别人的 clone 里是悬空的，所以只登记目录名本身（include/orb_slam/tools 是真目录、要入库）
+core/gripper/orb_slam_src/FaysSense_VI_Kit_Release/lib
+core/gripper/orb_slam_src/FaysSense_VI_Kit_Release/thirdparty
+core/gripper/orb_slam_src/FaysSense_VI_Kit_Release/config
+# 构建目录：build/ 那条全局规则已经覆盖（.pre_rebuild_* 备份落在 native/，也被覆盖）
 # 极简版发布目录/本机部署目录，整体不入库。
 # 2026-09-16 起 start_lite.bat/.sh 与 使用说明_lite.md 三个分发壳住在**仓库根**
 # （与 main_lite.py 同级，使根目录直接可运行）；lite_package/ 里那三份是

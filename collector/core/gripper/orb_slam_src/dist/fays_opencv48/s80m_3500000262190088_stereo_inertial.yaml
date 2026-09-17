@@ -1,0 +1,52 @@
+%YAML:1.0
+# FS-VI80-S80C serial 3500000262190088
+# Camera/IMU values read from Fays VIKit SDK 3.5.2 factory calibration.
+# Rectified intrinsics use cv::fisheye::stereoRectify with CALIB_ZERO_DISPARITY.
+
+File.version: "1.0"
+Camera.type: "Rectified"
+
+Camera1.fx: 180.99177175542104
+Camera1.fy: 180.99177175542104
+Camera1.cx: 288.3188194493703
+Camera1.cy: 176.229665549175
+
+Stereo.b: 0.0797447770264594
+Stereo.ThDepth: 40.0
+
+# SDK T_cam_imu: IMU/body -> unrectified cam0.
+IMU.T_b_c1: !!opencv-matrix
+  rows: 4
+  cols: 4
+  dt: f
+  data: [ -0.999965375537228, -0.008161268327974, 0.001578728618133, 0.005784037594984, 0.008217848252485, -0.999167229006721, 0.039963616145501, 0.005406484529236, 0.001251260915323, 0.039975211526100, 0.999199891891348, 0.016248931302944, 0.000000000000000, 0.000000000000000, 0.000000000000000, 1.000000000000000 ]
+# Direct SDK factory IMU model.
+IMU.NoiseGyro: 0.000806373747996
+IMU.NoiseAcc: 0.007187583066766
+IMU.GyroWalk: 8.271973275e-06
+IMU.AccWalk: 7.1624945534e-05
+IMU.Frequency: 1035.0
+IMU.InsertKFsWhenLost: 1
+
+Camera.width: 640
+Camera.height: 400
+Camera.fps: 30
+Camera.RGB: 1
+
+ORBextractor.nFeatures: 1400
+ORBextractor.scaleFactor: 1.1
+ORBextractor.nLevels: 8
+ORBextractor.iniThFAST: 20
+ORBextractor.minThFAST: 7
+
+Viewer.KeyFrameSize: 0.05
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.08
+Viewer.CameraLineWidth: 3.0
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -0.7
+Viewer.ViewpointZ: -3.5
+Viewer.ViewpointF: 500.0
+Viewer.imageViewScale: 1.0

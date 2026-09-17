@@ -1,6 +1,6 @@
 # collector — Multimodal Data Acquisition SDK · 多模态数据采集 SDK
 
-![Version](https://img.shields.io/badge/version-1.3.8-blue)
+![Version](https://img.shields.io/badge/version-1.3.9-blue)
 ![Python](https://img.shields.io/badge/python-3.12-blue)
 ![License](https://img.shields.io/badge/license-TBD-lightgrey)
 
@@ -375,6 +375,45 @@ are documented in [docs/index.md](docs/index.md#开发约定).
 
 ### Changelog
 
+- **v1.3.9** — connecting a gripper now puts every DECXIN's exposure/white balance
+  back to *auto*; until now each newly plugged gripper needed a manual
+  `v4l2-ctl -c auto_exposure=3,white_balance_automatic=1`. The dark picture is
+  not an acquisition-chain problem — it lives **inside the camera body**:
+  `auto_exposure=1` (manual) + `white_balance_automatic=0` pins it at the factory
+  `156/10000` (1.56% integration) forever, and that state **survives replugging**,
+  so fixing camera 001 does nothing for camera 002. The host had no write path at
+  all (the libuvc service only exposes `uvc_set_altsetting_override`;
+  `core.camera._apply_exposure_to` belongs to the generic OpenCV camera path,
+  which the gripper RGB never takes), hence the manual step.
+  `core/gripper/decxin_exposure.py` matches `1bcf:2d4f` only, reads every DECXIN
+  on **every connect**, and writes nothing at all when it is already auto (saves
+  a USB round trip and avoids wiping a manual exposure the user set on purpose).
+  The call site is `bridge._open_run`, **before
+  `UvcCameraServiceManager.select()`** — that order is mandatory: once the service
+  starts, the device is taken from libusb, the kernel `uvcvideo` driver is
+  detached and `/dev/videoN` disappears, after which every V4L2 ioctl fails (this
+  is exactly why `v4l2-ctl` used to require stopping the app). It is a purely
+  additive step and a failure is only logged: a dark picture is a minor problem,
+  a gripper that will not connect is not. The Sightac tactile camera
+  (`0c45:636f`) is never touched — its AE=1/AWB=0/6500K is the factory-stored
+  state. DECXIN's menu is 1=manual / 3=aperture-priority with **no 0** (writing 0
+  returns EINVAL), so candidates are tried 3/0/2; the manual entry point remains
+  `venv/bin/python -m core.gripper.decxin_exposure [--dry-run]` (stop the app
+  first). Also in this version: the ORB-SLAM **build source** moved into the repo
+  (`core/gripper/orb_slam_src/`) — it had only ever lived in the un-uploaded
+  `online/`, where all four crash-family fixes were made, so deleting `online/`
+  would have left binaries and not one editable line; production is **not** yet
+  installed from the new tree and is unverified on hardware. Four of the eleven
+  contract tests carry no `unittest.main()` entry point, so running them
+  directly only imported them and exited rc=0 with no output — a false green
+  that in fact "ran green" three of the four known-RED cases while this was
+  being checked; `core/gripper/orb_slam_src/tests/run_contract_tests.py` now
+  loads them by module, reports import-time SKIPs with their reason, and exits
+  1 only when a module fails to import. And `tools/diag_frame_trace.py` finally **settles the
+  v1.3.2 stale-frame question as H2** (the old frame is re-delivered, not just
+  mis-stamped): the discriminator has to be an edge map plus a same-window
+  control, bare mad gets it wrong — all 5 events captured on 09-17 read H2, so
+  the guard's drop is correct and **the stamp must not be "fixed" back**.
 - **v1.3.8** — fixes a leftover from v1.3.7: the two DECXINs' by-id link
   **ownership flips on re-enumeration**. Both report serial `01.00.00`, so both
   want the same link name, only one gets it — and *which* one depends on
@@ -1086,6 +1125,43 @@ i18n 文案经 `tr()` 翻译、PyQt5 信号参数用 `object` 封送大整数、
 
 ### 更新记录
 
+- **v1.3.9** — 连夹爪时自动把 DECXIN 的曝光/白平衡写回「自动」：此前每接一台新
+  夹爪都要人工跑一次 `v4l2-ctl -c auto_exposure=3,white_balance_automatic=1`。
+  画面暗的根因不在采集链，而在**相机机身**——`auto_exposure=1`（手动）+ AWB=0
+  会让它永久停在出厂 `156/10000`（1.56% 积分）的积分上，而这个状态**存在相机
+  里、跨重插保持**，所以「修好 001 那台」对 002 一点用都没有。主程序侧此前根本
+  没有写入口（libuvc 服务只有 `uvc_set_altsetting_override`；
+  `core.camera._apply_exposure_to` 是 OpenCV 通用相机那条路，夹爪 RGB 不经过），
+  于是只能人工介入。新的 `core/gripper/decxin_exposure.py` 只认 `1bcf:2d4f`，
+  **每次连接**把所有 DECXIN 读一遍，已经是自动档就一个字节都不写（省一次 USB
+  往返，也不会每连一次就把用户特意设的手动曝光抹掉）。调用点在
+  `bridge._open_run`、**早于 `UvcCameraServiceManager.select()`** —— 这个顺序是
+  硬要求：服务一开设备就被 libusb 拿走、内核 uvcvideo 被摘、`/dev/videoN` 随之
+  注销，之后所有 V4L2 ioctl 都会失败（这正是「要停掉主程序才能 v4l2-ctl」的
+  由来）。纯附加动作，失败只记日志——画面暗是小事，连不上是大事。Sightac 触觉
+  相机（`0c45:636f`）绝不触碰：它的 AE=1/AWB=0/6500K 是原厂存储态。DECXIN 的
+  `auto_exposure` 菜单是 1=手动 / 3=光圈优先、**没有 0**（写 0 得 EINVAL），故
+  候选序 3/0/2；手工入口仍在：`venv/bin/python -m core.gripper.decxin_exposure
+  [--dry-run]`（需先停主程序）。
+  同版另进三样。**ORB-SLAM 构建源入库**：`core/gripper/orb_slam_src/` 从此是
+  唯一真源，它原先只活在不上传的 `online/` 里，而四个崩溃家族的修复全在那份
+  源码上——online 一删就只剩二进制、一行都改不动（`pack_lite.py` 按名字整棵排除
+  它：树下有 `build/`、`dist/*/bin/` 这些 ELF 产物，收进 Windows 包会撞上
+  「零 ELF」硬断言）。生产**尚未**从新树安装、真机未验。**契约测试补加载器**：
+  11 份只读 ORB/桥接源码的测试里有 4 份（`test_connect_debug`、
+  `test_fays_sdk_shutdown`、`test_orb_stereo_baseline`、
+  `test_slam_offline_evaluation`）**没有 `unittest.main()` 入口**，直跑只 import
+  一遍就退出 —— `rc=0`、零输出，看着全绿（本次核对时实测把 4 个 RED 里的 3 个
+  这样「跑绿」了）；改由 `core/gripper/orb_slam_src/tests/run_contract_tests.py`
+  按模块加载，import 期 SkipTest 的如实报 SKIP 与原因，只有模块 import 失败才
+  `rc=1`。**陈旧帧取证定案 H2**：`tools/diag_frame_trace.py` 判定下陷
+  帧是**往前第 L 帧的旧图像被重新投递**（几何是 80ms 前的、电平是当帧的），
+  不是「只戳错」——判据必须用**边缘图 + 同窗对照**（`|Δx|+|Δy|` 抵消整幅电平
+  漂移；同窗正常帧给出 `e(L)/e(1)` 的对照带），**裸 mad 会判错**（第一版据此
+  给过两个错的「只戳错」）。09-17 17:06 真机抓到的 5 个事件全判 H2 ⇒ v1.3.2
+  守卫的「丢帧」处置是对的，**不该把戳修回来**（修回来等于把 80ms 前的
+  measurement 当成当前帧喂进跟踪器）。工具需先 `preflight` 打印 export 再重连
+  夹爪取证，离线自检 `tools/tests/test_diag_frame_trace.py`（16 项，约 5 秒）。
 - **v1.3.8** — 修 v1.3.7 的遗留：两颗 DECXIN 的 by-id 链接**归属会在重新枚举时
   翻转**。两颗序列号都是 `01.00.00`，都要同一个链接名，而只有一颗拿得到——**谁
   拿到取决于注册顺序**。v1.3.7 只把**没链接**那颗压到拓扑路径、拿到链接那颗仍用

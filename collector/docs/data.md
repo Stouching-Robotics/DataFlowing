@@ -353,12 +353,14 @@ mapping, residual_ns = align_episode("episode-000.parquet", side="left")
 `observation.{prefix}slam_trajectory_ns`。
 
 > **改这段 native 代码要认准文件**：构建源是
-> `online/ORB-SLAM/Examples/fays/fayssense_orb_slam.cc`（由
-> `online/dist/fays_opencv48/CMakeLists.txt` 的 `FAYS_BRIDGE_SOURCE` 硬指向）。
-> `core/gripper/native/ORB-SLAM/Examples/fays/` 下那份是**陈旧副本，不是构建源**，
-> 改它不会进二进制——且它缺少 2026-09-11 部署的崩溃修复。两棵树都被
-> `.gitignore`（`online/` 第 58 行、`core/gripper/native/` 第 62 行），桥接源码
-> 没有版本控制兜底，改完必须重编二进制才会生效。
+> `core/gripper/orb_slam_src/ORB-SLAM/Examples/fays/fayssense_orb_slam.cc`，
+> 由同树 `dist/fays_opencv48/CMakeLists.txt` 的 `FAYS_BRIDGE_SOURCE` 硬指向
+> （该值缺省就是 `${KSQ_ROOT}/ORB-SLAM/Examples/fays/fayssense_orb_slam.cc`）。
+> 2026-09-17 之前这两份源码只存在于 `online/`（不上传），现已随包入库，
+> 可以直接改、有版本控制兜底；重建走 `core/gripper/orb_slam_src/build.sh`。
+> `core/gripper/native/ORB-SLAM/Examples/fays/` 下那份是**陈旧副本，不是构建源**
+> （只留一份 `SUPERSEDED.md`），改它不会进二进制——它连 2026-09-11 的崩溃修复
+> 都没有。`online/` 里那份现在是**同一份源码的第二份拷贝**，不再是真源。
 
 - **与 `slam_trajectory` 同序等长**，下标即配对，所以某帧有 N 个轨迹点就有 N
   个时刻。这要求时刻列表**锁步**累积：某个点没有戳时补 `0`（= 未知，与

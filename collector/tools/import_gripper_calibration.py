@@ -21,11 +21,14 @@ collector 按现场探到的产品序列号拼文件名去找这两个文件：
     venv/bin/python tools/import_gripper_calibration.py --generate [序列号]
     venv/bin/python tools/import_gripper_calibration.py 3500000262300099
     venv/bin/python tools/import_gripper_calibration.py 3500000262300099 \
-        --source /path/to/online [--force] [--dry-run]
+        --source /path/to/上位机根目录 [--force] [--dry-run]
 
---source 缺省为本仓库的 online/（上位机根目录）。也可以直接指向
-上位机产物目录、或同时含两个 yaml 的任意目录。同名目标已存在且内容
-不同时必须加 --force，旧文件先备份成 *.bak_<时间戳>。
+--source 缺省为本仓库的 core/gripper/native/。原先缺省指向 online/，但那个
+目录整个不上传（.gitignore），在交付包里等于没有缺省值。native/ 与它内部形状
+一致（gripper_version1/fays_config/ + dist/fays_opencv48/ 两个兄弟目录），
+_layouts 的第一条布局照样命中；也可以直接指向产物目录、或同时含两个 yaml 的
+任意目录。同名目标已存在且内容不同时必须加 --force，旧文件先备份成
+*.bak_<时间戳>。
 
 注意：native/ 不入库（见 .gitignore），标定只存在本机；换机器/重装要
 重新生成或重新搬一次。
@@ -48,7 +51,9 @@ if _ROOT not in sys.path:
 from core.gripper import paths  # noqa: E402
 
 _SERIAL_PATTERN = re.compile(r"^[A-Za-z0-9._:-]+$")
-_DEFAULT_SOURCE = os.path.join(_ROOT, "online")
+# 上位机根目录的缺省值。online/ 已在 .gitignore 里（整个目录不上传），指向它
+# 等于在交付包里没有缺省；native/ 的形状与它一致，_source_paths 的第一条布局命中。
+_DEFAULT_SOURCE = os.path.join(_ROOT, "core", "gripper", "native")
 
 
 def _target_paths(serial):
@@ -331,7 +336,9 @@ def main(argv=None):
              "--generate 时可省略，省略则用现场唯一那台")
     parser.add_argument(
         "--source", default=_DEFAULT_SOURCE,
-        help=f"上位机根目录（缺省 {_DEFAULT_SOURCE}）")
+        help=f"上位机根目录（缺省 {_DEFAULT_SOURCE}）。"
+             "缺省值就是本机的 native/，即目标自己 —— 只做一致性核对（会打印"
+             "「已是最新，跳过」）。真要搬运别的机器上的标定，必须显式给 --source。")
     parser.add_argument(
         "--list", action="store_true", help="列出 native/ 已覆盖的序列号")
     parser.add_argument(

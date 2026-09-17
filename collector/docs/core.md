@@ -971,6 +971,7 @@ rows/cols 映射，点击"选择"弹出子级 `MatrixConfigDialog` 逐部位编�
 | `core/gripper/fays_runtime.py` | FaysSense S80M 的单一运行时配置来源 + 探针/运行双 env（`build_fays_probe_env` / `build_fays_runtime_env`） |
 | `core/gripper/fays_serial_probe.py` | 经官方 VI Kit SDK 读 S80M 产品序列号 |
 | `core/gripper/bridge.py` | 夹爪 rig 与主程序的 Qt 桥（后台线程采集 → 队列信号回主线程） |
+| `core/gripper/decxin_exposure.py` | 连夹爪时把 DECXIN 的曝光/白平衡写回自动档（状态存在相机机身里、逐台各一份） |
 | `core/gripper/affinity.py` | 夹爪 CPU 预留（主进程掩码收窄 + raw 流接收线程专用核） |
 | `core/gripper/tactile_process_worker.py` | Sightac 触觉计算子进程 |
 | `core/gripper/slam/` | 桥接进程控制器与 stdout 协议解析（`process_controller.py` / `protocol.py`） |
@@ -1027,6 +1028,47 @@ IMU 五项（`NoiseGyro`/`NoiseAcc`/`GyroWalk`/`AccWalk`/`Frequency`）由
 与 `ui/main_window.py`（后台线程跑 `refresh_calibration`）调用；离线回归见
 `tools/tests/test_gripper_calibration_autogen.py`（重定向全部产物目录 + 假厂商
 二进制，含真机产物逐字节回放）。
+
+### core/gripper/decxin_exposure.py
+
+**作用（v1.3.9）**：连夹爪时把 DECXIN（`1bcf:2d4f`）的 `auto_exposure` /
+`white_balance_automatic` 写回**自动档**。画面暗的根因不在采集链，而在**相机
+机身**：`auto_exposure=1`（手动）+ AWB=0 会让它停在出厂 `156/10000`（1.56%
+积分）的积分上，而这个状态**存在相机里、跨重插保持**且逐台各存一份 ⇒ 修好
+001 那台对 002 一点用都没有。主程序侧此前没有任何写入口（libuvc 服务只有
+`uvc_set_altsetting_override`；`core/camera.py` 的 `_apply_exposure_to` 走的是
+OpenCV 通用相机路径，夹爪 RGB 不经过），所以过去每接一台新夹爪都要人工
+`v4l2-ctl -c auto_exposure=3,white_balance_automatic=1` 一次；本模块就是那次
+人工动作的自动化。
+
+**关键接口**：
+
+| 名称 | 签名要点 | 作用 |
+|---|---|---|
+| `normalize_decxin_exposure` | `(*, logger=None, dry_run=False, max_index=16)` | 枚举所有 `1bcf:2d4f` 的物理设备并逐台归一化，返回 `List[DecxinExposureResult]` |
+| `DecxinExposureResult` | dataclass | 单台结论：`node/usb_path/state/before/after/detail`；`state ∈ ok/changed/partial/dry-run/skipped/unsupported`，property `healthy`（`skipped`/`unsupported` 之外都算自动曝光在生效——`partial` 只差白平衡色偏，亮度契约仍成立） |
+| `python -m core.gripper.decxin_exposure` | `[--dry-run] [--max-index N]` | 手工入口，**必须先停主程序**（见下） |
+
+**关键数据**：纯 `fcntl.ioctl`，不依赖 `v4l2-ctl`，不申请缓冲、不取流（`O_NONBLOCK`
+打开，设备正在收流时也不会卡在 open）。ioctl 号由 `<asm-generic/ioctl.h>` 的
+`_IOWR` 宏现算，期望值 `VIDIOC_G_CTRL=0xC008561B` / `VIDIOC_S_CTRL=0xC008561C` /
+`VIDIOC_QUERYCTRL=0xC0445624` 在 `tools/tests/test_decxin_exposure.py` 里钉死。
+写之前先 `VIDIOC_QUERYCTRL` 读菜单：DECXIN 是 1=手动 / 3=光圈优先、**没有 0**
+（写 0 得 EINVAL），故候选序 **3/0/2**（与 `core/camera.py` 的候选表同源，那边
+0 在前是因为通用相机大多吃 0）。**已是自动档则一个字节都不写**。相机按 **USB
+拓扑路径**分组而非节点号/`by-id`（节点号随重插漂移，同型号两台的 `by-id` 链接
+会被顶掉并在重枚举时翻转，见 `core/device_detector.py` 的 `by_id_ambiguous`），
+一台 DECXIN 的主/次两个节点都留着，哪个带控制项靠 probe 试出来。**只认
+`1bcf:2d4f`**：Sightac 触觉相机（`0c45:636f`）绝不触碰——它的 AE=1/AWB=0/
+WBTmp=6500/ET=312 是原厂存储态。异常一律不外泄：枚举失败＝空结果 + 日志。
+
+**调用关系**：由 `core/gripper/bridge.py` 的 `_open_run` 在拿到 Fays 租约之后、
+`UvcCameraServiceManager.select()` **之前**调用 —— 这个顺序是硬要求：服务一
+启动设备就被 libusb 拿走、内核 uvcvideo 被 `libusb_detach_kernel_driver()` 摘
+掉、`/dev/videoN` 随之注销，之后所有 V4L2 ioctl 都会失败（这就是「要停掉主程序
+才能 v4l2-ctl」的由来）。纯附加动作，异常只记日志（画面暗是小事，连不上是
+大事）。离线回归 `tools/tests/test_decxin_exposure.py`，含「调用点必须早于
+`select()`」的静态断言。
 
 ## 数据流
 

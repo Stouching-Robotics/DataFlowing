@@ -1,0 +1,55 @@
+%YAML:1.0
+# FS-VI80-S80M serial 3500000261980088
+# Rectification and IMU extrinsics generated from the device's factory dump.
+# IMU noise/walk/rate are read directly from VI Kit 3.5.2 with
+# FAYS_VIK_GetCalibrationParam for this serial; DumpCalib omits these fields.
+
+File.version: "1.0"
+Camera.type: "Rectified"
+
+Camera1.fx: 183.162223432427
+Camera1.fy: 183.162223432427
+Camera1.cx: 262.490887158935
+Camera1.cy: 200.986123194008
+
+Stereo.b: 0.079931103580
+Stereo.ThDepth: 40.0
+
+IMU.T_b_c1: !!opencv-matrix
+  rows: 4
+  cols: 4
+  dt: f
+  data: [ -0.999898672,  0.007639643, -0.012015149, -0.000026860,
+          -0.008018117, -0.999462962,  0.031773645,  0.010005580,
+          -0.011765957,  0.031866763,  0.999422848, -0.016045161,
+           0.000000000,  0.000000000,  0.000000000,  1.000000000 ]
+
+IMU.NoiseGyro: 0.000806373747996
+IMU.NoiseAcc: 0.007187583066766
+IMU.GyroWalk: 0.000008271973275
+IMU.AccWalk: 0.000071624945534
+IMU.Frequency: 1035.0
+IMU.InsertKFsWhenLost: 1
+
+Camera.width: 640
+Camera.height: 400
+Camera.fps: 30
+Camera.RGB: 1
+
+ORBextractor.nFeatures: 1400
+ORBextractor.scaleFactor: 1.1
+ORBextractor.nLevels: 8
+ORBextractor.iniThFAST: 20
+ORBextractor.minThFAST: 7
+
+Viewer.KeyFrameSize: 0.05
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.08
+Viewer.CameraLineWidth: 3.0
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -0.7
+Viewer.ViewpointZ: -3.5
+Viewer.ViewpointF: 500.0
+Viewer.imageViewScale: 1.0

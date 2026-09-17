@@ -38,6 +38,7 @@ from PyQt5.QtCore import QObject, pyqtSignal
 from config import settings
 from core.s80m_manager import s80m_drop_watch, STEREO_DROP_ALERT_RATE
 from core.gripper import affinity, paths
+from core.gripper.decxin_exposure import normalize_decxin_exposure
 from core.gripper.fays_runtime import build_fays_runtime_env
 from core.gripper.fays_single import SingleFaysLease
 from core.gripper.control.grip_state import GripState
@@ -357,6 +358,17 @@ class GripperBridge(QObject):
                 "usb={:g}M".format(
                     selected["product_serial"],
                     selected["usb_speed_mbps"]))
+
+            # DECXIN 曝光归一化：**必须赶在 libuvc 服务启动之前**。曝光值存在
+            # 相机机身里（跨重插保持），哪台被写成手动档就哪台永久偏暗，而
+            # 服务一开就把设备从 libusb 拿走、内核 uvcvideo 被摘掉，之后
+            # /dev/videoN 的 V4L2 ioctl 全部失效 —— 所以「上次修好 001」救不了
+            # 新接上的 002，只能在每次连接时对**所有**接着的 DECXIN 写一遍。
+            # 纯附加动作，失败只记日志：画面暗是小事，连不上是大事。
+            try:
+                normalize_decxin_exposure(logger=self._log)
+            except Exception as exc:                     # noqa: BLE001
+                self._log(f"[DECXIN] 曝光归一化异常（忽略）: {exc}")
 
             self._uvc = UvcCameraServiceManager(logger=self._log)
             self._reservation = self._uvc.select(lambda: assignment)

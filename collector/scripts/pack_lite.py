@@ -98,7 +98,13 @@ _PLATFORM_BOUND_NAMES = ("native", "sightac_sdk")
 #   FaysSense_VI_Kit_Release/ 同理全是运行时资产。
 _PAYLOAD_SKIP_SUFFIX = (".pyc", ".a")
 _PAYLOAD_SKIP_INFIX = (".pre_", ".bak_")     # 现场备份：xxx.pre_rebuild_2026...
-_PAYLOAD_SKIP_NAMES = ("__pycache__", "camera_service_src")
+# 构建源，不是运行时资产：两个包都不收（和 camera_service_src 同理）。
+# orb_slam_src/ 是 2026-09-17 从 online/ 搬进 core/ 的 ORB-SLAM 真源，只在开发机
+# 上 build.sh 用；运行时一切路径都由 core/gripper/paths.py 指到 native/。
+# ★ 必须排除而不是「反正没 ELF」：它下面有 build/、dist/fays_opencv48/bin/、
+#   ORB-SLAM/{lib,Thirdparty/*/lib}/ 这些树内构建产物（全是 ELF），收进 Windows
+#   包会直接撞上下面的「零 ELF」硬断言 sys.exit(1)。
+_PAYLOAD_SKIP_NAMES = ("__pycache__", "camera_service_src", "orb_slam_src")
 
 
 def _gripper_ignore_factory(src_root: str, windows: bool,

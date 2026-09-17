@@ -1,0 +1,2 @@
+# frame dt_frame_ms track_ms imu_backlog imu_in
+# dt_frame=相邻帧时间间隔(ms)  track=Track耗时(ms)  imu_backlog=IMU积压数  imu_in=帧间IMU条数

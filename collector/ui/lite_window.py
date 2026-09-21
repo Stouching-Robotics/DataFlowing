@@ -54,9 +54,10 @@ from core.device_detector import (DeviceInfo, _list_ble_devices,
                                   usb_glove_prefer_side)
 from core.encoder_probe import list_working_ffmpegs
 from core.gripper_codec import (describe_gripper_matrix_spec,
-                               encode_gripper_force_matrix)
+                               encode_gripper_force_matrix,
+                               encode_gripper_force_matrix_array)
 from core.helpers import delete_pooled_episode, format_duration
-from core.pipeline import CameraPipeline
+from core.pipeline import CameraPipeline, frame_drop_total
 from core.uploader import UploadManager
 
 # USB 手套引擎模块级导入（pyserial 在白名单依赖内）：缺依赖时在
@@ -1060,6 +1061,10 @@ class LiteWindow(QMainWindow):
             self._pipeline.register_external_source(sid, (h, w), fps=30.0)
             entry["_video_registered"].add(sid)
             self._log(tr("[夹爪] RGB 外部帧源已注册 {}x{}@30", w, h))
+        # v1.3.10 派发滞后（lite 无 FPS 标签，这是主线程卡顿的唯一读数）
+        bridge = entry.get("bridge")
+        if bridge is not None and hw_ns and hw_ns > 0:
+            bridge.note_rgb_dispatch_lag(time.monotonic_ns() - int(hw_ns))
         if self._pipeline.is_recording:
             self._pipeline.write_external_frame(
                 sid, frame.copy(), hardware_ns=hw_ns)
@@ -1208,7 +1213,9 @@ class LiteWindow(QMainWindow):
                     continue
                 capture_ns, matrix = stamped
                 try:
-                    encoded = encode_gripper_force_matrix(matrix, spec)
+                    # _array 版：不 .tolist()（内存 15× 差 + 收尾持 GIL，
+                    # 见 core/gripper_codec.py 的实测说明）
+                    encoded = encode_gripper_force_matrix_array(matrix, spec)
                 except Exception as exc:
                     self._log(tr("[夹爪] 力矩阵编码失败 ({}): {}",
                                  side, exc))
@@ -1295,6 +1302,7 @@ class LiteWindow(QMainWindow):
             bridge = entry.get("bridge")
             if bridge is not None:
                 bridge.reset_stereo_drop_watch()
+                bridge.reset_rgb_quality()
                 bridge.clear_trajectory()
 
     def _start_recording(self):
@@ -1324,7 +1332,51 @@ class LiteWindow(QMainWindow):
 
     def _stop_recording(self):
         if self._pipeline.is_recording:
+            # v1.3.10 采集侧的账必须在 finish 之前并入（口径同 main_window
+            # ._stop_all：那一步快照 drop_stats 并回写 writer 元数据）
+            self._gripper_rgb_quality_inject()
             self._pipeline.finish_recording("")
+            self._gripper_rgb_quality_summary()
+
+    def _gripper_rgb_quality_inject(self):
+        """夹具 RGB 采集侧计数并入本段统计（finish_recording 之前）。"""
+        for entry in self._gripper_entries():
+            bridge = entry.get("bridge")
+            if bridge is None:
+                continue
+            stem = entry["slot_map"]["rgb"]
+            snap = bridge.rgb_quality_snapshot(time.monotonic_ns())
+            self._pipeline.note_drop_stats(
+                {f"{stem}_{key}": value for key, value in snap.items()})
+
+    def _gripper_rgb_quality_summary(self):
+        """夹具 RGB 异常汇总（finish 之后；写线程已 join，读数才稳定）。"""
+        stats = self._pipeline.last_drop_stats
+        for entry in self._gripper_entries():
+            bridge = entry.get("bridge")
+            if bridge is None:
+                continue
+            stem = entry["slot_map"]["rgb"]
+            snap = bridge.rgb_quality_snapshot(time.monotonic_ns())
+            gap_ms = stats.get(f"{stem}_gap_ms", 0)
+            if gap_ms:
+                self._log(tr(
+                    "[夹爪] RGB 帧空洞 {}ms（最大 {}ms / {} 次）——采集侧同步"
+                    "停摆 {}ms、重连 {} 次；视频该处静止后跳变",
+                    gap_ms, stats.get(f"{stem}_gap_max_ms", 0),
+                    stats.get(f"{stem}_gap_count", 0),
+                    snap["readfail_max_ms"], snap["reconnect_count"]))
+            if snap["overwrite_count"]:
+                self._log(tr("[夹爪] RGB 覆盖 {} 帧——该段跳帧但与编码器无关",
+                             snap["overwrite_count"]))
+            # v1.3.11（L0-2）：原始流接收侧；快照取在 finish 之后 ⇒ 含本次
+            # 收尾窗口（口径同 main_window._gripper_rgb_quality_summary）
+            if snap["raw_recv_stall_count"] or snap["raw_reconnect_count"]:
+                self._log(tr(
+                    "[夹爪] 原始流接收：最长停顿 {}ms、停顿 {} 次、重连 {} 次"
+                    "（含本次收尾）——服务端队列 ≈0.53s 满即主动断开",
+                    snap["raw_recv_gap_max_ms"], snap["raw_recv_stall_count"],
+                    snap["raw_reconnect_count"]))
 
     def _abort_recording(self):
         if self._pipeline.is_recording:
@@ -1357,7 +1409,8 @@ class LiteWindow(QMainWindow):
         episode_index = getattr(self._pipeline, "last_episode_index", 0) or 0
         frames = sum(self._pipeline.last_recording_frames.values())
         drops = self._pipeline.last_drop_stats
-        total_drops = sum(v for k, v in drops.items() if k != "imu_overflow")
+        # v1.3.10：帧数口径走 frame_drop_total（时长/次数类诊断键不算丢帧）
+        total_drops = frame_drop_total(drops)
         self._log(tr("[录制] ■ 完成: {}（{} 帧 / 丢帧 {} / episode {}）",
                      os.path.basename(session_path) if session_path else "-",
                      frames, total_drops, episode_index))

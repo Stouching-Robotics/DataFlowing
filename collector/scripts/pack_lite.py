@@ -156,6 +156,15 @@ MODULE_FILES = {
         "gripper_codec.py",
         # core/gripper/bridge.py:39 顶层 import 它的双目丢帧窗口常量
         "s80m_manager.py",
+        # core/pipeline.py:19 顶层 import 的帧空洞看门狗（录制侧与
+        # tools/audit_frame_gaps.py 审计脚本共用同一份口径）
+        "frame_gap.py",
+        # core/pipeline.py / core/egodata_writer.py 顶层 import 的收尾
+        # 分段计时（v1.3.11 L0-1；漏了它 lite 一 import 就 ModuleNotFoundError）
+        "timing.py",
+        # main_lite.py 顶层 import 的启动环境守卫（用错解释器时给出启动
+        # 指引再退出；零第三方依赖，必须在包里）
+        "startup_guard.py",
     ],
 }
 
@@ -322,9 +331,9 @@ def _verify_payload(out_dir: str, target: str) -> None:
         if not os.path.isfile(os.path.join(out_dir, "core",
                                            "gripper_codec.py")):
             absent.append("core/gripper_codec.py")
-        if not os.path.isfile(os.path.join(out_dir, "core",
-                                           "s80m_manager.py")):
-            absent.append("core/s80m_manager.py")
+        for name in ("s80m_manager.py", "frame_gap.py"):
+            if not os.path.isfile(os.path.join(out_dir, "core", name)):
+                absent.append(f"core/{name}")
         if absent:
             print(f"[失败] Windows 包缺夹爪代码（两个包都收 .py）: {absent}")
             sys.exit(1)

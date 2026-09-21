@@ -109,6 +109,9 @@ config/ 是应用全局配置、国际化与版本号所在的配置包。版本
 | 录制编码 | `ENCODER_X265_MIN_FPS_RATIO` | float | 1.5 | x265 达标门槛 = 录制帧率 × 该比值（不达标回退 x264） |
 | 录制编码 | `IMU_PENDING_MAX_SAMPLES` | int | 18000 | 双目 IMU 防丢缓冲上限（约 1 分钟 @300Hz；队列满时丢帧保 IMU） |
 | 录制编码 | `DROP_WARN_RATIO` / `DROP_WARN_MIN_COUNT` | float / int | 0.01 / 30 | 录制结束丢帧告警阈值（占比 1% 或 30 帧） |
+| 帧空洞 | `GRIPPER_RGB_GAP_MIN_MS` | int | 100 | 计入「空洞」的**间隔**下限（≈3 帧；实测正常帧距 29.9~37.5ms）。审计脚本 `--min-gap-ms` 默认同值 |
+| 帧空洞 | `GRIPPER_RGB_GAP_ALERT_MS` | int | 500 | 落盘侧空洞闭合时的当场告警门槛（低于此只落 parquet 不打日志） |
+| 帧空洞 | `GRIPPER_RGB_STALL_ALERT_MS` / `GRIPPER_RGB_STALL_REPEAT_S` | int / float | 1000 / 30.0 | 采集侧 `read()` 失败连击的告警门槛与持续故障的重复告警间隔（进入一次 / 限频 / 恢复一次） |
 | 任务服务 | `TASK_POLL_INTERVAL_MS` / `TASK_API_URL` / `DEVICE_NAME` | int / str / str | 30000 / `SERVER_URL` / `"EGO_001"` | 轮询间隔 / API 地址 / 设备认领名 |
 | 手部追踪 | `HAND_TRACK_ENABLED` / `HAND_TRACK_MODE` | bool / str | `False` / `"glove"` | 需 ultralytics；`"glove"` 黑色手套 / `"bare"` 裸手 |
 | 手部追踪 | `HAND_DETECTION_DIR` / `HAND_DET_MODEL` / `HAND_MEDIAPIPE_MODEL` | str | 根下 `tools/hand_detection` / 其内 `best.pt` / `hand_landmarker.task` | YOLO 手套模型 / MediaPipe 裸手模型 |

@@ -39,6 +39,7 @@ from core.encoder_probe import (select_encoder, list_working_ffmpegs,
                                 find_depth_12bit_ffmpeg)
 from core.depth_codec import quantize_depth, depth_video_encoder_args
 from core.calibration import StereoCalibration
+from core.timing import Stopwatch
 from core.helpers import (
     task_dir_of, episode_chunk_file, POOLED_CHUNK_SIZE,
     pooled_video_path, pooled_video_dir,
@@ -102,6 +103,38 @@ def _episode_rows_table(rows: List[dict]) -> pa.Table:
     for name, typ, default in _EPISODE_COLUMNS:
         arrs[name] = pa.array([r.get(name, default) for r in rows], type=typ)
     return pa.table(arrs, schema=_EPISODE_SCHEMA)
+
+
+def _list_column(values: List[object], item: pa.DataType) -> pa.Array:
+    """变长行 → `list<item>`，行内元素摊平进**一条 numpy 缓冲**再包成 arrow。
+
+    行可以是 ndarray（生产路径：`encode_gripper_force_matrix_array`）或
+    Python list（历史调用方 / 测试），两者结果逐位相同。
+
+    **为什么不用 `pa.array([...], pa.list_(item))`**：pyarrow 对 Python
+    list 逐值装箱，实测 185 帧 × 187500 点 = **538ms 且全程持 GIL**，
+    正好在收尾窗口把原始流接收线程挡在 `recv()` 外——服务端 16 包队列
+    （≈0.53s）填满即主动 close，这就是「点停止就断链」的成因
+    （2026-09-18：55 次「完成」54 次断链；中止路径不写 parquet ⇒ 0/11）。
+    走缓冲后同一列 13.5ms、最长停摆 3.6ms（噪声底 0.9ms）。
+
+    语义与旧实现**逐位一致**：缺键行与空行都落成**空 list**（不是 null），
+    行序、行长、元素值都不变——由
+    `tools/tests/test_force_matrix_schema_contract.py` 对着冻结的旧表达式钉死。
+    """
+    np_dtype = np.float32 if item == pa.float32() else np.int16
+    sizes = np.fromiter((len(v) for v in values), np.int32, len(values))
+    offsets = np.zeros(len(values) + 1, np.int32)
+    np.cumsum(sizes, out=offsets[1:])
+    flat = np.empty(int(offsets[-1]), np_dtype)
+    pos = 0
+    for v in values:
+        n = v.size if isinstance(v, np.ndarray) else len(v)
+        if n:
+            # 同型 ndarray ⇒ memcpy；list ⇒ numpy 的逐值转换（老调用方照旧）
+            flat[pos:pos + n] = v
+            pos += n
+    return pa.ListArray.from_arrays(offsets, pa.array(flat))
 
 
 def _read_episode_rows(path: str) -> List[dict]:
@@ -183,6 +216,9 @@ class EgoDataWriter(QObject):
         self._depth_enabled: bool = False        # 业务开关：是否录制深度
         self._encoder_choice = None              # 本会话编码器选择（v1.0.9）
         self._drop_stats: Dict[str, int] = {}    # 丢帧统计（pipeline 注入）
+        # v1.3.11（L0-1）收尾各段耗时（flush/parquet/meta，毫秒）——
+        # 由 end_episode / abort_episode 写入，pipeline 读它打一行日志
+        self.finalize_timing: Dict[str, int] = {}
         # abort 清理清单：本 episode 落盘的最终文件 + 创建的目录
         self._created_files: List[str] = []
         self._created_dirs: List[str] = []
@@ -595,15 +631,24 @@ class EgoDataWriter(QObject):
     def _note_matrix_dtype(self, key: str, value) -> None:
         """按首帧实际元素类型锁定该力矩阵列的落盘规格。
 
-        int16 行差分编码走 np.int16.tolist() → Python int；
-        float32 原值走 np.float32.tolist() → Python float。
+        int16 行差分编码 → np.int16（或 Python int）；
+        float32 原值 → np.float32（或 Python float）。
         首帧空样本时不定型（后续有样本再定）；定型后若类型变了说明
         录制中切了开关——parquet 一列只能一种类型，这里显式报错而不是
         让 pyarrow 抛难懂的转换异常。
+
+        ★ 两个坑（2026-09-18 换成 ndarray 交付时踩出来的）：
+          * **判空不能用 `if not value`**：对真数组 numpy 抛
+            「truth value of an array is ambiguous」——每帧都炸；
+          * **`isinstance(np.float32(x), float)` 是 False**：只看 Python
+            标量会把 float32 档判成 int16 ⇒ 列类型错 + 精度真丢（不报错，
+            是悄悄截断）。所以必须同时认 numpy 标量家族。
         """
-        if not value:
+        n = value.size if isinstance(value, np.ndarray) else len(value)
+        if n == 0:
             return                            # 空样本：不定型
-        dtype = "float32" if isinstance(value[0], float) else "int16"
+        first = value.reshape(-1)[0] if isinstance(value, np.ndarray) else value[0]
+        dtype = "float32" if isinstance(first, (float, np.floating)) else "int16"
         prev = self._matrix_dtype.get(key)
         if prev is None:
             self._matrix_dtype[key] = dtype
@@ -768,14 +813,24 @@ class EgoDataWriter(QObject):
     # ── 结束 ──────────────────────────────────────────
 
     def end_episode(self):
-        """关闭 ffmpeg，写出全部文件（顺序见 docs/data.md 写入流程）。"""
+        """关闭 ffmpeg，写出全部文件（顺序见 docs/data.md 写入流程）。
+
+        v1.3.11（L0-1）：各段耗时写进 ``finalize_timing`` 供 pipeline 打一行
+        ——停止瞬间的断链（raw 接收线程被 GIL 挡住）与位姿发散（SLAM 分区
+        的 SMT 兄弟核被抢）都发生在这个窗口里，先量再修（见 core/timing.py）。
+        """
+        sw = Stopwatch()
         self._close_ffmpeg()
+        sw.lap("flush")
         self._write_data_parquet()
+        sw.lap("parquet")
         self._append_episode_row()
         self._write_info_json()
         self._merge_stats()
         self._write_tasks_jsonl()
         clear_recycled_episode(self._task_dir)
+        sw.lap("meta")
+        self.finalize_timing = sw.snapshot()
         self.episode_finished.emit(self._task_dir)
 
     @property
@@ -801,7 +856,12 @@ class EgoDataWriter(QObject):
         if getattr(self, "_episode_index", 0) > 0 and getattr(
                 self, "_task_dir", ""):
             mark_recycled_episode(self._task_dir, self._episode_index)
+        # 中止路径同样收尾 ffmpeg（不做 parquet/meta）——这一段的耗时与
+        # 「完成」路径对比，正是 2026-09-18 那条判据的来源：中止 0/6 断链
+        sw = Stopwatch()
         self._close_ffmpeg()
+        sw.lap("flush")
+        self.finalize_timing = sw.snapshot()
         for p in list(self._created_files):
             try:
                 if os.path.isfile(p):
@@ -937,8 +997,8 @@ class EgoDataWriter(QObject):
             elif key.endswith("_force_matrix"):
                 item = (pa.float32() if self._matrix_dtype.get(key) == "float32"
                         else pa.int16())
-                cols[name] = pa.array(
-                    [r.get(name, []) for r in rows], pa.list_(item))
+                cols[name] = _list_column(
+                    [r.get(name, []) for r in rows], item)
             elif key.endswith("slam_trajectory"):
                 cols[name] = pa.array(
                     [r.get(name, []) for r in rows], pa.list_(pa.float64()))

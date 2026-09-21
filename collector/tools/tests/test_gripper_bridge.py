@@ -34,6 +34,7 @@ import numpy as np
 from PyQt5.QtCore import QCoreApplication
 
 from core.gripper.bridge import GripperBridge
+from core.pipeline import is_frame_drop_key
 
 FAILS = []
 
@@ -375,7 +376,9 @@ def main():
         board_fields={"ST": "1", "PCT": "50"}, updated="10:00:00"))
     bridge._latest_force["left"] = (0.0, 0.0, 400.0)
     bridge._on_grip_check()
-    _pump_until(lambda: len(stats["state"]) >= 1)
+    # 上一句 board 更新已经投过一条 state（fz 还是触觉那次的 88）：必须等
+    # 力检查这条也到，否则断言拿到的是在途中的前一条（曾随机假红）
+    _pump_until(lambda: stats["state"] and stats["state"][-1]["fz"] == 400.0)
     check(len(stats["state"]) >= 1
           and stats["state"][-1]["gripped"] is True
           and abs(stats["state"][-1]["pct"] - 50.0) < 0.01
@@ -561,6 +564,105 @@ def main():
     bridge8._events.put(("_stop", ()))
     bridge8._emitter.join(timeout=2.0)
     bridge8.deleteLater()
+
+    print("── 8. RGB 采集质量仪表（v1.3.10）──")
+    bridge9, fakes9 = _run_open_flow()
+    cam9 = fakes9["reservation"].camera("decxin")._camera
+    logs9 = []
+    bridge9.log.connect(logs9.append)
+    frame9 = np.zeros((8, 8, 3), dtype=np.uint8)
+
+    # 假相机的 read 是全速返回帧的（真机 30fps）：本节一开始就让它处于
+    # 「读不到帧」态，覆盖/滞后这类峰值口径才不被每秒几十万帧的噪声淹没
+    state9 = {"failing": True}
+
+    def _read9():
+        if state9["failing"]:
+            return False, None
+        return True, frame9
+
+    cam9.read.side_effect = _read9
+    time.sleep(0.05)                  # 等采集线程在途的那一帧落地（失败侧 sleep 5ms）
+
+    # 相机对象的 reconnect_count 是跨段累计的：基座在 reset 时取
+    cam9.reconnect_count = 5
+    bridge9.reset_rgb_quality()
+    snap9 = bridge9.rgb_quality_snapshot()
+    check(all(v == 0 for v in snap9.values()),
+          f"reset 后全零: {snap9}")
+    check(snap9["reconnect_count"] == 0, "跨段累计的重连数减掉基座后归零")
+
+    # 停摆侧的现场：最近传输错误 + 停摆期间重连了 2 次（真机上重连发生在
+    # 停摆起初，故在等告警之前就置好；告警行报的是此刻的段内增量）
+    cam9.last_transport_error = "timed out"
+    cam9.reconnect_count = 7
+
+    # emit 滞后：payload[1] 是采集时刻，投一帧 300ms 前的 → 峰值显出来。
+    # 采集线程此时在读失败（上面 sleep 已让它停手），这帧不会被顶掉
+    bridge9._post_frame("rgb", frame9, time.monotonic_ns() - 300_000_000)
+    _pump_until(lambda: bridge9.rgb_quality_snapshot()["emit_lag_max_ms"] >= 250)
+    check(bridge9.rgb_quality_snapshot()["emit_lag_max_ms"] >= 250,
+          f"emit 峰值滞后可读: {bridge9.rgb_quality_snapshot()['emit_lag_max_ms']}ms")
+
+    # 派发滞后（主线程侧，峰值语义）
+    bridge9.note_rgb_dispatch_lag(12_000_000)
+    bridge9.note_rgb_dispatch_lag(210_000_000)
+    bridge9.note_rgb_dispatch_lag(3_000_000)
+    snap9 = bridge9.rgb_quality_snapshot()
+    check(snap9["dispatch_lag_max_ms"] == 210, "派发滞后取峰值（小的不覆盖）")
+
+    # 采集侧停摆：read() 连续失败超门槛(1s) → 进入行 + 恢复行各一行
+    _pump_until(lambda: any("RGB 采集停摆" in m for m in logs9), timeout=3.0)
+    alerts = [m for m in logs9 if "RGB 采集停摆" in m]
+    check(len(alerts) == 1,
+          f"停摆超门槛打一行（实际 {len(alerts)} 行）: {alerts[:1]}")
+    if alerts:
+        check("重连 2 次" in alerts[0] and "最近错误: timed out" in alerts[0],
+              "进入行含段内重连增量与最近传输错误")
+    state9["failing"] = False
+    _pump_until(lambda: any("已恢复" in m for m in logs9), timeout=3.0)
+    recovered = [m for m in logs9 if "已恢复" in m]
+    check(len(recovered) == 1,
+          f"恢复打一行（实际 {len(recovered)} 行）: {recovered[:1]}")
+    if recovered:
+        check("本段视频该处会有一段静止" in recovered[0],
+              "恢复行点明视频后果（用户看得到的现象）")
+        check("最近错误: timed out" in recovered[0],
+              "恢复行仍带停摆期间的错误（read 成功会清掉相机侧字段）")
+    snap9 = bridge9.rgb_quality_snapshot()
+    check(snap9["readfail_max_ms"] >= 1000 and snap9["readfail_stall_count"] == 1,
+          f"停摆时长入账: {snap9['readfail_max_ms']}ms / "
+          f"{snap9['readfail_stall_count']} 次")
+    check(snap9["reconnect_count"] == 2,
+          f"重连只报段内增量 5→7: {snap9['reconnect_count']}")
+    check(bridge9.rgb_quality_snapshot()["readfail_ms"]
+          >= snap9["readfail_max_ms"],
+          "累计停摆 ≥ 单次峰值")
+    # 结构约束（比逐键真值表更能防漂移）：快照的**每一个**键都会被 UI 原样
+    # 加前缀塞进 drop_stats，所以任何一个不以 _ms/_count 结尾的键都会被
+    # frame_drop_total 当成帧数加进「丢帧统计」——2026-09-18 的 readfail_*
+    # 就差点这么漏进去（当时的键名 _episodes 不在后缀表里）。
+    bad = [k for k in snap9 if is_frame_drop_key(k)]
+    check(not bad, f"快照键全部不算帧数（越界的键: {bad}）")
+
+    # 覆盖计数：emitter 停掉后事件没人取，pending 恒挂 → 连投两帧必覆盖一帧。
+    # 采集线程必须先停下——它自由跑时每秒投几十万帧，计数没有确定基线
+    state9["failing"] = True
+    time.sleep(0.05)                  # 让在途的一次成功投递落地（失败侧 sleep 5ms）
+    bridge9._events.put(("_stop", ()))
+    bridge9._emitter.join(timeout=2.0)
+    before9 = bridge9.rgb_quality_snapshot()["overwrite_count"]
+    bridge9._post_frame("rgb", frame9, time.monotonic_ns())
+    bridge9._post_frame("rgb", frame9, time.monotonic_ns())
+    check(bridge9.rgb_quality_snapshot()["overwrite_count"] == before9 + 1,
+          f"latest-wins 覆盖记账（{before9} → "
+          f"{bridge9.rgb_quality_snapshot()['overwrite_count']}）")
+    # 非 rgb 帧槽覆盖不记进 RGB 仪表（双目有自己的空桶看门狗）
+    bridge9._post_frame("stereo_left", frame9, time.monotonic_ns())
+    bridge9._post_frame("stereo_left", frame9, time.monotonic_ns())
+    check(bridge9.rgb_quality_snapshot()["overwrite_count"] == before9 + 1,
+          "双目槽的覆盖不混进 RGB 仪表")
+    bridge9.deleteLater()
 
     if FAILS:
         print(f"\nFAILED: {len(FAILS)}")

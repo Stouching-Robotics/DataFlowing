@@ -31,7 +31,8 @@ from core.database import db
 from core.recording_repository import RecordingRepo
 from core.recording_record import RecordingRecord
 from core.task_record import load_tasks, increment_task_completed
-from core.pipeline import CameraPipeline
+from core.pipeline import CameraPipeline, frame_drop_total, is_frame_drop_key
+from core.timing import Stopwatch
 from core.camera import CameraState
 from core.device_detector import DeviceScanner
 from ui.camera_grid import CameraGrid
@@ -118,8 +119,12 @@ except ImportError:
 # 力矩阵编码与规格文案是**落盘契约**（家在 core/gripper_codec.py —— 极简版
 # lite 也要录夹爪，而 lite 的导入黑名单不含本模块，契约不能存两份）。
 # 这里 re-export，本窗口与 tools/tests/test_gripper_matrix_*.py 沿用旧路径。
+# 落盘路径改用 _array 版（list 版是它的皮，逐位同值）：list 每帧
+# 187500 个 Python 对象的代价是 5.4MB/帧内存（ndarray 0.36MB，15×）
+# 与收尾 538ms 持 GIL——见 core/gripper_codec.py 里的实测说明。
 from core.gripper_codec import (  # noqa: E402,F401
-    encode_gripper_force_matrix, describe_gripper_matrix_spec)
+    encode_gripper_force_matrix, encode_gripper_force_matrix_array,
+    describe_gripper_matrix_spec)
 
 
 class MainWindow(QMainWindow):
@@ -1698,6 +1703,12 @@ class MainWindow(QMainWindow):
             self._pipeline.register_external_source(sid, (h, w), fps=30.0)
             entry["_video_registered"].add(sid)
             self._log(tr("[夹爪] RGB 外部帧源已注册 {}x{}@30", w, h))
+        # v1.3.10 派发滞后：帧从采集到进到主线程花了多久。主线程卡顿本身
+        # 不产生视频空洞（帧还在 FIFO 里排着），但会顶掉 latest-wins 帧槽
+        # ——两个数分开记才分得清是 emitter 堵了还是 GUI 堵了
+        bridge = entry.get("bridge")
+        if bridge is not None and hw_ns and hw_ns > 0:
+            bridge.note_rgb_dispatch_lag(time.monotonic_ns() - int(hw_ns))
         self._note_frame_arrival(sid)
         widget = self.grid.camera_widget(sid)
         if widget:
@@ -1872,7 +1883,10 @@ class MainWindow(QMainWindow):
                     continue
                 capture_ns, matrix = stamped
                 try:
-                    encoded = encode_gripper_force_matrix(matrix, spec)
+                    # _array 版：不 .tolist()。整段行都攥着这份编码，
+                    # 每帧 5.4MB(Python 对象) vs 0.36MB(ndarray) —— 录长了
+                    # 会把内存吃光引发换页停顿（2026-09-20 实测 16.7GB）
+                    encoded = encode_gripper_force_matrix_array(matrix, spec)
                 except Exception as exc:
                     self._log(tr("[夹爪] 力矩阵编码失败 ({}): {}",
                                  side, exc))
@@ -2085,6 +2099,68 @@ class MainWindow(QMainWindow):
                              entry.get("label", "UMI"),
                              dropped, dropped / elapsed * 100))
 
+    def _gripper_rgb_quality_inject(self):
+        """录制结束（finish_recording **之前**）：把采集侧计数并入本段统计。
+
+        与双目空桶（_gripper_drop_summary）并列：那边看「SLAM 取帧够不够
+        30fps」，这里看「相机 → 视频文件」这条链卡在哪一层。落盘侧的空洞
+        由 pipeline 自己在 finish 时注入，两边合起来才是完整的一条链。
+        """
+        for entry in self._gripper_entries():
+            bridge = entry.get("bridge")
+            if bridge is None:
+                continue
+            stem = entry["slot_map"]["rgb"]
+            snap = bridge.rgb_quality_snapshot(time.monotonic_ns())
+            self._pipeline.note_drop_stats(
+                {f"{stem}_{key}": value for key, value in snap.items()})
+
+    def _gripper_rgb_quality_summary(self):
+        """录制结束（finish_recording 之后）：有异常才打日志。
+
+        把同一次故障在**两层**的证据对在同一行里——这正是 2026-09-18 那次
+        episode-099 事后最缺的东西：视频里一段静止、所有计数器都是 0，
+        只能猜是相机没帧、emit 槽覆盖还是 GUI 卡顿。
+        """
+        stats = self._pipeline.last_drop_stats
+        for entry in self._gripper_entries():
+            bridge = entry.get("bridge")
+            if bridge is None:
+                continue
+            stem = entry["slot_map"]["rgb"]
+            label = entry.get("label", "UMI")
+            snap = bridge.rgb_quality_snapshot(time.monotonic_ns())
+            gap_ms = stats.get(f"{stem}_gap_ms", 0)
+            if gap_ms:
+                self._log(tr(
+                    "[夹爪] {} RGB 帧空洞 {}ms（最大 {}ms / {} 次）——采集侧"
+                    "同步停摆 {}ms、重连 {} 次；视频该处静止后跳变",
+                    label, gap_ms, stats.get(f"{stem}_gap_max_ms", 0),
+                    stats.get(f"{stem}_gap_count", 0),
+                    snap["readfail_max_ms"], snap["reconnect_count"]))
+            elif snap["readfail_max_ms"]:
+                self._log(tr(
+                    "[夹爪] {} RGB 采集停摆 {}ms（重连 {} 次）但未造成视频"
+                    "空洞——队列缓冲吸收了",
+                    label, snap["readfail_max_ms"], snap["reconnect_count"]))
+            if (snap["overwrite_count"] or snap["emit_lag_max_ms"]
+                    or snap["dispatch_lag_max_ms"]):
+                self._log(tr(
+                    "[夹爪] {} RGB 覆盖 {} 帧（emit 峰值 {}ms、派发峰值 {}ms）"
+                    "——该段跳帧但与编码器无关",
+                    label, snap["overwrite_count"], snap["emit_lag_max_ms"],
+                    snap["dispatch_lag_max_ms"]))
+            # v1.3.11（L0-2）：原始流接收侧。快照取在 finish 之后 ⇒ 含
+            # **本次收尾窗口**（落盘那段持 GIL 的时间），这正是要抓的数；
+            # parquet 里的 raw_recv_* 键注入在 finish 之前，只覆盖录制期，
+            # 两者口径不同、别互相校对
+            if snap["raw_recv_stall_count"] or snap["raw_reconnect_count"]:
+                self._log(tr(
+                    "[夹爪] {} 原始流接收：最长停顿 {}ms、停顿 {} 次、"
+                    "重连 {} 次（含本次收尾）——服务端队列 ≈0.53s 满即主动断开",
+                    label, snap["raw_recv_gap_max_ms"],
+                    snap["raw_recv_stall_count"], snap["raw_reconnect_count"]))
+
     def _build_device_meta(self) -> list:
         """按注册表构建录制设备信息（口径在 core.device_manager）。"""
         return self._device_manager.build_device_meta()
@@ -2135,6 +2211,7 @@ class MainWindow(QMainWindow):
                 bridge = entry.get("bridge")
                 if bridge is not None:
                     bridge.reset_stereo_drop_watch()
+                    bridge.reset_rgb_quality()
                     bridge.clear_trajectory()
                 pose_view = entry.get("pose_view")
                 if pose_view is not None:
@@ -2149,7 +2226,12 @@ class MainWindow(QMainWindow):
         if self._pipeline.is_recording:
             self._s80m_drop_summary()
             self._gripper_drop_summary()
+            # v1.3.10 采集侧的账必须在 finish_recording 之前并入：那一步会
+            # 快照 drop_stats 并回写 writer 元数据，之后补就只进日志不进 parquet
+            self._gripper_rgb_quality_inject()
             self._pipeline.finish_recording("")
+            # finish 之后写线程已 join，落盘侧空洞的读数才稳定（无锁）
+            self._gripper_rgb_quality_summary()
             self._reset_s80m_record_state()
 
     def _abort_recording(self):
@@ -2231,6 +2313,10 @@ class MainWindow(QMainWindow):
 
     def _on_recording_finished(self, slot_id: str, session_path: str):
         """录制完成——保存历史记录并更新任务进度。"""
+        # v1.3.11（L0-1）：Phase D 在 GUI 线程做重活（摘要读 parquet +
+        # sqlite + 历史列表刷新最多 100 个 parquet），同样持 GIL。它发生在
+        # 「■ 录制完成」之后、不是断链窗口，但要量出来才知道值不值得后置
+        sw = Stopwatch()
         self._device_panel.set_locked(False)
         episode_index = getattr(
             self._pipeline, "last_episode_index", 0) or 0
@@ -2261,6 +2347,7 @@ class MainWindow(QMainWindow):
             )
             RecordingRepo.save(rec)
             self._refresh_history()
+            sw.lap("summary")   # 落盘摘要 + 历史库 + 历史列表刷新
 
             # ── 更新任务进度（按录制完成次数持久化，删除文件不回退）──
             # 归属以实际录制用的任务名为准（pipeline._task_name = 录制启动
@@ -2290,12 +2377,19 @@ class MainWindow(QMainWindow):
             drops = self._pipeline.last_drop_stats
             if drops:
                 imu_ov = drops.get("imu_overflow", 0)
+                # v1.3.10：帧数口径改用 is_frame_drop_key（时长/次数类键
+                # 不再混进这个数，否则用户会被指去调编码器）；诊断键另起
+                # 一行，名字就写明它们不是帧数
                 frame_drops = {k: v for k, v in drops.items()
-                               if k != "imu_overflow"}
-                total = sum(frame_drops.values())
+                               if is_frame_drop_key(k)}
+                total = frame_drop_total(drops)
                 if total or imu_ov:
                     self._log(tr("[录制] 丢帧统计: {} (IMU 溢出 {})",
                                  frame_drops, imu_ov))
+                diag = {k: v for k, v in drops.items()
+                        if not is_frame_drop_key(k) and k != "imu_overflow"}
+                if diag:
+                    self._log(tr("[录制] 采集/落盘诊断: {}（非帧数）", diag))
                 frames = sum(self._pipeline.last_recording_frames.values())
                 if (total > settings.DROP_WARN_MIN_COUNT
                         or (frames and total / frames > settings.DROP_WARN_RATIO)):
@@ -2328,6 +2422,9 @@ class MainWindow(QMainWindow):
         if settings.HAND_TRACK_ENABLED and _HAND_PROC_AVAILABLE and session_path:
             QTimer.singleShot(500, lambda: self._process_hand_keypoints(
                 session_path, silent=True, episode_index=episode_index))
+
+        self._log(tr("[录制] 收尾(UI) phase_d={}ms（其中摘要/历史 {}ms）",
+                     sw.lap("phase_d"), sw.snapshot().get("summary", 0)))
 
     def _on_recording_aborted(self, slot_id: str):
         """异常停止。"""

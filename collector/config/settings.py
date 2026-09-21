@@ -56,6 +56,14 @@ IMU_PENDING_MAX_SAMPLES = 18000    # 双目 IMU 防丢缓冲上限（~1 分钟 @
 DROP_WARN_RATIO = 0.01             # 丢帧提示阈值：丢帧 > 总帧数×该比例 或
 DROP_WARN_MIN_COUNT = 30           #   丢帧 > 该帧数 → 提示换编码器/降分辨率
 
+# ── 夹爪 RGB 帧空洞可见化（v1.3.10；见 docs/postmortem_trajectory_and_rgb.md）──
+# 2026-09-18 episode-099 丢了 4.68s 而所有计数器都是 0：静默丢帧无处可查。
+# 这四个值是「同一现象在三层各自的门槛」，改动前先读那一节。
+GRIPPER_RGB_GAP_MIN_MS = 100       # 计入「空洞」的**间隔**下限（≈3 帧）；实测正常帧距 29.9~37.5ms
+GRIPPER_RGB_GAP_ALERT_MS = 500     # 空洞闭合时当场告警门槛（低于此只落 parquet 不打日志）
+GRIPPER_RGB_STALL_ALERT_MS = 1000  # read() 失败连击告警门槛（停摆多久才开始喊）
+GRIPPER_RGB_STALL_REPEAT_S = 30.0  # 持续故障的重复告警间隔（进入一次 / 限频 / 恢复一次）
+
 # ── 设备命名规范 (EgoData 标准) ───────────────────────
 # 命名约定: <位置>_<模态>
 #   头戴左目: head_left_rgb

@@ -248,7 +248,7 @@ data/recordings/                          # 录制根目录（settings.RECORDING
 | `created_at` | 创建时间（Unix 时间） |
 | `codebase_version` | 程序版本（`config.__version__`） |
 | `video_codec` | v1.0.9：本会话视频编码信息 `{encoder, codec, crf, ffmpeg, selected_by, probe}`；`selected_by` = `"auto"` 或显式指定名，`probe` = 录前速度探针结果（x265 路径） |
-| `drop_stats` | v1.0.9：录制丢帧统计 `{队列键: 丢弃帧数}` + `imu_overflow`（IMU 防丢缓冲溢出次数）；无丢帧时全为 0 |
+| `drop_stats` | v1.0.9：录制丢帧统计 `{队列键: 丢弃帧数}` + `imu_overflow`（IMU 防丢缓冲溢出次数）；无丢帧时全为 0。v1.3.10 起另有**带后缀**的键：`*_ms`（时长）/ `*_count`（次数）——夹爪 RGB 的帧空洞与采集侧仪表（`<槽>_gap_ms`、`_readfail_ms`、`_overwrite_count`、`_emit_lag_max_ms`、`_dispatch_lag_max_ms` 等）。**`_ms`/`_count` 后缀的键不是帧数**，加总帧数前必须过 `core.pipeline.is_frame_drop_key`（见 [file_format](file_format.md) §7.3、[postmortem](postmortem_trajectory_and_rgb.md) §4.6） |
 
 ### 4.4 `timestamps.json`
 
@@ -274,7 +274,7 @@ data/recordings/                          # 录制根目录（settings.RECORDING
   | `timestamp` | float32 | 会话时间（秒） |
   | `task_index` | int64 | 任务序号（当前固定 0） |
   | `observation.<sensor>` | list<float32, 256> | 传感器读数（16×16 展平；缺帧补零） |
-  | `observation.left_hand_pose` / `observation.right_hand_pose` | list<float32, 63> | 手部关键点（21 关节 × xyz；录制时占位为零，后处理回填） |
+  | `observation.left_hand_pose` / `observation.right_hand_pose` | list<float32, 63> | 手部关键点（21 关节 × xyz；USB 手套录制时由 IMU 实时解算回填，无手套或未解算时为零占位） |
   | `action` | list<float32, 1> | 动作（当前固定 `[0.0]`） |
   | `status.<device_id>` | string | 该设备在本帧的连接状态（默认 `"connected"`） |
 

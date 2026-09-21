@@ -15,6 +15,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -24,6 +25,7 @@ import sys
 
 import cv2
 
+from config import settings
 from core.gripper.fays_runtime import PROJECT_ROOT
 from core.gripper.paths import CAMERA_MODE_STATE_DIR
 from core.gripper.runtime.device_access import device_access_guard
@@ -87,6 +89,129 @@ def _native_env(binary=None):
     )
     env["LD_LIBRARY_PATH"] = os.pathsep.join(dict.fromkeys(directories))
     return env
+
+
+# camera-service 原生日志留档（契约与 core/gripper/fays_single.py 的
+# _archive_native_log 逐字同构）。runtime_dir 在 _stop_entry_locked 里被
+# rmtree，而相机侧的停摆/降档/USB 复位**只**写这个文件：客户端日志里只有
+# 「read 失败」，服务侧「为什么」全在这里。2026-09-18 排查 episode-099 那
+# 4.68 秒空洞时就撞在这上面——一次干净退出的会话（正是最该留证据的那种）
+# 其日志随目录一起没了。留档放 logs/ 下的独立子目录，免得和 main.log 混放。
+_CAMERA_LOG_NAME = "camera-service.log"
+_CAMERA_LOG_ARCHIVE_KEEP = 20
+
+# 摘录只认「出事」的行。健康的每 5 秒 stats 行（fps_in=… dropped=… queue=…）
+# 与退出时的汇总行（… retries=… stalls=… usb_resets=…）**都不匹配**——拿裸
+# 的 dropped / stalls= 当判据的话，摘录在任何一次正常会话里都非空，等于噪声。
+# 刻意不收裸 [LIBUVC-QUIRK]：其中 `xfers=` 那行是每次成功开流都会打的（它正是
+# 判断真实档位的权威行），收进来同样破坏「健康即静默」。出了事要看那些行时，
+# 存档文件里有全文。
+_CAMERA_LOG_EVIDENCE = re.compile("|".join([
+    r"stream stalled: no frame for",
+    r"restarting UVC stream",
+    r"rebuilding libusb context after stall",
+    r"usb reset: rc=",
+    r"cannot reset device",
+    r"stalls at alt=",
+    r"stalls but alt=",
+    r"failed opens at alt=",
+    r"failed opens but alt=",
+    r"remembered altsetting=",
+    r"open failed:",
+    r"unavailable",              # 设备打不开 / 档位端点不可用（含 QUIRK 那条）
+    r"cannot apply altsetting override",
+    r"negotiation failed",
+    r"startup failed",
+    r"uvc_start_streaming failed",
+    r"uvc_init failed",
+    r"output write failed",
+    r"dropped incomplete MJPEG",
+    r"thread creation failed",
+    r"收尾超时",
+]))
+
+
+def _camera_log_archive_dir():
+    return os.path.join(settings.LOGS_DIR, "camera_service")
+
+
+def _prune_camera_log_archive():
+    """只保留最近 _CAMERA_LOG_ARCHIVE_KEEP 份留档（长期运行不撑爆磁盘）。"""
+    directory = _camera_log_archive_dir()
+    try:
+        names = sorted(
+            name for name in os.listdir(directory)
+            if name.endswith(_CAMERA_LOG_NAME)
+        )
+    except OSError:
+        return
+    # 文件名前缀是 %Y%m%d_%H%M%S，字典序即时间序，不必逐个 stat
+    for name in names[:-_CAMERA_LOG_ARCHIVE_KEEP]:
+        try:
+            os.unlink(os.path.join(directory, name))
+        except OSError:
+            pass
+
+
+def _camera_log_evidence(path, limit=6):
+    """摘出告警行（取最后 ``limit`` 行；健康的会话返回空表）。
+
+    取末尾而不是开头：一次会话里最要紧的是**结束前**发生了什么。
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as stream:
+            lines = [line.rstrip() for line in stream]
+    except OSError:
+        return []
+    hits = [line for line in lines if _CAMERA_LOG_EVIDENCE.search(line)]
+    return hits[-limit:]
+
+
+def _archive_camera_log(runtime_dir, tag, logger=None):
+    """把即将被 rmtree 的 camera-service.log 拷进 logs/camera_service/。
+
+    纯取证手段：任何失败只记一行日志，绝不打断 _stop_entry_locked 的清理
+    （留档丢了是少一份证据，清理半途而废会留下脏的运行时目录）。成功且无
+    告警时**不出声**——健康会话的日志只在存档目录里，不占 main.log。
+    """
+    source = os.path.join(str(runtime_dir), _CAMERA_LOG_NAME)
+    if not os.path.isfile(source):
+        return None
+    key = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(tag or "unknown"))
+    try:
+        directory = _camera_log_archive_dir()
+        os.makedirs(directory, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        target = os.path.join(directory, f"{stamp}_{key}_{_CAMERA_LOG_NAME}")
+        sequence = 0
+        while os.path.exists(target):
+            # 同一秒里同一台相机停了两次（服务起来就崩、连着两轮）：留档的
+            # 意义就是「证据不会没了」，所以宁可多一个后缀也不覆盖已有证据
+            sequence += 1
+            target = os.path.join(
+                directory, f"{stamp}_{key}-{sequence}_{_CAMERA_LOG_NAME}")
+        shutil.copy2(source, target)
+    except OSError as exc:
+        if logger is not None:
+            logger(f"[UVC] camera-service 日志留档失败: {exc}")
+        return None
+    _prune_camera_log_archive()
+    return target
+
+
+def _service_tag(records):
+    """留档文件名里的身份：``bus<bus>-port<外口路径>``。
+
+    同一台机器上双 rig 靠总线号 + 外口路径区分；取不到时退化成 unknown，
+    只是文件名不好认，不影响留档本身。
+    """
+    record = records[0] if records else {}
+    try:
+        bus = int(record.get("bus"))
+    except (TypeError, ValueError):
+        bus = 0
+    port = str(record.get("outer_path") or "").strip() or "unknown"
+    return f"bus{bus}-port{port}"
 
 
 class UvcCameraServiceError(RuntimeError):
@@ -776,6 +901,9 @@ class UvcCameraServiceManager:
                         "runtime_dir": runtime_dir,
                         "sockets": sockets,
                         "leases": 0,
+                        # 留档文件名里的身份（停服务时 runtime_dir 连同日志
+                        # 一起删，所以要在这里先把「这是哪台相机」定下来）
+                        "tag": _service_tag(records),
                     }
                     self._logger(
                         "[UVC] libusb/libuvc camera-service started: "
@@ -891,8 +1019,7 @@ class UvcCameraServiceManager:
             on_release=lambda sig=signature: self._release_lease(sig),
         )
 
-    @staticmethod
-    def _stop_entry_locked(entry):
+    def _stop_entry_locked(self, entry):
         process = entry["process"]
         runtime_dir = entry["runtime_dir"]
         if process is not None and process.poll() is None:
@@ -902,6 +1029,17 @@ class UvcCameraServiceManager:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=2.0)
+        # 先留档再删：camera-service.log 只活在这个目录里。停摆/降档/复位
+        # 的「为什么」全在服务侧日志里，客户端只能看到 read() 失败
+        target = _archive_camera_log(
+            runtime_dir, entry.get("tag"), self._logger)
+        if target is not None:
+            evidence = _camera_log_evidence(target)
+            if evidence:
+                self._logger("[UVC] camera-service 告警摘录:")
+                for line in evidence:
+                    self._logger(f"  {line}")
+                self._logger(f"[UVC] camera-service 日志留档: {target}")
         shutil.rmtree(runtime_dir, ignore_errors=True)
 
     def _stop_locked(self):

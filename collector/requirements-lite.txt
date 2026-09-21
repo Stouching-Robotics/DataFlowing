@@ -1,6 +1,6 @@
 # 极简采集版依赖白名单（start_lite.bat / start_lite.sh 使用）
 # 只保留: 连接设备 → 采集(parquet+MP4) → 上传。
-# 不含回放/登录/任务页/骨架解算(toolkit/scipy/loguru/pydantic)/pyvista 等重型依赖。
+# 不含回放/登录/任务页/骨架解算(toolkit/scipy/loguru/pydantic/polars)/pyvista 等重型依赖。
 # 注意: imageio-ffmpeg(约 77MB) 提供静态 ffmpeg 二进制(含 x264)，
 #       客户机无 PATH ffmpeg 时录制链必需；装有系统 ffmpeg 的机器可删掉本行。
 # UVC 摄像头零新增依赖: Linux 走 sysfs 枚举；Windows 无 pygrabber 时

@@ -14,6 +14,8 @@ import threading
 import time
 from typing import Callable, Optional
 
+from core.gripper.rgb_quality import RawStallWatch
+
 
 RAW_HEADER = struct.Struct("<6I3Q4i2hi2I")
 RAW_STREAM_MAGIC = 0x53544F55
@@ -25,6 +27,14 @@ IMU_PAYLOAD_SIZE = 48
 # 断线重连节奏：1s 一次尝试，累计 60s 仍连不上才算致命错误
 RECONNECT_ATTEMPT_INTERVAL_S = 1.0
 RECONNECT_TOTAL_TIMEOUT_S = 60.0
+
+# 接收停滞口径（L0-2，v1.3.11）。正常包间隔 ~1ms 级（双目 30fps + IMU
+# 1kHz 交替），100ms 已不可能是调度抖动；服务端队列 16 包 ≈0.53s 满即
+# 主动 close，所以 300ms 是「差一档就要被断链」的预警位——不是为了当场
+# 做什么，而是把「客户端到底卡了多久」变成 parquet 里的一个数。
+RAW_STALL_NS = 100_000_000        # >100ms 计入停滞
+RAW_STALL_ALERT_NS = 300_000_000  # ≥300ms 打一行（去抖）
+RAW_STALL_REPEAT_NS = 5_000_000_000
 
 
 class FaysRawStreamError(RuntimeError):
@@ -60,6 +70,12 @@ class FaysRawStreamClient:
         self._last_stereo_sequence: Optional[int] = None
         self._last_stereo_timestamp_ns = 0
         self._reconnect_count = 0
+        # L0-2：接收侧停滞仪表（录制开始时由 bridge 归零，见 reset_stall_watch）
+        self._stall_watch = RawStallWatch(
+            stall_ns=RAW_STALL_NS,
+            alert_ns=RAW_STALL_ALERT_NS,
+            repeat_ns=RAW_STALL_REPEAT_NS,
+        )
         self.imu_packets = 0
         self.stereo_packets = 0
         self.connected = threading.Event()
@@ -70,6 +86,19 @@ class FaysRawStreamClient:
     def alive(self) -> bool:
         thread = self._thread
         return bool(thread and thread.is_alive())
+
+    @property
+    def reconnect_count(self) -> int:
+        """累计重连次数（跨录制段累计；bridge 在录制开始时取基座）。"""
+        return int(self._reconnect_count)
+
+    def reset_stall_watch(self) -> None:
+        """录制开始归零接收停滞读数（与 bridge.reset_rgb_quality 同一时刻）。"""
+        self._stall_watch.reset()
+
+    def stall_snapshot(self) -> dict:
+        """接收停滞读数（ns/count；线程安全，主线程在录制结束时读）。"""
+        return self._stall_watch.snapshot()
 
     def start(self) -> None:
         with self._lock:
@@ -194,6 +223,10 @@ class FaysRawStreamClient:
             payload = self._recv_exact(sock, payload_size)
             if len(payload) != payload_size:
                 break
+            # L0-2：包间隔停滞（在 kind 分支之前记，双目/IMU 一起算）。
+            # 只记账 + 超门槛时递出一行日志，绝不在这里阻塞接收循环
+            for line in self._stall_watch.note_recv(time.monotonic_ns()):
+                self._logger(line)
             if kind == RAW_PACKET_IMU:
                 if payload_size != IMU_PAYLOAD_SIZE:
                     raise FaysRawStreamError(

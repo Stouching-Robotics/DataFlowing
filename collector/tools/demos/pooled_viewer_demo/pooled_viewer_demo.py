@@ -19,10 +19,10 @@
        无深度流时 RGB 占满整行）
     2) 手套触觉面板（厂商 Glove-test V1.4 glove_qt_visualizer.py 的
        PressureMatrixCanvas 的 OpenCV 移植：只留 16x16 分区网格，
-       手形热图 PressureHandCanvas 移植已按用户要求移除；单面板优先
-       显示左手，会话无左手数据时回退显示右手；可选"触觉基线校正"
-       （每传感器中位基线，默认开）。与骨架面板在同一行左右并排
-       （触觉左、骨架右））
+       手形热图 PressureHandCanvas 移植已按用户要求移除；左右手各一个
+       面板并排、左手在左，面板角上标传感器名；会话只有单手数据时
+       就只剩那一个面板；可选"触觉基线校正"（每传感器中位基线，
+       默认开）。与骨架面板在同一行左右并排（触觉左、骨架右））
     3) 手部骨架面板（工具包 apps/rendering/replay.py 的 MANO 21 关键点
        骨骼渲染，observation.{left,right}_hand_pose，左 | 右；
        视角 = 标定预览初始视角（calibration_pose_preview 的
@@ -31,7 +31,8 @@
        在画面左侧）；相机距离与居中点按整段数据一次计算，播放中
        相机完全不动）
     4) 手套 IMU 面板（16 个 BNO055 的四元数姿态，每格画旋转后的 XYZ 轴；
-       有骨架数据时默认隐藏，"显示 IMU 四元数"勾选可切出）
+       每传感器一个面板左右并排、标题带传感器名；有骨架数据时默认隐藏，
+       "显示 IMU 四元数"勾选可切出）
 
 parquet 稀疏列约定（与 core/egodata_writer 一致）:
     observation.<sensor>            fixed_size_list<float32,256>  16x16 触觉
@@ -562,6 +563,10 @@ class PooledSession:
 #   （右手传感列 [10,9,8,6,4] / 左手 [10,9,8,6]），列 0-2 为空。
 # 面板内拇指统一朝左：网格 x 轴 = 矩阵行，左手翻转、右手不翻
 # （与厂商网格恰好对调，因左手行序与厂商 README 假定相反）。
+# 手指分区框与图例里的 x 区间也按各手的行序给（左手 拇指 x=13..15、
+# 小指 x=1..3），所以两只手的拇指框都落在画面左侧 —— 2026-09-20 修正：
+# 旧写法按「两只手拇指都在行 1-3」摆框，左手的五个框整体对调了
+# （分区框/图例与 Spare 框、掌心框口径不一致）。
 
 _TACTILE_FINGER_NAMES = ("Thumb", "Index", "Middle", "Ring", "Pinky")
 # 手指区分区框颜色（厂商 _FINGER_COLORS，BGR）
@@ -670,8 +675,10 @@ def render_tactile_grid(matrix, side="right", baseline=None,
 
     finger_height = 4.0 * cell
     for group in range(5):
-        start_x = 1 + group * 3
-        display_start_x = start_x if not flip else 16 - (start_x + 3)
+        # 框要扣在该手指的行落点上：右手行序 1..15（拇指 1-3），左手镜像
+        # （拇指 15-13）→ 翻转后第 g 组落在显示列 3g..3g+2，拇指仍在画面
+        # 左侧。与下面 Spare 框（行 0）、掌心框（行 1..15）同一口径。
+        display_start_x = 3 * group if flip else 1 + group * 3
         x0 = int(grid_left + display_start_x * cell)
         y0 = int(grid_top)
         cv2.rectangle(img, (x0 + 2, y0 + 2),
@@ -699,7 +706,8 @@ def render_tactile_grid(matrix, side="right", baseline=None,
             cv2.rectangle(img, (legend_left, top),
                           (legend_left + 15, top + 15),
                           _TACTILE_FINGER_BGR[group], -1)
-            cv2.putText(img, f"{_TACTILE_FINGER_NAMES[group]}: x={1+group*3}..{3+group*3}",
+            row_lo = 13 - 3 * group if flip else 1 + 3 * group
+            cv2.putText(img, f"{_TACTILE_FINGER_NAMES[group]}: x={row_lo}..{row_lo+2}",
                         (legend_left + 23, top + 13),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, _TACTILE_TEXT, 1, cv2.LINE_AA)
         cv2.putText(img, "Spare col: x=0, y=3..15",
@@ -785,19 +793,22 @@ def _arrow(img, p0, p1, color, thick=2):
     ], np.int32), color, cv2.LINE_AA)
 
 
-def render_imu_panel(quats, valid, w=880, h=240):
+def render_imu_panel(quats, valid, w=880, h=240, label=""):
     """手套 IMU 姿态面板：16 个 BNO055 各画一格，格内为旋转后的 XYZ 轴。
 
     Args:
         quats: (16,4) float XYZW
         valid: (16,) bool
+        label: 传感器名（左右手各一个面板时用于区分，空则不显示）
     Returns:
         BGR 画布
     """
     canvas = np.full((h, w, 3), 18, np.uint8)
     n_valid = int(np.count_nonzero(valid))
-    cv2.putText(canvas,
-                f"Glove IMU 四元数姿态 ({n_valid}/16 sensors)",
+    title = "Glove IMU 四元数姿态"
+    if label:
+        title += f" [{label}]"
+    cv2.putText(canvas, f"{title} ({n_valid}/16 sensors)",
                 (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                 (220, 220, 220), 1, cv2.LINE_AA)
 
@@ -1171,13 +1182,11 @@ class DemoWindow(QMainWindow):
         self.has_depth = self.data.has_depth()
         self.has_imu = self.data.has_imu()
         self.has_kpts = self.data.has_keypoints()
-        # 触觉面板只留一个：优先左手；会话没有左手数据时回退显示右手
-        # （恢复双面板时改回 sorted(self.data.tactile) 即可）
-        lefts = [s for s in sorted(self.data.tactile)
-                 if glove_side_of(s) == "left"]
-        rights = [s for s in sorted(self.data.tactile)
-                  if glove_side_of(s) == "right"]
-        self.tactile_sensors = lefts or rights
+        # 触觉面板：左手套 + 右手套各一个并排（左手在左，与骨架面板
+        # 同序）；会话只有单手数据时就只剩那一个面板
+        self.tactile_sensors = sorted(
+            self.data.tactile,
+            key=lambda s: (0 if glove_side_of(s) == "left" else 1, s))
         self._update_panel_visibility()
         # 骨架相机：距离照工具包 replay.py 按整段数据空间尺度一次拟合、
         # 居中点按整段数据各帧包围盒中心的中位数一次计算，播放中全部
@@ -1205,10 +1214,9 @@ class DemoWindow(QMainWindow):
                 "触觉列存在但全为零\n"
                 "（手套触觉传感器无数据，检查硬件/连接后重新录制）")
         elif self.tactile_sensors:
-            # 单面板回退：优先左手，无左手时显示右手
-            side = glove_side_of(self.tactile_sensors[0])
-            self.lbl_hand.setText(
-                f"Glove Tactile Matrix Panel ({side.upper()})")
+            sides = "+".join(glove_side_of(s).upper()
+                             for s in self.tactile_sensors)
+            self.lbl_hand.setText(f"Glove Tactile Matrix Panel ({sides})")
         else:
             self.lbl_hand.setText("Glove Tactile Matrix Panel")
         self.chk_imu.setVisible(self.has_imu and self.has_kpts)
@@ -1236,13 +1244,7 @@ class DemoWindow(QMainWindow):
                 f"深度 {len(self.data.depth_videos)} 路"]
         if self.data.skipped_depth:
             bits.append(f"深度流无法解码: {', '.join(self.data.skipped_depth)}")
-        tbit = f"触觉 {', '.join(self.data.tactile) or '无'}"
-        if self.tactile_sensors and glove_side_of(
-                self.tactile_sensors[0]) == "right":
-            tbit += "（无左手数据，显示右手）"
-        elif len(self.data.tactile) > len(self.tactile_sensors):
-            tbit += "（暂只显示左手）"
-        bits.append(tbit)
+        bits.append(f"触觉 {', '.join(self.data.tactile) or '无'}")
         bits.append(f"骨架 {', '.join(self.data.keypoints) or '无'}"
                     if self.has_kpts else "骨架 无")
         bits.append(f"IMU {', '.join(self.data.imu_quats) or '无'}")
@@ -1251,7 +1253,7 @@ class DemoWindow(QMainWindow):
     def _update_panel_visibility(self):
         """骨架/IMU 面板可见性：有骨架时骨架优先，IMU 降为勾选兜底。
 
-        触觉面板显示 self.tactile_sensors（优先左手，无左手回退右手）。
+        触觉面板显示 self.tactile_sensors（左右手各一个，左手在左）。
         """
         self.lbl_depth.setVisible(self.has_depth)
         # 有触觉列就保留面板（正常渲染网格；全零时显示说明占位），
@@ -1426,8 +1428,8 @@ class DemoWindow(QMainWindow):
             self._show_image(self.lbl_depth, top)
 
         # 2) 手套触觉面板（厂商 Glove-test 移植：只留分区网格，手形热图
-        #    已按用户要求移除；优先显示左手，会话无左手数据时回退显示
-        #    右手；全零数据时不渲染、保留 load 里的占位说明文字）
+        #    已按用户要求移除；左右手各一个面板并排（左手在左），面板角
+        #    上标传感器名；全零数据时不渲染、保留 load 里的占位说明文字）
         sensors = self.tactile_sensors
         if self.has_tactile and sensors:
             h = max(self.lbl_hand.height() or 560, 240)
@@ -1447,9 +1449,15 @@ class DemoWindow(QMainWindow):
             bhv = panels[0]
             for p in panels[1:]:
                 bhv = np.hstack([bhv, pad24, p])
-            put_label(bhv, "Tactile Matrix (Glove-test V1.4 port)", (12, 26),
-                      (0, 255, 255))
-            self._show_image(self.lbl_hand, bhv)
+            # 传感器名另起一条顶栏：两个网格左右手单看分不出是谁的，
+            # 但网格本身画得满（左上角压着坐标数字、中上是 "X -> …"），
+            # 名字写进面板里必然盖掉东西 —— 往上加带子，标签区还有余量
+            head = np.full((26, bhv.shape[1], 3), 15, np.uint8)
+            for k, sn in enumerate(sensors):
+                cv2.putText(head, sn, (k * (int(per_w) + 24) + 10, 19),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255),
+                            1, cv2.LINE_AA)
+            self._show_image(self.lbl_hand, np.vstack([head, bhv]))
 
         # 3) 手部骨架面板（MANO 21 关键点，每侧一个面板横排；视角 =
         #    标定预览初始视角 yaw=186.8°/elev=-44.3°/roll=1.5° + 每侧
@@ -1477,24 +1485,28 @@ class DemoWindow(QMainWindow):
                 out = panels[0]
             self._show_image(self.lbl_skel, out)
 
-        # 4) IMU 姿态面板（每传感器一个面板，竖排；有骨架时默认隐藏）
+        # 4) IMU 姿态面板（每传感器一个面板，左右并排，标题带传感器名；
+        #    有骨架时默认隐藏。IMU 面板是宽扁的，两个竖排会被面板高度
+        #    压到看不清，横排刚好铺满）
         imu_sensors = sorted(self.data.imu_quats)
         if self.has_imu and imu_sensors and self.lbl_imu.isVisible():
+            h = max(self.lbl_imu.height() or 240, 200)
             w = self.lbl_imu.width() or 880
-            h = self.lbl_imu.height() or 240
+            per_w = max((w - 4 * (len(imu_sensors) - 1)) // len(imu_sensors),
+                        480)
             panels = []
             for sn in imu_sensors:
                 quats, valid = self.data.imu_frame(sn, idx)
-                panels.append(render_imu_panel(
-                    quats, valid, w=max(w, 640), h=max(h, 200)))
+                panels.append(render_imu_panel(quats, valid, w=int(per_w),
+                                               h=h, label=sn))
             if len(panels) > 1:
-                pad = np.full((4, max(w, 640), 3), 10, np.uint8)
+                pad = np.full((h, 4, 3), 10, np.uint8)
                 out = panels[0]
                 for p in panels[1:]:
-                    out = np.vstack([out, pad, p])
-                self._show_image(self.lbl_imu, out)
+                    out = np.hstack([out, pad, p])
             else:
-                self._show_image(self.lbl_imu, panels[0])
+                out = panels[0]
+            self._show_image(self.lbl_imu, out)
 
     @staticmethod
     def _show_image(label, bgr):

@@ -55,6 +55,7 @@ from core.gripper.devices.tactile_process_manager import (
 )
 from core.gripper.devices.uvc_camera_service import UvcCameraServiceManager
 from core.gripper.recording.fays_raw_client import FaysRawStreamClient
+from core.gripper.rgb_quality import MaxLagWatch, RgbReadWatch
 from core.gripper.slam.process_controller import (
     SlamProcessController,
     SlamState,
@@ -216,6 +217,19 @@ class GripperBridge(QObject):
             "elapsed": 0,
             "alerted": False,
         }
+        # v1.3.10 RGB 采集质量仪表（core/gripper/rgb_quality.py）：面板上
+        # 「RGB 卡住/跳帧」此前完全无迹可查——_rgb_run 的 read() 失败分支
+        # 不记不报、latest-wins 覆盖连一行日志都没有，事后只能看到视频里
+        # 一段静止，说不清是相机侧没帧、emit 侧没人取还是 GUI 主线程卡了。
+        # 三层各记一份，判据见 docs/postmortem_trajectory_and_rgb.md。
+        self._rgb_watch = RgbReadWatch(
+            alert_ns=settings.GRIPPER_RGB_STALL_ALERT_MS * 1_000_000,
+            repeat_ns=int(settings.GRIPPER_RGB_STALL_REPEAT_S * 1e9))
+        self._rgb_emit_lag = MaxLagWatch("emit")
+        self._rgb_dispatch_lag = MaxLagWatch("dispatch")
+        # 相机对象的 reconnect_count 是跨段累计的，对外只报段内增量
+        self._rgb_reconnect_base = 0
+        self._raw_reconnect_base = 0
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._open_thread = None
@@ -269,10 +283,17 @@ class GripperBridge(QObject):
         self._events.put((name, args))
 
     def _post_frame(self, kind, *payload):
-        """latest-wins 帧槽：GUI 卡顿时丢旧帧不积压。"""
+        """latest-wins 帧槽：GUI 卡顿时丢旧帧不积压。
+
+        v1.3.10：被顶掉的帧记进 RGB 采集质量仪表——这是「帧采到了、但没人
+        及时取走」的唯一证据，此前是彻底静默的。只记 RGB（双目有自己的空桶
+        看门狗，触觉不走本槽进录制）。
+        """
         with self._frame_lock:
             self._frame_slots[kind] = payload
             if kind in self._frame_pending:
+                if kind == "rgb":
+                    self._rgb_watch.note_overwrite()
                 return
             self._frame_pending.add(kind)
         self._events.put(("frame", (kind,)))
@@ -290,6 +311,13 @@ class GripperBridge(QObject):
                     self._frame_pending.discard(kind)
                 if payload is None:
                     continue
+                # v1.3.10：从投递到真正 emit 的滞留（RGB 的 payload[1] 是
+                # 采集时刻，与这里是同一个宿主单调钟）。它衡量「emit 线程
+                # 自己排到队了没有」，与 GUI 派发滞后分开记——两个数一起看
+                # 才能分辨是 emitter 堵了还是主线程堵了。
+                if kind == "rgb" and len(payload) >= 2 and payload[1]:
+                    self._rgb_emit_lag.note(
+                        time.monotonic_ns() - int(payload[1]))
                 emitter = _FRAME_EMITTERS.get(kind)
                 if emitter is not None:
                     emitter(self, payload)
@@ -526,13 +554,53 @@ class GripperBridge(QObject):
             self._post("error", str(exc))
 
     def _rgb_run(self):
+        # v1.3.10：失败连击与恢复都由 _rgb_watch 记账并按门槛出日志行
+        # （健康态静默，一次抽风只留「停摆」「已恢复」两行）。read() 成功时
+        # 相机会清掉 last_transport_error，所以停摆期间的错误信息本地留一份
+        # 带给恢复行——否则最有用的那句「为什么坏」正好在恢复时丢掉。
+        last_error = ""
         while not self._stop.is_set():
             ok, frame = self._rgb_camera.read()
             if not ok:
                 if not self._stop.is_set():
+                    last_error = self._rgb_error() or last_error
+                    for line in self._rgb_watch.note_fail(
+                            time.monotonic_ns(),
+                            reconnects=self._rgb_reconnects(),
+                            error=last_error):
+                        self._log(line)
                     time.sleep(0.005)
                 continue
-            self._post_frame("rgb", frame, time.monotonic_ns())
+            now_ns = time.monotonic_ns()
+            for line in self._rgb_watch.note_ok(
+                    now_ns, reconnects=self._rgb_reconnects(),
+                    error=last_error or self._rgb_error()):
+                self._log(line)
+            last_error = ""
+            self._post_frame("rgb", frame, now_ns)
+
+    def _rgb_cam_attr(self, name, default):
+        """读相机客户端的仪表字段（客户端缺失/换实现时降级为默认值）。"""
+        cam = self._rgb_camera
+        if cam is None:
+            return default
+        try:
+            value = getattr(cam, name, default)
+        except Exception:
+            return default
+        return default if value is None else value
+
+    def _rgb_reconnects(self) -> int:
+        """本段录制内的重连次数（相机对象的计数是跨段累计的）。"""
+        try:
+            total = int(self._rgb_cam_attr("reconnect_count", 0))
+        except (TypeError, ValueError):
+            return 0
+        return max(0, total - self._rgb_reconnect_base)
+
+    def _rgb_error(self) -> str:
+        value = self._rgb_cam_attr("last_transport_error", "")
+        return value if isinstance(value, str) else ""
 
     def _on_tactile_result(self, side, heatmap, force, force_matrix):
         # 采集时刻在回调入口取（最接近样本真实到达时刻），随信号一起送到
@@ -743,6 +811,93 @@ class GripperBridge(QObject):
             "elapsed": 0,
             "alerted": False,
         }
+
+    # ── v1.3.10 RGB 采集质量（录制开始归零，录制结束并入 drop_stats）──
+
+    def reset_rgb_quality(self):
+        """录制开始重置 RGB 采集质量仪表（与空桶看门狗同一时刻）。
+
+        重连基座也在此刻取——相机对象的 reconnect_count 是跨段累计的，
+        不取基座会把上一段的账算到本次录制头上。
+        """
+        try:
+            self._rgb_reconnect_base = int(
+                self._rgb_cam_attr("reconnect_count", 0))
+        except (TypeError, ValueError):
+            self._rgb_reconnect_base = 0
+        self._rgb_watch.reset()
+        self._rgb_emit_lag.reset()
+        self._rgb_dispatch_lag.reset()
+        # L0-2：原始流侧同期归零（重连数同样跨段累计，须取基座）
+        try:
+            self._raw_reconnect_base = int(
+                getattr(self._raw_client, "reconnect_count", 0) or 0)
+        except (TypeError, ValueError):
+            self._raw_reconnect_base = 0
+        if self._raw_client is not None:
+            try:
+                self._raw_client.reset_stall_watch()
+            except Exception:
+                pass
+
+    def note_rgb_dispatch_lag(self, lag_ns: int):
+        """主线程收到 RGB 帧时记一次派发滞后（UI 各窗口调用）。
+
+        ``lag_ns`` = 收到帧的宿主单调钟 − 帧自带的采集时刻。它单独不产生
+        视频空洞（帧在 FIFO 里排着，时间戳仍连续），是**导致** latest-wins
+        覆盖才产生空洞——所以必须与 overwrite_count 分开计。
+        """
+        self._rgb_dispatch_lag.note(lag_ns)
+
+    def rgb_quality_snapshot(self, now_ns: int = None) -> dict:
+        """本 rig 采集链各层读数（全 int；键名见 ``is_frame_drop_key`` 约定）。
+
+        readfail_* / reconnect_count  = RGB 相机链（相机/服务侧停摆）
+        overwrite_count / emit_lag_*  = emit 侧（采集到但没及时取走）
+        dispatch_lag_*                = GUI 侧（主线程滞后）
+        raw_recv_* / raw_reconnect_count = 原始流接收线程（本进程客户端侧
+                                          卡顿——服务端队列溢出就主动断开）
+
+        **每个键都必须以 `_ms` / `_count` 结尾**：UI 原样加槽位前缀塞进
+        `drop_stats`，不带后缀的键会被 `frame_drop_total` 当成帧数（这里曾
+        有过一个 `readfail_episodes`，见 tools/tests/test_drop_stats.py 的真值表）。
+        """
+        reads = self._rgb_watch.snapshot(now_ns)
+        emit = self._rgb_emit_lag.snapshot()
+        dispatch = self._rgb_dispatch_lag.snapshot()
+        stall = self._raw_stall()
+        return {
+            "readfail_ms": int(round(reads["readfail_ns"] / 1e6)),
+            "readfail_max_ms": int(round(reads["readfail_max_ns"] / 1e6)),
+            "readfail_stall_count": reads["readfail_stall_count"],
+            "reconnect_count": self._rgb_reconnects(),
+            "overwrite_count": reads["overwrite_count"],
+            "emit_lag_max_ms": int(round(emit["lag_max_ns"] / 1e6)),
+            "dispatch_lag_max_ms": int(round(dispatch["lag_max_ns"] / 1e6)),
+            "raw_recv_gap_max_ms": int(round(stall["gap_max_ns"] / 1e6)),
+            "raw_recv_stall_count": int(stall["stall_count"]),
+            "raw_reconnect_count": self._raw_reconnects(),
+        }
+
+    def _raw_stall(self) -> dict:
+        """原始流接收停滞读数（客户端缺失时全零）。"""
+        raw = self._raw_client
+        if raw is None:
+            return {"gap_max_ns": 0, "stall_ns": 0, "stall_count": 0}
+        try:
+            snap = raw.stall_snapshot()
+        except Exception:
+            return {"gap_max_ns": 0, "stall_ns": 0, "stall_count": 0}
+        return snap if isinstance(snap, dict) else {
+            "gap_max_ns": 0, "stall_ns": 0, "stall_count": 0}
+
+    def _raw_reconnects(self) -> int:
+        """本段录制内的原始流重连次数（客户端计数是跨段累计的）。"""
+        try:
+            total = int(getattr(self._raw_client, "reconnect_count", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, total - self._raw_reconnect_base)
 
     def clear_trajectory(self):
         """录制开始清空 GUI 轨迹滚动窗口（只显示本段录制的点）。

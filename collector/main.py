@@ -24,6 +24,14 @@ try:
 except ImportError:
     pass
 
+# ── 运行环境守卫（在 PyQt5 之前、torch 之后: 顺序不能动）──────────
+# 用错解释器（没激活 venv / 激活了 conda 或别的 venv）时，真正的报错是
+# "No module named 'PyQt5'" 这种看不出该怎么办的信息。这里提前判断关键
+# 依赖是否真的缺，缺了就直接给出可照抄的启动命令（细节见模块注释）。
+from core.startup_guard import enforce as _enforce_env
+
+_enforce_env(_base, "main")
+
 from PyQt5.QtWidgets import QApplication, QDesktopWidget
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFontDatabase  # noqa: F401 — qt-material 需要

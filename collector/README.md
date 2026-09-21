@@ -81,28 +81,33 @@ python -m venv venv
 venv/bin/pip install -r requirements.txt
 ```
 
-> Optional dependencies such as `pyrealsense2`, `mediapipe`, `torch` are not
-> listed in `requirements.txt` (lazily imported; the corresponding feature is
-> unavailable if missing — one-click installs via `start.bat extras` below).
+> Optional dependencies such as `mediapipe` and `torch` are not listed in
+> `requirements.txt` (lazily imported; the corresponding feature is unavailable
+> if missing — one-click installs via `start.bat extras` below). `pyrealsense2`
+> (D435/D405) and the glove-skeleton solver dependencies are part of the
+> default install.
 
 #### Windows one-click deployment (recommended for customers)
 
 Double-click **`start.bat`** in the repo root: it installs Python 3.12
-(silent download if absent), creates the venv, installs dependencies, and
+(silent download if absent), creates the venv, installs dependencies, unpacks
+the bundled glove toolkit ([4/7] — needed for the live hand skeleton; if it is
+missing only a warning is printed and the program still starts), and
 launches the main program; already-deployed machines start instantly. Common
 commands:
 
 ```bat
 start.bat               deploy and launch (default)
 start.bat reinstall     delete venv and reinstall (first resort when broken)
-start.bat extras        additionally install mediapipe / pyrealsense2
+start.bat extras        additionally install mediapipe
 start.bat extras-torch  additionally install CPU torch (hand-keypoint RTMPose backend)
 start.bat help          open the operation guide and troubleshooting doc
 ```
 
 > Full operation guide, error-code reference, and intranet offline delivery
 > procedure: [使用说明.md](使用说明.md) / [使用说明_EN.md](使用说明_EN.md)
-> (offline wheel bundles are produced by `python scripts/pack_wheels.py`).
+> (offline wheel bundles are produced by `python scripts/pack_wheels.py`,
+> which by default also trims the glove toolkit into `wheels/toolkit/glove_toolkit.zip`).
 
 **Lite edition** (capture + upload only — no login / playback / task page /
 skeleton solving): double-click **`start_lite.bat`** (Windows) or run
@@ -151,7 +156,7 @@ venv/bin/python tools/hand_detection/demo_stereo_hands.py  # stereo + MediaPipe 
 | Device | Interface | Notes |
 |---|---|---|
 | UVC camera | `/dev/videoN` (OpenCV V4L2) | MJPG pixel format; up to 8 cameras |
-| Intel RealSense D435 / D405 | `pyrealsense2` | RGB + depth dual slots; depth recorded as 12-bit gray HEVC MP4 (log depth codes) + live JET heatmap; built-in stall/framerate watchdog with auto-reconnect; D405 has a dedicated near-range capture profile |
+| Intel RealSense D435 / D405 | `pyrealsense2` (default install) | RGB + depth dual slots; depth recorded as 12-bit gray HEVC MP4 (log depth codes) + live JET heatmap; built-in stall/framerate watchdog with auto-reconnect; D405 has a dedicated near-range capture profile |
 | S80C / S80M stereo | FaysSense VI Kit SDK (bundled in-repo, incl. FT602 bridge driver) | No SDK install needed; camera profile `STEREO_CAM_FPS` (default 50 fps) decimated to 30 fps recording via wall-clock 1/30 s buckets (burst backfill + empty-bucket watchdog, ~3% empty-bucket rate on healthy recordings); callback frame capture (same as the official GUI); carries hardware nanosecond timestamps and IMU samples; since v1.0.11 the subprocess runs the SDK depth engine → third-tile live depth heatmap + 12-bit gray depth video recording |
 | BLE data gloves | `bleak` | one per hand; parquet column names bound (`right_glove` / `left_glove`) |
 | UMI gripper (Fays S80M) | in-repo native stack (`core/gripper/native/`, ~460 MB, not in git) | Linux only (the native stack is ELF x86-64); up to 2 grippers (second one gets the `gripper_2_*` column prefix); records left-lens RGB video + `observation.gripper_{left,right}_force` / `_force_matrix` (10×10×3 force matrix) + `observation.slam_trajectory` + gripper state, no stereo video / IMU; new grippers auto-generate their per-serial factory calibration on open |
@@ -183,7 +188,8 @@ data/recordings/<task>/
   columns (`episode_index` / `frame_index` / `timestamp` / `wall_time` /
   `hardware_ns`) plus sparse observations (`observation.<sensor>` per
   frame, `observation.imu` variable-length sample lists aligned by
-  `imu_ts_ns`, `observation.*hand_pose` zero placeholders backfilled by
+  `imu_ts_ns`, `observation.*hand_pose` placeholders filled live from the
+  glove IMU when solving is available, zero otherwise / backfilled by
   post-processing). The full interface contract lives in
   [docs/file_format.md](docs/file_format.md)
 - Device naming follows the EgoData `<location>_<modality>` convention, e.g.
@@ -314,6 +320,14 @@ venv/bin/python tools/tests/glove_widget_test.py
 venv/bin/python tools/tests/grid_drag_fps_test.py
 venv/bin/python tools/tests/device_panel_gui_smoke_test.py
 venv/bin/python tools/tests/test_device_detector.py
+# gripper RGB frame-gap instrumentation (v1.3.10)
+venv/bin/python tools/tests/test_frame_gap.py
+venv/bin/python tools/tests/test_rgb_quality.py
+venv/bin/python tools/tests/test_ext_frame_gap.py
+venv/bin/python tools/tests/test_camera_log_archive.py
+venv/bin/python tools/tests/test_audit_frame_gaps.py
+# whole-library frame-gap audit (read-only; exit 1 when picture loss is proven)
+venv/bin/python tools/audit_frame_gaps.py
 # hardware tests require the corresponding device attached: d405_worker_test,
 # d435_e2e_test, d435_gui_smoke_test, mono_regression, d435_playback_test, etc.
 ```
@@ -375,6 +389,35 @@ are documented in [docs/index.md](docs/index.md#开发约定).
 
 ### Changelog
 
+- **v1.3.10** — silent holes in the gripper RGB stream are now instrumented,
+  alarmed and archived. `episode-099.mp4`'s frozen opening is not a missing
+  stream at the start: the first 45 frames are real (the scene is simply still)
+  and **4.68s vanished between row44 and row45** (`hardware_ns` +4680.8ms and
+  `wall_time` +4666.4ms jump together) — while *every* counter read 0 and the log
+  held nothing. Three different paths leave the **same** hole signature in the
+  parquet: the camera having no frame to read, the emit frame slot being
+  overwritten, and the GUI main thread stalling. They are counted separately now
+  (ten `*_ms`/`*_count` keys in `drop_stats` — seven from the bridge, three from
+  the writer — all excluded from the frame-drop totals by
+  `core.pipeline.is_frame_drop_key`, with a test that walks the whole snapshot so
+  a key can never fall outside that suffix rule again), with a live alarm on the
+  acquisition side and a per-episode summary line. The camera service's own log
+  — where stalls, altsetting downgrades and USB resets are written — used to die
+  with its `runtime_dir` on every clean shutdown, so the sessions most worth
+  keeping left no evidence at all; it is archived to
+  `logs/camera_service/<time>_<tag>_camera-service.log` (last 20) with a warning
+  excerpt in `main.log`. And the read-only `tools/audit_frame_gaps.py` settles
+  the whole library: **25 of 95 episodes really lost picture, 37412.6ms total
+  (max 4647.5ms @ 099), and all 25 sit 0.13–1.47s after recording start** — the
+  window before the ~1s queue buffer has built up. Counting clocks alone would
+  have booked 20.1s of "frames arrived late" as loss; the verdict comes from the
+  *picture* (boundary mad against a same-window control), and the clock signature
+  only names which side stalled (`Δwall − Δhw` = queue-latency change: positive =
+  writer backlog, negative = reader gap draining it). Decoupling recording from
+  display, camera-side self-healing, and shrinking the external queue are
+  explicitly **not** part of this change; the two timestamps' semantics are now
+  written down in `docs/file_format.md` §7.3 and the whole post-mortem in
+  `docs/postmortem_trajectory_and_rgb.md` §4.
 - **v1.3.9** — connecting a gripper now puts every DECXIN's exposure/white balance
   back to *auto*; until now each newly plugged gripper needed a manual
   `v4l2-ctl -c auto_exposure=3,white_balance_automatic=1`. The dark picture is
@@ -861,24 +904,27 @@ python -m venv venv
 venv/bin/pip install -r requirements.txt
 ```
 
-> `pyrealsense2`、`mediapipe`、`torch` 等可选依赖未列入 `requirements.txt`
+> `mediapipe`、`torch` 等可选依赖未列入 `requirements.txt`
 > （代码内惰性导入，缺失时对应功能不可用；一键安装见下方 `start.bat extras`）。
+> `pyrealsense2`（D435/D405）与手套骨架解算依赖属默认安装。
 
 #### Windows 一键部署（推荐客户使用）
 
 双击根目录 **`start.bat`**：自动安装 Python 3.12（无则静默下载安装）、创建 venv、
-安装依赖并启动主程序；已部署过则秒开。常用命令：
+安装依赖、展开随包的手套工具包（[4/7]，实时骨架解算用；缺了只打印警告、主程序照常
+启动）并启动主程序；已部署过则秒开。常用命令：
 
 ```bat
 start.bat               部署并启动（默认）
 start.bat reinstall     删除 venv 重装（出问题首选）
-start.bat extras        追加安装 mediapipe / pyrealsense2
+start.bat extras        追加安装 mediapipe
 start.bat extras-torch  追加安装 CPU 版 torch（手部关键点 RTMPose 后端）
 start.bat help          打开操作指引与异常排查文档
 ```
 
 > 完整操作指引、错误码对照与内网离线交付方式见 [使用说明.md](使用说明.md) /
-> [使用说明_EN.md](使用说明_EN.md)（离线安装包由 `python scripts/pack_wheels.py` 生成）。
+> [使用说明_EN.md](使用说明_EN.md)（离线安装包由 `python scripts/pack_wheels.py` 生成，
+> 默认同时把手套工具包裁剪进 `wheels/toolkit/glove_toolkit.zip`）。
 
 **极简版**（只做连接设备 → 采集 → 上传，无登录/回放/任务页/骨架解算）：
 Windows 双击 **`start_lite.bat`**、Linux 跑 `./start_lite.sh`，用独立环境
@@ -922,7 +968,7 @@ venv/bin/python tools/hand_detection/demo_stereo_hands.py  # 双目 + MediaPipe 
 | 设备 | 接入方式 | 说明 |
 |---|---|---|
 | UVC 相机 | `/dev/videoN`（OpenCV V4L2） | MJPG 像素格式；最多 8 路 |
-| Intel RealSense D435 / D405 | `pyrealsense2` | RGB + depth 双路槽位；深度以 12-bit 灰度 HEVC MP4 录制（对数深度码）+ 实时 JET 热力图；内置停滞/帧率看门狗自动重连；D405 有独立近距采集配置 |
+| Intel RealSense D435 / D405 | `pyrealsense2`（默认安装） | RGB + depth 双路槽位；深度以 12-bit 灰度 HEVC MP4 录制（对数深度码）+ 实时 JET 热力图；内置停滞/帧率看门狗自动重连；D405 有独立近距采集配置 |
 | S80C / S80M 双目 | FaysSense VI Kit SDK（仓库自带，含 FT602 桥驱动） | 无需安装 SDK；相机档 `STEREO_CAM_FPS`（默认 50fps）按 wall 时钟 1/30s 桶抽帧录制 30fps（突发补录 + 空桶看门狗，健康录制空桶率 ~3%），回调取帧（官方 GUI 同款）；携带硬件纳秒时间戳与 IMU 样本；v1.0.11 起子进程内置 SDK 深度引擎 → 第三格实时深度热力图 + 12-bit 灰度深度视频录制 |
 | BLE 数据手套 | `bleak` | 左右手各一只，parquet 列名绑定（`right_glove` / `left_glove`） |
 | UMI 夹爪（Fays S80M） | 仓库自带原生栈（`core/gripper/native/`，约 460MB，不入库） | 仅 Linux（原生栈是 ELF x86-64）；最多 2 台（第二台的数据列自动加 `gripper_2_*` 前缀）；录左目 RGB 视频 + `observation.gripper_{left,right}_force` / `_force_matrix`（10×10×3 力矩阵）+ `observation.slam_trajectory` + 夹爪状态，不存双目视频/IMU；新夹爪开启时自动生成逐台出厂标定 |
@@ -953,7 +999,8 @@ data/recordings/<任务>/
   （`episode_index` / `frame_index` / `timestamp` / `wall_time` /
   `hardware_ns`）+ 稀疏观测列（`observation.<传感器>` 逐帧、
   `observation.imu` 变长样本列表按 `imu_ts_ns` 对齐、
-  `observation.*hand_pose` 恒写占位零由后处理回填）。完整接口契约见
+  `observation.*hand_pose` 解算可用时由手套 IMU 实时回填、否则为零占位，
+  也可由后处理回填）。完整接口契约见
   [docs/file_format.md](docs/file_format.md)
 - 设备命名遵循 EgoData 标准 `<位置>_<模态>`：如 `head_left_rgb`、
   `head_right_rgb`、`head_depth`、`right_glove`、`right_hand_pose`
@@ -1074,6 +1121,14 @@ venv/bin/python tools/tests/glove_widget_test.py
 venv/bin/python tools/tests/grid_drag_fps_test.py
 venv/bin/python tools/tests/device_panel_gui_smoke_test.py
 venv/bin/python tools/tests/test_device_detector.py
+# 夹爪 RGB 帧空洞可见化（v1.3.10）
+venv/bin/python tools/tests/test_frame_gap.py
+venv/bin/python tools/tests/test_rgb_quality.py
+venv/bin/python tools/tests/test_ext_frame_gap.py
+venv/bin/python tools/tests/test_camera_log_archive.py
+venv/bin/python tools/tests/test_audit_frame_gaps.py
+# 全库帧空洞审计（只读；画面证实丢帧时退出码 1）
+venv/bin/python tools/audit_frame_gaps.py
 # 真机相关测试需连接对应设备：d405_worker_test、d435_e2e_test、
 # d435_gui_smoke_test、mono_regression、d435_playback_test 等
 ```
@@ -1125,6 +1180,25 @@ i18n 文案经 `tr()` 翻译、PyQt5 信号参数用 `object` 封送大整数、
 
 ### 更新记录
 
+- **v1.3.10** — 夹爪 RGB 的**静默空洞**从此有仪表、有告警、有留档。`episode-099.mp4`
+  开头那一段静止不是「开头没流」：前 45 帧是真帧（场景本身静止），真正丢的是
+  **row44→row45 之间的 4.68 秒**（`hardware_ns` +4680.8ms 与 `wall_time` +4666.4ms
+  同步跳）—— 而当时**所有计数器都是 0**、日志里一行都没有。「相机侧没帧可读」
+  「emit 帧槽被顶掉」「GUI 主线程卡顿」这三条路在 parquet 里留下的是**同一个签名**，
+  现在各记各的账（`drop_stats` 里十个 `*_ms`/`*_count` 键——桥接七个 + 落盘三个，
+  全部由 `core.pipeline.is_frame_drop_key` 挡在「丢帧统计」之外；`test_gripper_bridge`
+  逐个键走一遍这份后缀规则，免得再有一个键漏到帧数里去），采集侧当场出声、录制结束
+  再打一行汇总。相机服务自己那份日志（停摆/降档/USB 复位全写在那里）原先随
+  `runtime_dir` 一起被删——一次干净退出的会话（正是最该留证据的那种）等于没写过；
+  现在留档到 `logs/camera_service/<时刻>_<tag>_camera-service.log`（最近 20 份），
+  告警行摘录进 `main.log`。只读的 `tools/audit_frame_gaps.py` 把全库一次数清楚：
+  **95 段里 25 段画面真的丢了，累计 37412.6ms（最大 4647.5ms @ 099），且 25 起
+  全部落在开录后 0.13~1.47s** —— 也就是那 ~1 秒队列缓冲还没垫起来的窗口。只按钟
+  算会把 20.1s 的「帧到得晚」记成损失；结论现在由**画面**给出（事件处帧差对同窗
+  对照），钟只用来指认**哪一侧停了**（`Δwall − Δhw` = 队列滞留变化：正 = 写侧积压，
+  负 = 读侧空窗排空）。录制与显示解耦、相机侧自愈、外部队列改小**本次都不做**；
+  两个时间戳的语义写进了 `docs/file_format.md` §7.3，完整复盘见
+  `docs/postmortem_trajectory_and_rgb.md` 第四节。
 - **v1.3.9** — 连夹爪时自动把 DECXIN 的曝光/白平衡写回「自动」：此前每接一台新
   夹爪都要人工跑一次 `v4l2-ctl -c auto_exposure=3,white_balance_automatic=1`。
   画面暗的根因不在采集链，而在**相机机身**——`auto_exposure=1`（手动）+ AWB=0

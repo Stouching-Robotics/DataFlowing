@@ -13,6 +13,7 @@
 | `tools/diag_color.py` | S80M 子进程 pipe 输出一帧的颜色通道诊断（需 `FAYSSENSE_SDK_DIR`） |
 | `tools/diag_frame_layout.py` | ctypes 直连 FaysSense SDK 打印标定/帧布局/双目相关性（需 `FAYSSENSE_SDK_DIR`） |
 | `tools/diag_frame_trace.py` | 陈旧帧取证：判「只戳错（H1）」还是「旧帧被重投递（H2）」（离线读取证目录，不需相机） |
+| `tools/audit_frame_gaps.py` | 帧空洞全库审计：画面复核判「真丢/画面连续/判不了」+ 双钟定性（只读，见「诊断工具」节） |
 | `tools/hand_3d_d435/` | D435 RGB-D 单目 3D 手部关键点独立模块（实时 demo + 离线批处理 + 验收探针） |
 | `tools/hand_3d_d435/probes/` | 6 个离线验收探针（对齐/一致性/完整性/标签/传播/骨长） |
 | `tools/hand_3d_d435/tools/` | 3 个配套小工具（parquet 渲染、交付版 demo 导出、标定提取） |
@@ -307,7 +308,7 @@ YOLO-World 检测 + RTMPose 姿态的自包含工具箱（11 个 .py），专为
 
 ## 诊断工具
 
-两个 FaysSense SDK（S80M 双目）诊断脚本，都从 `FAYSSENSE_SDK_DIR` 环境变量定位 SDK（`<FaysSense VI Kit Release 目录>`），未设置直接报错退出。
+三个离线取证脚本（都不需要相机/硬件；前两个需 `FAYSSENSE_SDK_DIR`，第三个只读录制产物）。
 
 #### `diag_color.py`
 
@@ -371,9 +372,57 @@ mad 与正常帧间差分不开 —— 第一版判据（比 mad 与全场基线
   比对窗、常量与 `fays_raw_client.py` 逐字一致、残尾/多分片/缺 `capture.json`、
   恒定相位偏移、零下陷时的结论行。
 
+#### `audit_frame_gaps.py`
+
+**作用**：把「录下来的视频到底丢了多少」一次数清楚（**只读**，不写任何东西；
+背景与全库基线见 [postmortem](postmortem_trajectory_and_rgb.md) 第四节）。
+
+```bash
+venv/bin/python tools/audit_frame_gaps.py [任务目录] [选项]   # 默认 data/recordings/UMIGripper_Action_AI
+```
+
+选项：`--min-gap-ms 100`（相邻帧间隔 ≥ 该值才算异常）、`--clock-tol-ms 100`
+（双钟互证容差）、`--merge-rows 15`（相隔 ≤N 行的异常并成一次事件）、
+`--no-video-check`（跳过画面复核，只剩钟口径）、`--all`、`--json`、
+`--camera-logs DIR`（关联 `logs/camera_service/` 的留档日志，秒级粗相关，默认关）。
+
+**三层判据**（由强到弱）：
+
+| 层 | 判据 | 结论 |
+|---|---|---|
+| 1 画面复核 | 事件处两帧差 ÷ 同窗邻帧差中位 ≤2.0 | 画面连续 ⇒ **没丢**（帧到得晚/写得晚） |
+| | ≥3.0 或 ≥0.7×远端饱和差 | 画面跳变 ⇒ **丢了** |
+| | 其余（含整窗静止 <噪声地板 1.5） | 判不了 ⇒ 回落第 2/3 层，进「待复核」 |
+| 2 双钟 | Δhw ≈ Δwall ≥ 阈值 | 两侧都这么说（无画面时按疑似计） |
+| 3 单钟 | 只有墙钟跳 | **写侧打嗝**（帧按 33ms 到了、只是写晚） |
+| | 只有戳跳 | **读侧停顿**（帧晚到，写侧靠队列垫住） |
+
+**两个戳分别是谁盖的**（不认识这个会得出错结论）：`hardware_ns` 由**采集线程**
+在相机 `read()` 返回处盖（量「取到帧的时刻」，宿主单调钟；≤078 段是被截成**有符号
+32 位**的同一个钟，每 4.295s 锯齿一次，必须先按 2^32 解卷）；`wall_time` 由**写入
+线程**在建行落盘处盖（量「写下来的时刻」，宿主墙钟）。因此 **Δwall − Δhw = 队列
+滞留的变化量**：阶跃为正 = 写侧积压、为负 = 读侧空窗把积压排空 —— 这是区分「哪一
+侧停了」的判据。
+
+**归账四桶**（互斥，只第 1 桶算「证实丢了」）：
+
+```
+画面跳变 → gap_ms（丢了）  只有墙钟跳 → wall_ms（写侧打嗝）
+画面连续 → stamp_ms（没丢）  其余 → pending_ms（待复核，绝不计入损失）
+```
+
+**退出码**：有画面证实丢帧、或有待复核 → 1（「不上报等于把未知当没事」）；否则 0。
+2026-09-18 全库结果：95 段 / **画面证实丢了 25 段 37412.6ms**（23 段早年段 + 098/099，
+**全部落在开录后 0.13~1.47s**）/ 钟跳但画面连续 72 段 20076.2ms / 写侧打嗝 43 段
+9944.8ms / 待复核 0。
+
+离线自检：`QT_QPA_PLATFORM=offscreen venv/bin/python tools/tests/test_audit_frame_gaps.py`
+（10 组、全合成 fixture，不依赖真机数据；含「渐变条」画面模型使一帧运动量与 30 帧
+运动量在数值上分得开，以及「静止场景不许判成没丢」的反向用例）。
+
 ## tests/ 测试
 
-16 个测试脚本（11 离线 + 5 真机），离线测试加 `QT_QPA_PLATFORM=offscreen` 无需任何硬件；真机测试需对应设备在线。运行命令见 `README.md` 测试节。
+测试脚本见 `tools/tests/`（当前 56 份；离线测试加 `QT_QPA_PLATFORM=offscreen` 无需任何硬件，真机测试需对应设备在线）。完整运行命令见 `README.md` 测试节；下表是早期 16 份，末尾补上帧空洞相关的 5 份。
 
 | 文件 | 类型 | 一句话 |
 | --- | --- | --- |
@@ -393,3 +442,8 @@ mad 与正常帧间差分不开 —— 第一版判据（比 mad 与全场基线
 | `d435_gui_smoke_test.py` | 真机 | D435 GUI 冒烟 |
 | `d435_playback_test.py` | 真机 | D435 回放 |
 | `mono_regression.py` | 真机 | 单目回归 |
+| `test_frame_gap.py` | 离线 | 帧空洞看门狗纯类（口径、混源不造假空洞、负值戳） |
+| `test_rgb_quality.py` | 离线 | 采集侧停摆告警去抖 + 覆盖/滞后峰值仪表 |
+| `test_ext_frame_gap.py` | 离线 | 落盘侧空洞端到端（含 parquet `*_gap_*` 注入） |
+| `test_camera_log_archive.py` | 离线 | camera-service 日志留档 + 告警摘录（健康会话零命中） |
+| `test_audit_frame_gaps.py` | 离线 | 审计脚本三层判据/四桶/退出码（全合成 fixture） |

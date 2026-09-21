@@ -14,6 +14,7 @@ rem    start_lite.bat help       打开 使用说明_lite.md
 rem
 rem  只安装 requirements-lite.txt 白名单依赖（独立 venv_lite/，
 rem  与主程序 venv/ 互不影响）；wheels/ 与 data/ 两版本共用。
+rem  本脚本自带 venv，可在已激活 conda / 其它 venv 的窗口里直接运行（互不影响）
 rem  依赖安装顺序: wheels\ 离线包 → 阿里云镜像 → 清华镜像 → 官方源
 rem  错误码 A-G 对应 使用说明_lite.md（异常处理章节）
 rem
@@ -28,6 +29,22 @@ rem  不对称，别在这里补一个「资源缺失」的检查（在这份包里它永远不通过）。
 rem ============================================================
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
+
+rem ── 环境隔离: 调用任何 Python 之前，先清掉会「串味」的外部变量 ──
+rem 本脚本一律用项目自带 venv，但用户可能是在 conda / 另一个 venv 里双击的，
+rem 或自己设过 PYTHONHOME。这些变量会穿透进我们的 venv，把解释器指到别处
+rem （症状: 依赖明明装了却 import 失败 / DLL load failed / pip 装到了别的环境）。
+rem 直接清空并提示，不让用户去猜；只提示，不打断。
+if defined VIRTUAL_ENV   echo  [提示] 检测到已激活的虚拟环境 "%VIRTUAL_ENV%"，本脚本不使用它（仍用项目自带 venv）
+if defined CONDA_PREFIX  echo  [提示] 检测到已激活的 conda 环境 "%CONDA_PREFIX%"，本脚本不使用它（仍用项目自带 venv）
+if defined PYTHONHOME    echo  [提示] 已忽略外部变量 PYTHONHOME="%PYTHONHOME%"
+if defined PYTHONPATH    echo  [提示] 已忽略外部变量 PYTHONPATH="%PYTHONPATH%"
+set "PYTHONHOME="
+set "PYTHONPATH="
+set "PYTHONSTARTUP="
+rem 屏蔽用户级 site-packages（%APPDATA%\Python 下的包），让 venv 完全自给自足
+set "PYTHONNOUSERSITE=1"
+
 
 set "FORCE=0"
 if /i "%~1"=="reinstall" set "FORCE=1"
@@ -83,12 +100,34 @@ goto :errA
 echo  [1/6] 使用 Python: %PY%
 
 rem ── [2/6] 虚拟环境 venv_lite ──
-if exist "%VPY%" if "%FORCE%"=="1" (
-    echo  [2/6] reinstall: 删除旧 venv_lite ...
-    rmdir /s /q "venv_lite" 2>nul
-    if exist "%VPY%" goto :errC2
-)
-if exist "%VPY%" goto :deps_check
+rem 为什么体检: venv 目录在 ≠ venv 可用。
+rem   ① 从别的机器拷来的 venv: python.exe 在，但里面硬编码的是那台机器的
+rem      Python 路径 → 一跑就「No Python at ...」；
+rem   ② pip 升级 / 杀软 / 断电打断: pip 被删到一半（目录还在、模块没了）→
+rem      所有 pip 命令都报 ModuleNotFoundError: pip._internal.cli。
+rem 这两类都不该让用户去猜: 一律先离线修（ensurepip 用 Python 自带组件），
+rem 修不动就整目录重建（同样不联网）。
+if not exist "%VPY%" goto :make_venv
+if "%FORCE%"=="1" goto :reinstall_venv
+rem 体检 ①: 解释器本身能不能跑、版本够不够（拷来的 venv 在这里现形）
+"%VPY%" -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
+if errorlevel 1 goto :venv_broken
+rem 体检 ②: pip 是否完整（半装 pip 在这里现形）
+"%VPY%" -m pip --version >nul 2>&1
+if not errorlevel 1 goto :deps_check
+echo  [2/6] 检测到 venv_lite 的 pip 不完整，正在离线修复 ...
+"%VPY%" -m ensurepip --upgrade >nul 2>&1
+"%VPY%" -m pip --version >nul 2>&1
+if not errorlevel 1 goto :deps_check
+:venv_broken
+echo  [2/6] venv_lite 不可用（pip 缺失或解释器异常），自动重建（不需要联网，约 1 分钟）...
+goto :reinstall_venv_do
+:reinstall_venv
+echo  [2/6] reinstall: 删除旧 venv_lite ...
+:reinstall_venv_do
+rmdir /s /q "venv_lite" 2>nul
+if exist "%VPY%" goto :errC2
+:make_venv
 echo  [2/6] 创建虚拟环境 venv_lite（首次约 1 分钟）...
 rem 注意: PY 可能是带空格的命令（py -3.12 / python），不能加引号
 %PY% -m venv "venv_lite"
@@ -105,9 +144,27 @@ if "%STAMP%"=="%SIG%" goto :after_deps
 
 :install_deps
 echo  [3/6] 安装依赖（首次约 3-8 分钟，之后启动秒开）...
-"%VPY%" -m pip install --upgrade pip >nul 2>&1
+rem ────────────────────────────────────────────────────────────
+rem  这里以前有一句静默的 pip install --upgrade pip，已移除 —— 它是「半装 pip」
+rem  的唯一来源: pip 升级是「先删旧、再解新」，中途被打断（关窗口 / 断网 /
+rem  杀软 / 断电）就只剩一个空壳，之后每次启动都报
+rem  ModuleNotFoundError: pip._internal.cli，而用户看到的是「依赖下载失败」
+rem  （错误 D）—— 方向完全跑偏，而且重试多少次都一样。
+rem  Python 3.10+ 自带的 pip 足够装本项目的全部依赖，故不再自动升级；
+rem  确有需要请在 cmd 里手动执行（坏了的 pip 下次启动会被 [2/6] 体检修好）:
+rem      venv_lite\Scripts\python.exe -m pip install --upgrade pip
+rem ────────────────────────────────────────────────────────────
+call :pip_install_req
+if not errorlevel 1 goto :deps_write_ok
+rem 安装失败: 先确认 pip 本身还在不在（被半装 / 被杀软删是常见现场）
+"%VPY%" -m pip --version >nul 2>&1
+if not errorlevel 1 goto :errD
+call :repair_pip
+if errorlevel 1 goto :errD
+echo  [3/6] pip 已修复，重试安装 ...
 call :pip_install_req
 if errorlevel 1 goto :errD
+:deps_write_ok
 > "venv_lite\.deps-lite-ok" echo %SIG%
 
 rem ── [4/6] 依赖冒烟自检（能 import 即通过）──
@@ -140,6 +197,17 @@ rem ══════════════════════════════════════
 if errorlevel 1 exit /b 1
 set "PY=%*"
 exit /b 0
+
+rem ────────────────────────────────────────────────────────────
+rem  子程序: pip 半装时的离线自救
+rem  ensurepip 用 Python 自带组件重装 pip，不联网；修不好返回非零，
+rem  由调用方决定是重试安装还是直接报错（再不行就只能重建 venv）。
+rem ────────────────────────────────────────────────────────────
+:repair_pip
+echo  [3/6] pip 异常，尝试离线修复 ...
+"%VPY%" -m ensurepip --upgrade >nul 2>&1
+"%VPY%" -m pip --version >nul 2>&1
+exit /b %errorlevel%
 
 rem ── 检查 wheels\ 目录下是否有 .whl 文件 ──
 :wheels_exists
@@ -220,11 +288,19 @@ exit /b 1
 echo.
 echo  [错误 D] 依赖下载/安装失败
 echo  ------------------------------------------------------------
-echo   1. 检查网络: 稍后双击 start_lite.bat 重试（已下载部分会缓存）
-echo   2. 公司内网/防火墙: 请联系管理员开通 pypi 镜像，或使用离线包
-echo      管理员用 scripts\pack_wheels.py --lite 生成 wheels\ 目录
-echo   3. 杀毒软件/防火墙拦截 pip: 加入白名单后重试
-echo   4. 重装: 双击 start_lite.bat reinstall
+echo   先看上一屏的报错，再对症处理:
+echo.
+echo   · 报 ModuleNotFoundError: pip._internal.cli / No module named 'pip'
+echo     → venv 里的 pip 坏了（升级被打断 / 杀软删了文件），不是网络问题。
+echo       直接双击 start_lite.bat reinstall 重建 venv（约 1 分钟，不需要联网）。
+echo   · 报 No Python at ... / 找不到 Python
+echo     → venv 是从别的机器拷来的，双击 start_lite.bat reinstall 重建即可。
+echo   · 报 Could not find a version / connection / timeout / 证书错误
+echo     → 才是网络或权限问题:
+echo       1. 检查网络: 稍后双击 start_lite.bat 重试（已下载部分会缓存）
+echo       2. 公司内网/防火墙: 请联系管理员开通 pypi 镜像，或使用离线包
+echo          管理员用 scripts\pack_wheels.py --lite 生成 wheels\ 目录
+echo       3. 杀毒软件/防火墙拦截 pip: 加入白名单后重试
 echo.
 pause
 exit /b 1

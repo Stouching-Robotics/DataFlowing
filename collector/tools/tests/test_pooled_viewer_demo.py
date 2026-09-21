@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -45,17 +46,22 @@ def check(name: str, cond: bool, detail: str = ""):
 
 def make_synthetic_session(root: str, n: int = 30,
                            tactile_zero: bool = False,
-                           right_only: bool = False) -> str:
+                           right_only: bool = False,
+                           both_hands: bool = False) -> str:
     """合成含触觉 + IMU + 骨架 + RGB/深度视频的池化 episode，返回 parquet 路径。
 
     tactile_zero: 触觉列全零（覆盖"触觉列存在但无数据"占位提示路径）。
     right_only: 只有右手触觉列（覆盖"单面板回退：无左手数据时显示右手
     并渲染矩阵、面板不得隐藏"的回归路径）。
+    both_hands: 左右手齐全（左手也有 IMU 与非零骨架，与真实双套录制一致；
+    覆盖"双手触觉/IMU/骨架各一个面板并排、左手在左"）。
     """
     task = os.path.join(root, "synthetic_task" if not tactile_zero
                         else "synthetic_task_zero_tactile")
     if right_only:
         task += "_right_only"
+    if both_hands:
+        task += "_both_hands"
     os.makedirs(os.path.join(task, "data", "chunk-000"))
     os.makedirs(os.path.join(task, "videos", "chunk-000", "d435_rgb"))
     os.makedirs(os.path.join(task, "videos", "chunk-000", "d435_depth"))
@@ -80,7 +86,7 @@ def make_synthetic_session(root: str, n: int = 30,
             [0.05 * j, 0.012 * k, 0.0]
             for k in range(1, 6) for j in range(1, 5)], np.float32)
         kpts = kpts @ rot.T
-        rows.append({
+        row = {
             "episode_index": 1,
             "frame_index": i,
             "timestamp": float(i) / 30.0,
@@ -91,8 +97,21 @@ def make_synthetic_session(root: str, n: int = 30,
             "observation.right_glove_imu_valid": (
                 np.where(np.arange(16) % 5 == 0, 0.0, 1.0)).tolist(),
             "observation.right_hand_pose": kpts.reshape(-1).tolist(),
+            # 左手骨架默认全零占位（恒写列，覆盖"占位列被过滤"）
             "observation.left_hand_pose": [0.0] * 63,
-        })
+        }
+        if both_hands:
+            # 左手 IMU：绕 X 转 90° 的定值姿态（与右手的单位姿态可区分）
+            row["observation.left_glove_imu_quat"] = (np.tile(
+                [math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5)], 16) +
+                rng.normal(0, 0.02, 64)).tolist()
+            row["observation.left_glove_imu_valid"] = (
+                np.where(np.arange(16) % 3 == 0, 0.0, 1.0)).tolist()
+            # 左手骨架：右手模板镜像 X（手性不同，与右手面板可区分）
+            row["observation.left_hand_pose"] = (
+                kpts * np.array([-1.0, 1.0, 1.0], np.float32)
+            ).reshape(-1).tolist()
+        rows.append(row)
     cols = {
         "episode_index": pa.array([r["episode_index"] for r in rows],
                                   pa.int64()),
@@ -115,8 +134,9 @@ def make_synthetic_session(root: str, n: int = 30,
             [r["observation.left_hand_pose"] for r in rows],
             pa.list_(pa.float32(), 63)),
     }
+    # 左手套默认只有触觉、无 IMU（覆盖"两手：触觉有 IMU 无"的组合路径），
+    # both_hands 时才算齐全
     if not right_only:
-        # 左手套：只有触觉、无 IMU（覆盖"触觉有 IMU 无"的组合路径）
         cols["observation.left_glove"] = pa.array(
             [r["observation.right_glove"] for r in rows],
             pa.list_(pa.float32(), 256))
@@ -124,6 +144,17 @@ def make_synthetic_session(root: str, n: int = 30,
                                                 "shape": [16, 16]}}
     else:
         info_left = {}
+    if both_hands:
+        cols["observation.left_glove_imu_quat"] = pa.array(
+            [r["observation.left_glove_imu_quat"] for r in rows],
+            pa.list_(pa.float32(), 64))
+        cols["observation.left_glove_imu_valid"] = pa.array(
+            [r["observation.left_glove_imu_valid"] for r in rows],
+            pa.list_(pa.float32(), 16))
+        info_left["observation.left_glove_imu_quat"] = {
+            "dtype": "float32", "shape": [16, 4]}
+        info_left["observation.left_glove_imu_valid"] = {
+            "dtype": "float32", "shape": [16]}
     parquet_path = os.path.join(task, "data", "chunk-000", "episode-000.parquet")
     pq.write_table(pa.table(cols), parquet_path)
 
@@ -355,6 +386,21 @@ def main() -> int:
         grid_z = mod.render_tactile_grid(np.zeros((16, 16), np.float32),
                                          side="right", w=780, h=560)
         check("渲染: 全零矩阵不崩", grid_z.shape == (560, 780, 3))
+
+        # 手指分区框要扣在"该手指的行落点"上：左手行序镜像（拇指 15-13），
+        # 翻转后拇指框仍在画面左侧 —— 旧写法把左右手的框整体对调了
+        def _leftmost(img, bgr):
+            m = np.all(img == np.array(bgr, np.uint8), axis=-1)
+            xs = np.nonzero(m.any(axis=0))[0]
+            return int(xs.min()) if len(xs) else -1
+
+        for _side in ("right", "left"):
+            g = mod.render_tactile_grid(np.zeros((16, 16), np.float32),
+                                        side=_side, w=780, h=560)
+            _t = _leftmost(g, mod._TACTILE_FINGER_BGR[0])      # Thumb 红
+            _p = _leftmost(g, mod._TACTILE_FINGER_BGR[4])      # Pinky 紫
+            check(f"渲染: {_side} 拇指框在小指框左边（拇指统一朝左）",
+                  0 <= _t < _p, f"thumb@x={_t} pinky@x={_p}")
         check("渲染: 手形热图函数已移除", not hasattr(mod, "render_tactile_hand"))
         check("渲染: 左右手判定", mod.glove_side_of("right_glove") == "right"
               and mod.glove_side_of("left_glove") == "left"
@@ -381,6 +427,9 @@ def main() -> int:
               and not win.chk_imu.isHidden())
         check("GUI: 触觉基线勾选可见", not win.chk_tactile_baseline.isHidden()
               and win.chk_tactile_baseline.isChecked())
+        check("GUI: 触觉左右手各一个面板（左手在左）",
+              win.tactile_sensors == ["left_glove", "right_glove"],
+              f"{win.tactile_sensors}")
         check("GUI: 骨架相机距离按整段数据一次拟合(绕腕)",
               abs(win._skel_dists["right"]
                   - mod._fit_dist(s.keypoints["right"].reshape(30, 21, 3)
@@ -442,6 +491,11 @@ def main() -> int:
         win._on_slider_moved(20)
         win._on_slider_released()
         check("GUI: 播放中拖动松手落定新位置", win.idx == 20, f"idx={win.idx}")
+        # 归零已流逝时间再 tick：上面的松手渲染本身要几十毫秒（深度 seek +
+        # 两路触觉网格），真实墙钟会漏进"无时间流逝"里 —— 渲染恰好跨过一
+        # 帧就假失败。与下面 -3.0/fps 是同一个套路：这条断言要测的是
+        # "tick 不重设节奏起点"，不是渲染耗时。
+        win._play_t0 = time.perf_counter() - win.idx / win.play_fps
         win.next_frame()                # 下一拍按新起点推进（无时间流逝→原地）
         check("GUI: 播放中拖动后不被弹回", win.idx == 20, f"idx={win.idx}")
         win._play_t0 -= 3.0 / win.play_fps
@@ -503,6 +557,58 @@ def main() -> int:
               win4.lbl_hand.pixmap() is not None
               and not win4.lbl_hand.pixmap().isNull())
         win4.close()
+
+        # ── 左右手齐全（新数据形态：两只手套都有触觉 + IMU + 骨架）──
+        p5 = make_synthetic_session(tmp, both_hands=True)
+        s5 = mod.PooledSession(p5)
+        check("双手: 数据层两手齐全",
+              set(s5.tactile) == {"left_glove", "right_glove"}
+              and set(s5.imu_quats) == {"left_glove", "right_glove"}
+              and set(s5.keypoints) == {"left", "right"})
+        q5, v5 = s5.imu_frame("left_glove", 0)
+        check("渲染: IMU 标题带传感器名（左右手可区分）",
+              not np.array_equal(
+                  mod.render_imu_panel(q5, v5, w=640, h=240,
+                                       label="left_glove"),
+                  mod.render_imu_panel(q5, v5, w=640, h=240,
+                                       label="right_glove")),
+              "同一份四元数、只有标题不同 → 画布必须不同")
+        win5 = mod.DemoWindow()
+        # IMU 面板的渲染闸门是 isVisible()（窗口 show 过才为真），别的
+        # 用例只查 isHidden() 所以不用 show；这条要真渲染 IMU 就得 show
+        win5.show()
+        app.processEvents()
+        win5.load(p5)
+        app.processEvents()
+        check("双手: 触觉左右各一个面板（左手在左）",
+              win5.tactile_sensors == ["left_glove", "right_glove"])
+        # 截下 _show_image 的入参：面板数直接看拼出来的画布宽度，比数
+        # pixmap 可靠（pixmap 是缩放后的，看不出几块）
+        grabbed = {}
+        orig_show = mod.DemoWindow.__dict__["_show_image"]
+        mod.DemoWindow._show_image = staticmethod(
+            lambda lbl, bgr: grabbed.__setitem__(lbl, np.asarray(bgr)))
+        try:
+            win5.render_frame(0)
+            app.processEvents()
+            win5.chk_imu.setChecked(True)      # 有骨架时 IMU 默认隐藏
+            app.processEvents()
+        finally:
+            mod.DemoWindow._show_image = orig_show
+        hand_img = grabbed[win5.lbl_hand]
+        pw = max(680, (win5.lbl_hand.width() - 24) // 2)
+        check("双手: 触觉画布 = 左右两块并排 + 24px 间隙",
+              hand_img.shape[1] == 2 * pw + 24,
+              f"{hand_img.shape[1]} vs {2 * pw + 24}")
+        sw = max(480, (win5.lbl_skel.width() or 1280) // 2)
+        check("双手: 骨架画布 = 左右两块并排 + 8px 间隙",
+              grabbed[win5.lbl_skel].shape[1] == 2 * sw + 8,
+              f"{grabbed[win5.lbl_skel].shape[1]} vs {2 * sw + 8}")
+        iw = max(((win5.lbl_imu.width() or 880) - 4) // 2, 480)
+        check("双手: IMU 画布 = 左右两块并排 + 4px 间隙",
+              grabbed[win5.lbl_imu].shape[1] == 2 * iw + 4,
+              f"{grabbed[win5.lbl_imu].shape[1]} vs {2 * iw + 4}")
+        win5.close()
 
     # ── 真实录制（有则测）──
     repo = os.path.dirname(os.path.dirname(os.path.dirname(

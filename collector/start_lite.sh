@@ -11,11 +11,34 @@
 #  与主程序 venv/ 互不影响）；wheels/ 与 data/ 两版本共用。
 #  依赖安装顺序: 离线 wheels/ 包 → 阿里云镜像 → 清华镜像 → 官方源
 #
+#  本脚本自带 venv_lite，可在已激活 conda / 其它 venv 的终端里直接运行（互不影响）
+#
 #  夹爪(UMI/Fays S80M): 原生资源 core/gripper/native（约 460MB）随本包
 #  下发，[B] 会逐项校验，缺失报 [错误 B] 并拒启；Windows 包不带该资源。
 # ============================================================
 set -euo pipefail
 cd "$(dirname "$0")"
+
+# ── 环境隔离: 调用任何 Python 之前，先清掉会「串味」的外部变量 ──
+# 本脚本一律用项目自带 venv_lite，但用户可能是在 conda / 另一个 venv 里跑的，
+# 或自己设过 PYTHONHOME。这些变量会穿透进我们的 venv，把解释器指到别处
+# （症状: 依赖明明装了却 import 失败 / pip 装到了别的环境）。
+# 直接清空并提示，不让用户去猜；只提示，不打断。
+if [ -n "${VIRTUAL_ENV:-}" ]; then
+    echo "[提示] 检测到已激活的虚拟环境 $VIRTUAL_ENV，本脚本不使用它（仍用项目自带 venv_lite）"
+fi
+if [ -n "${CONDA_PREFIX:-}" ]; then
+    echo "[提示] 检测到已激活的 conda 环境 $CONDA_PREFIX，本脚本不使用它（仍用项目自带 venv_lite）"
+fi
+if [ -n "${PYTHONHOME:-}" ]; then
+    echo "[提示] 已忽略外部变量 PYTHONHOME=$PYTHONHOME"
+fi
+if [ -n "${PYTHONPATH:-}" ]; then
+    echo "[提示] 已忽略外部变量 PYTHONPATH=$PYTHONPATH"
+fi
+unset PYTHONHOME PYTHONPATH PYTHONSTARTUP
+# 屏蔽用户级 site-packages（~/.local/lib/pythonX.Y/...），让 venv 完全自给自足
+export PYTHONNOUSERSITE=1
 
 FORCE=0
 case "${1:-}" in
@@ -99,16 +122,43 @@ elif ! find_python; then
 fi
 echo "[1/6] 使用 Python: $PY"
 
-# ── [2/6] venv_lite ──
-if [ -x venv_lite/bin/python ] && [ "$FORCE" = 1 ]; then
-    echo "[2/6] reinstall: 删除旧 venv_lite ..."
-    rm -rf venv_lite
-fi
-if [ ! -x venv_lite/bin/python ]; then
+# ── [2/6] venv_lite（完整性体检 + 自愈）──
+# 为什么体检: venv 目录在 ≠ venv 可用。
+#   ① 从别的机器拷来的 venv: python 在，但 pyvenv.cfg 指向那台机器的解释器
+#      → 一跑就报找不到 Python；
+#   ② pip 升级 / 断电 / 杀软打断: pip 被删到一半（目录还在、模块没了）→
+#      所有 pip 命令都报 ModuleNotFoundError: pip._internal.cli。
+# 这两类都不该让用户去猜: 先离线修（ensurepip 用 Python 自带组件），
+# 修不动就整目录重建（同样不联网）。
+venv_healthy() {
+    "$VPY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
+        >/dev/null 2>&1 || return 1
+    "$VPY" -m pip --version >/dev/null 2>&1 && return 0
+    echo "[2/6] 检测到 venv_lite 的 pip 不完整，正在离线修复 ..."
+    "$VPY" -m ensurepip --upgrade >/dev/null 2>&1 || true
+    "$VPY" -m pip --version >/dev/null 2>&1
+}
+
+VPY="venv_lite/bin/python"
+if [ ! -x "$VPY" ]; then
     echo "[2/6] 创建虚拟环境 venv_lite（首次约 1 分钟）..."
     "$PY" -m venv venv_lite
+elif [ "$FORCE" = 1 ]; then
+    echo "[2/6] reinstall: 删除旧 venv_lite ..."
+    rm -rf venv_lite
+    echo "[2/6] 创建虚拟环境 venv_lite（首次约 1 分钟）..."
+    "$PY" -m venv venv_lite
+elif ! venv_healthy; then
+    echo "[2/6] venv_lite 不可用（pip 缺失或解释器异常），自动重建（不需要联网，约 1 分钟）..."
+    rm -rf venv_lite
+    "$PY" -m venv venv_lite
 fi
-VPY="venv_lite/bin/python"
+if [ ! -x "$VPY" ]; then
+    echo "[错误 C] 虚拟环境创建失败:"
+    echo "  ① Ubuntu/Debian 先装: sudo apt install python3.12-venv"
+    echo "  ② 磁盘空间不足（需约 2GB）；③ 目录写权限；④ 路径含特殊字符"
+    exit 1
+fi
 
 # ── [3/6] 依赖（requirements-lite.txt 的 mtime+size 签名驱动）──
 HASH="$(md5sum requirements-lite.txt | cut -d' ' -f1)"
@@ -131,12 +181,37 @@ install_req() {
     "$VPY" -m pip install -r "$req"
 }
 
+err_d() {
+    echo "[错误 D] 依赖下载/安装失败"
+    echo "  先看上一屏的报错再对症处理:"
+    echo "  · 报 ModuleNotFoundError: pip._internal.cli / No module named 'pip'"
+    echo "    → venv_lite 里的 pip 坏了（升级被打断 / 被杀软删了文件），不是网络问题。"
+    echo "      执行 ./start_lite.sh reinstall 重建（约 1 分钟，不需要联网）。"
+    echo "  · 报 Could not find a version / connection / timeout / 证书错误"
+    echo "    → 才是网络问题: 检查网络；内网环境请用 scripts/pack_wheels.py --lite 生成 wheels/ 离线包。"
+    exit 1
+}
+
 if [ "$NEED_INSTALL" = 1 ]; then
     echo "[3/6] 安装依赖（首次约 3-8 分钟，之后启动秒开）..."
-    "$VPY" -m pip install --upgrade pip >/dev/null 2>&1 || true
+    # 这里以前有一句静默的 `pip install --upgrade pip`，已移除 —— 它是「半装
+    # pip」的唯一来源: pip 升级是「先删旧、再解新」，中途被打断（关窗口 /
+    # 断网 / 被杀软删）就只剩一个空壳，之后每次启动都报
+    # ModuleNotFoundError: pip._internal.cli，而用户看到的是「依赖安装失败」
+    # （错误 D）—— 方向完全跑偏，而且重试多少次都一样。
+    # Python 3.10+ 自带的 pip 足够安装本项目的全部依赖，故不再自动升级；
+    # 确有需要时手动执行（坏了的 pip 下次启动会被 [2/6] 体检修好）:
+    #     venv_lite/bin/python -m pip install --upgrade pip
     if ! install_req requirements-lite.txt; then
-        echo "[错误 D] 依赖下载/安装失败: 检查网络；内网环境请用 scripts/pack_wheels.py --lite 生成 wheels/ 离线包。"
-        exit 1
+        # 安装失败: 先确认 pip 本身还在不在（被半装 / 被杀软删是常见现场）
+        if "$VPY" -m pip --version >/dev/null 2>&1; then
+            err_d
+        fi
+        echo "[3/6] pip 异常，尝试离线修复 ..."
+        "$VPY" -m ensurepip --upgrade >/dev/null 2>&1 || true
+        "$VPY" -m pip --version >/dev/null 2>&1 || err_d
+        echo "[3/6] pip 已修复，重试安装 ..."
+        install_req requirements-lite.txt || err_d
     fi
     echo "$HASH" > venv_lite/.deps-lite-ok
 fi

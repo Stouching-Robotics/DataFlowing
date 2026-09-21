@@ -13,9 +13,19 @@ comtypes>=1.4           # pygrabber 依赖
 pyvista>=0.42
 pyvistaqt>=0.11
 pyserial>=3.5           # USB (Type-C) STM32 手套 CDC 串口
+pyrealsense2            # Intel D435/D405 深度相机（core/d435_camera.py 惰性导入，
+                        # 缺则设备面板不识别 RealSense；深度走它自带的 librealsense）
+
+# ── 手套实时骨架解算（普通版默认包含；start.sh 的 [4/7] 会校验这条链）──
+# 解算本身走随包的手套工具包（stouch_glove_toolkit*，由 scripts/pack_toolkit.py
+# 裁剪后经 wheels/toolkit/ 分发），但工具包要这几个包才能导入 —— 少任何一个
+# 都会让骨架**静默不可用**（连上手套才在日志里报错，录制不受影响）。
+scipy>=1.11             # glove_core.algorithm.solver 顶层 import（空间旋转）
+pydantic>=2.9           # glove_core.protected.modules.datamodels
+polars>=1.0             # glove_fk.fitting —— 经 glove_fk/__init__.py 间接导入
+loguru>=0.7             # 工具包全链日志
 
 # ── 可选依赖（代码内惰性导入，缺失时对应功能不可用）──
 # 一键安装: start.bat extras / start.bat extras-torch
-# pyrealsense2          # Intel D435/D405 深度相机
 # mediapipe             # 裸手 3D 关键点（bare 模式）
 # torch                 # 手部关键点 RTMPose 后端（CPU 版安装见 `start.bat extras-torch`）

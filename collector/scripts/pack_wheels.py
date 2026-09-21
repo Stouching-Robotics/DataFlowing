@@ -10,15 +10,17 @@ start.bat / start.sh 检测到 wheels\\*.whl 后自动改走纯离线安装。
 pip download（此时建议直接在一台 Windows 机器上运行本脚本）。
 
 用法:
-    python scripts/pack_wheels.py                 # 仅主程序必需依赖
-    python scripts/pack_wheels.py --lite          # 仅极简采集版依赖（requirements-lite.txt）
-    python scripts/pack_wheels.py --extras        # + mediapipe / pyrealsense2
+    python scripts/pack_wheels.py                 # 主程序必需依赖 + 手套工具包
+    python scripts/pack_wheels.py --lite          # 仅极简采集版依赖（requirements-lite.txt，不带工具包）
+    python scripts/pack_wheels.py --extras        # + mediapipe
     python scripts/pack_wheels.py --torch         # + CPU 版 torch（较大）
+    python scripts/pack_wheels.py --no-toolkit    # 只打依赖轮子，不裁手套工具包
     python scripts/pack_wheels.py --out /tmp/wheels   # 自定义输出目录
 
 产物:
     <out>/*.whl                        Windows 3.12 依赖轮子（含依赖闭包）
     <out>/python-3.12.10-amd64.exe     Python 安装包（客户机器无 Python 时用）
+    <out>/toolkit/glove_toolkit.zip    手套工具包裁剪版（骨架解算用；见 pack_toolkit.py）
 """
 
 from __future__ import annotations
@@ -41,7 +43,8 @@ ALIYUN = "https://mirrors.aliyun.com/pypi/simple/"
 TUNA = "https://pypi.tuna.tsinghua.edu.cn/simple"
 PYPI = "https://pypi.org/simple"
 MIRRORS = [ALIYUN, TUNA, PYPI]
-EXTRAS = ["mediapipe", "pyrealsense2"]
+# pyrealsense2（D435/D405）已提升为 requirements.txt 的默认依赖，不再属于可选包
+EXTRAS = ["mediapipe"]
 TORCH_INDEXES = [
     ("https://mirrors.aliyun.com/pytorch-wheels/cpu/", ALIYUN),
     ("https://download.pytorch.org/whl/cpu", PYPI),
@@ -127,7 +130,7 @@ def main() -> int:
     parser.add_argument("--lite", action="store_true",
                         help="仅打包极简采集版依赖（requirements-lite.txt）")
     parser.add_argument("--extras", action="store_true",
-                        help="额外打包 mediapipe / pyrealsense2")
+                        help="额外打包 mediapipe")
     parser.add_argument("--torch", action="store_true",
                         help="额外打包 CPU 版 torch（体积较大）")
     parser.add_argument("--out", type=Path,
@@ -135,6 +138,8 @@ def main() -> int:
                         help="输出目录（默认仓库根目录 wheels/）")
     parser.add_argument("--no-python-installer", action="store_true",
                         help="跳过 Python 安装包下载")
+    parser.add_argument("--no-toolkit", action="store_true",
+                        help="不裁手套工具包（骨架解算随包，仅 --lite 时才可省）")
     args = parser.parse_args()
 
     if args.lite and (args.extras or args.torch):
@@ -152,7 +157,7 @@ def main() -> int:
     if args.extras:
         specs = specs + EXTRAS
 
-    print(f"[1/3] 解析 {len(specs)} 个包的 Windows {PY_VERSION} 依赖闭包 -> {out}/ ...")
+    print(f"[1/4] 解析 {len(specs)} 个包的 Windows {PY_VERSION} 依赖闭包 -> {out}/ ...")
     if UV is None:
         print("  [提示] 未检测到 uv，回退纯 pip 解析（建议在一台 Windows 机器上运行，"
               "或 pip install uv 后重试）")
@@ -174,7 +179,7 @@ def main() -> int:
         return 1
 
     if args.torch:
-        print("[2/3] 解析 CPU 版 torch（Windows）...")
+        print("[2/4] 解析 CPU 版 torch（Windows）...")
         torch_done = False
         for index, extra in TORCH_INDEXES:
             try:
@@ -188,27 +193,45 @@ def main() -> int:
         if not torch_done:
             print(f"[错误] torch 下载失败: {last_err}", file=sys.stderr)
             return 1
-        print("[2/3] torch 完成")
+        print("[2/4] torch 完成")
     else:
-        print("[2/3] 跳过 torch（--torch 可打包 CPU 版）")
+        print("[2/4] 跳过 torch（--torch 可打包 CPU 版）")
 
     if not args.no_python_installer:
-        print("[3/3] 拉取 Python 安装包（客户机器无 Python 时 start.bat 会用）...")
+        print("[3/4] 拉取 Python 安装包（客户机器无 Python 时 start.bat 会用）...")
         try:
             download_python_installer(out)
         except RuntimeError as e:
             print(f"[警告] {e}；不影响 wheels 使用，手动放入同名文件即可",
                   file=sys.stderr)
     else:
-        print("[3/3] 跳过 Python 安装包（--no-python-installer）")
+        print("[3/4] 跳过 Python 安装包（--no-python-installer）")
+
+    # 手套工具包（骨架解算）——普通版随包，极简版不需要
+    if args.lite or args.no_toolkit:
+        print("[4/4] 跳过手套工具包"
+              + ("（--lite 极简版不含骨架解算）" if args.lite else "（--no-toolkit）"))
+    else:
+        print("[4/4] 裁剪手套工具包（骨架解算随包）...")
+        rc = subprocess.run(
+            [sys.executable, str(repo_root / "scripts" / "pack_toolkit.py"),
+             "--out", str(out)]).returncode
+        if rc != 0:
+            # 不阻断 wheel 打包：工具包缺失只影响骨架，主程序照常
+            print("[警告] 工具包裁剪失败（骨架解算将不可用）。"
+                  "单独重试: python scripts/pack_toolkit.py --out "
+                  f"{out}", file=sys.stderr)
 
     whls = sorted(out.glob("*.whl"))
     total = sum(w.stat().st_size for w in whls) / 1e6
     print()
     print("=" * 60)
     print(f"打包完成: {len(whls)} 个 wheel，共 {total:.0f} MB -> {out}/")
+    if not (args.lite or args.no_toolkit):
+        print(f"          手套工具包 -> {out}/toolkit/glove_toolkit.zip")
     print("交付方式: 把整个 wheels/ 目录拷到客户项目根目录，")
-    print("          start.bat / start.sh 会自动改走纯离线安装。")
+    print("          start.bat / start.sh 会自动改走纯离线安装，")
+    print("          并把工具包展开到项目根（骨架解算开箱可用）。")
     print("=" * 60)
     return 0
 

@@ -120,8 +120,8 @@ fnum  = (N - 1) % 1000      # 三位零起：episode-000 .. episode-999
   `data/` 重建一次再增量合并（参考 `core.helpers.recalc_stats`）。
 - `action` 恒为占位块（`count:0`，仅声明列形状，不参与统计）。
 - 只统计实际存在的列：帧级 `observation.<sn>`（逐行计数，含全零行）、样本级
-  `observation.imu`（按样本计数）；`observation.*hand_pose` 为恒写占位零列
-  （后处理回填），**不入统计**。
+  `observation.imu`（按样本计数）；`observation.*hand_pose` 为恒写列（USB 手套
+  录制时由 IMU 实时解算回填，无解算时为零占位），**不入统计**。
 - 语义：删除 episode 不回退 stats（与任务进度水位一致）；stats.json 是全任务
   聚合快照，不是逐 episode 重建值。
 
@@ -165,7 +165,7 @@ fnum  = (N - 1) % 1000      # 三位零起：episode-000 .. episode-999
 | `length` | int64 | 帧数 = data parquet 行数 |
 | `created_at` | float64 | episode 开始时间（Unix 秒） |
 | `duration_sec` | float64 | 时长（秒） |
-| `drop_stats` | str | **JSON 字符串**（如 `{"imu_overflow": 0}`），读取方须 `json.loads` |
+| `drop_stats` | str | **JSON 字符串**（如 `{"imu_overflow": 0}`），读取方须 `json.loads`。v1.3.10 起含**带后缀**的键：`*_ms`/`*_count` 是时长/次数（夹爪 RGB 帧空洞与采集侧仪表），**不是帧数**——加总帧数前须过 `core.pipeline.is_frame_drop_key`（见 §7.3） |
 | `video_codec` | str | **JSON 字符串**：本机原始编码信息（encoder/codec/crf/ffmpeg 路径/probe）；上传 zip 中的 mp4 可能已被再编码，见 §8 |
 | `calibration` | str | **JSON 字符串**：本 episode 标定（结构与 info.json 的 calibration 同型），保每 episode 标定保真 |
 | `force_matrix_specs` | str | **JSON 字符串**：本段力矩阵列规格（列名 → 描述），**倍率的权威来源**，见 §7.2.1。v1.3.x 新增；旧 episode 无此列（读侧按缺列容忍，退回 info.json） |
@@ -196,7 +196,7 @@ fnum  = (N - 1) % 1000      # 三位零起：episode-000 .. episode-999
 | `observation.<sn>` | list<float32, 256> | 每帧一个传感器读数（维度 = info.json `sensor_dim`） |
 | `imu_ts_ns` | list<int64> | 与 `observation.imu` **一一对应**的样本时间戳 |
 | `observation.imu` | list<list<float32, 6>> | 挂在帧行上的**变长样本列表**（1000Hz/400Hz 只是 list 长短变化） |
-| `observation.left_hand_pose` | list<float32, 63> | **恒写占位零**，后处理回填（裸手 63 维 world landmarks） |
+| `observation.left_hand_pose` | list<float32, 63> | **恒写列**：USB 手套录制时由 IMU 实时解算回填，无解算时为零占位；裸手 63 维 world landmarks 由后处理回填 |
 | `observation.right_hand_pose` | list<float32, 63> | 同上 |
 | `action` | list<float32, 1> | 恒写（现为 0） |
 | `status.<did>` | str | 稀疏设备状态列（`"connected"`/`"disconnected"` 等） |
@@ -240,6 +240,18 @@ meta 行，不碰 data 字节）。
 `frame_index`（写入线程同拍产出）。IMU 为变长 list 列挂在帧行上，录制时按
 `hardware_ns` 设备时钟窗口挂靠。读取零重采样；宿主时间锚定靠 `timestamp` +
 `wall_time`。客户 9 列平表由导出工具展开插值合成，非本契约内容。
+
+**两个时间戳分别是谁盖的（MUST 理解，v1.3.10 明确）**：
+
+| 列 | 盖戳者 | 语义 |
+|---|---|---|
+| `wall_time` | **写入线程**，建行落盘处 `time.time()` | 该行**写下来**的时刻（宿主墙钟，绝对 Unix 秒） |
+| `hardware_ns` | **采集侧**，相机/传感器取到帧处 | 该帧**取到**的时刻。双目是 SDK 硬件戳（与 IMU 同源）；夹爪 RGB 是采集线程的宿主单调钟（≤078 段被截成有符号 32 位、每 4.295s 锯齿一次，读取方须按 2^32 解卷 —— `tools/audit_frame_gaps.py` 的 `trunc32`） |
+
+两者之差 = 中间队列的滞留（+ 两钟固定偏移）。**空洞**（相邻行 `hardware_ns` 间隔
+超出标称帧间隔的部分）不等于画面丢了：夹爪 RGB 的空洞要走画面复核才能定性
+（真丢 / 帧晚到 / 判不了），口径与全库基线见
+[postmortem §4](postmortem_trajectory_and_rgb.md)。
 
 ### 7.4 meta/episodes/.lock（运行时辅助文件，非数据）
 

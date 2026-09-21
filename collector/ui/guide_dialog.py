@@ -42,9 +42,10 @@ GUIDE_HTML_ZH = """
 <h3>2. 连接设备</h3>
 <ul>
 <li><b>UVC 摄像头</b>：插入 USB 后，左侧设备面板约 2 秒内自动出现，点击即可预览</li>
-<li><b>Intel RealSense D435 / D405</b>：需先运行 <code>start.bat extras</code> 安装组件，再插入设备</li>
+<li><b>Intel RealSense D435 / D405</b>：组件已随一键部署默认安装，插入 USB 后面板自动出现「🎥 D435」条目（与双目相机不能同时开启）</li>
 <li><b>双目相机（S80C）</b>：插入 USB 后，面板自动出现 👁 双目条目（面板显示为 FaysSense S80M），点击开启左右两路画面与深度热力图（第三格）；录制时同时保存深度热力图视频与原始深度数据；与 RealSense 不能同时开启</li>
 <li><b>触觉手套（蓝牙）</b>：打开手套电源，并开启电脑蓝牙 → 面板「🧤 手套」组自动出现设备 → 点击该设备，主画面出现仿生手掌并自动连接（左 / 右手按广播名 L / R 自动识别）</li>
+<li><b>手部骨架（实时解算）</b>：手套连上并静置数秒完成暖机后，录制中会实时解算 21 个手部关键点（观察窗口可看骨架）。解算用的标定默认是随包标定；换用自己的手套时，建议先在手套工具包目录里跑一次标定，新标定会被自动优先采用</li>
 </ul>
 <p><b>看不到设备时</b>：</p>
 <ul>
@@ -105,9 +106,10 @@ click "Switch account" at the top of the task page, fix the address and retry.</
 <h3>2. Connecting Devices</h3>
 <ul>
 <li><b>UVC camera</b>: after plugging in the USB, it appears in the device panel on the left within ~2 seconds; click to preview</li>
-<li><b>Intel RealSense D435 / D405</b>: run <code>start.bat extras</code> first to install the components, then plug in the device</li>
+<li><b>Intel RealSense D435 / D405</b>: components are installed by the one-click deploy by default; after plugging in the USB a "🎥 D435" entry appears in the panel (cannot be enabled together with the stereo camera)</li>
 <li><b>Stereo camera (S80C)</b>: after plugging in the USB, a 👁 stereo entry appears automatically (shown as FaysSense S80M in the panel); click it to open the left/right views plus a depth heatmap (third tile); recording also saves a depth heatmap video and raw depth data; cannot be enabled together with RealSense</li>
 <li><b>Haptic glove (Bluetooth)</b>: power on the glove and enable Bluetooth on the PC → the device appears in the "🧤 Gloves" group automatically → click it; the bionic hand view opens and connects automatically (left / right hand is recognized by the broadcast name L / R)</li>
+<li><b>Hand skeleton (live solving)</b>: once the glove is connected and has warmed up for a few seconds, the 21 hand keypoints are solved live during recording (visible in the view window). The shipped default calibration is used unless you calibrate your own glove — run the toolkit's calibration once and the new calibration is picked up automatically</li>
 </ul>
 <p><b>If a device does not appear</b>:</p>
 <ul>

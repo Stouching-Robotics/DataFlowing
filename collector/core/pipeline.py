@@ -16,6 +16,8 @@ from PyQt5.QtCore import QObject, pyqtSignal, QTimer
 from config import settings
 from core.camera import CameraWorker, CameraState
 from core.egodata_writer import EgoDataWriter
+from core.frame_gap import GapWatch
+from core.timing import Stopwatch
 
 
 class DropStats:
@@ -33,6 +35,14 @@ class DropStats:
         with self._lock:
             self._counts[key] = self._counts.get(key, 0) + n
 
+    def note_max(self, key: str, value: int):
+        """峰值类指标（最大滞后/最大空洞毫秒）——inc 只能累加，装不下峰值。"""
+        value = int(value)
+        with self._lock:
+            current = self._counts.get(key)
+            if current is None or value > current:
+                self._counts[key] = value
+
     def clear(self):
         with self._lock:
             self._counts.clear()
@@ -40,6 +50,33 @@ class DropStats:
     def snapshot(self) -> Dict[str, int]:
         with self._lock:
             return dict(self._counts)
+
+
+# drop_stats 键命名约定（新增键必须遵守；消费端一律用下面的判据，别再手写
+# `!= "imu_overflow"` 这类排除逻辑）：
+#   ext:<slot> / uvc:<slot> / sensor_queue   队列满丢帧 —— 帧数，可加总
+#   *_ms / *_ns / *_count                    时长/次数 —— **不可**加进帧数
+#   imu_overflow                             遗留键：防丢缓冲超限次数，非帧
+_NON_FRAME_SUFFIXES = ("_ms", "_ns", "_count")
+_LEGACY_NON_FRAME_KEYS = frozenset({"imu_overflow"})
+
+
+def is_frame_drop_key(key: str) -> bool:
+    """该键是否表示「可加总的帧数」。
+
+    DROP_WARN 告警的语义是「丢帧 ⇒ 编码器跟不上 ⇒ 换编码器/降分辨率」。
+    采集停摆时长、latest-wins 覆盖次数、帧空洞毫秒都与编码器无关，混进
+    sum() 会把用户指去调错东西——2026-09-18 那次 4.68s 空洞正是被这类
+    混淆掩盖的（所有计数器都是 0，谁也说不清帧丢在哪一层）。
+    """
+    if key in _LEGACY_NON_FRAME_KEYS:
+        return False
+    return not key.endswith(_NON_FRAME_SUFFIXES)
+
+
+def frame_drop_total(stats: Dict[str, int]) -> int:
+    """帧数口径的丢帧总数（消费端唯一入口：main_window / lite_window）。"""
+    return sum(v for k, v in stats.items() if is_frame_drop_key(k))
 
 
 class CameraSlot(QObject):
@@ -140,6 +177,10 @@ class CameraPipeline(QObject):
         # IMU 批只随主槽位写入的槽位集合（S80M 独立双目左右目共享同一份
         # 样本；夹爪链路不存 IMU/双目视频，只落盘 SLAM 位姿/轨迹）
         self._imu_external_slots = {"stereo_left"}
+
+        # v1.3.10 落盘侧帧空洞：slot → GapWatch（写线程私有，主线程只在
+        # join 之后读；见 core/frame_gap.py 与 docs/postmortem_trajectory_and_rgb.md）
+        self._ext_gap_watches: Dict[str, GapWatch] = {}
 
         # 已注册的传感器名称列表（决定 parquet 中 observation.<name> 列）
         self._sensor_names: List[str] = []
@@ -567,6 +608,8 @@ class CameraPipeline(QObject):
         self._codec_name = f"{w.encoder_label} | EgoData + LeRobot v3 Parquet"
         # 丢帧统计/IMU 防丢：每 episode 重置
         self._drop_stats.clear()
+        # v1.3.10 落盘侧空洞看门狗同样每段重置（连同时间基座，见 GapWatch）
+        self._ext_gap_watches.clear()
         self._pending_imu.clear()
         with self._glove_imu_lock:
             self._glove_imu.clear()
@@ -604,6 +647,78 @@ class CameraPipeline(QObject):
 
         self.recording_started.emit(self._recording_slot)
         self.session_changed.emit(self)
+
+    # ── v1.3.10 落盘侧帧空洞（写线程私有，无锁无 IO）──────────
+    def _note_ext_gap(self, sid: str, hw_ns: int) -> int:
+        """记一帧、返回本次空洞 ns（0 = 正常）。空洞闭合到告警门槛就打一行。
+
+        时间基座由本段首帧锁定：``hw_ns > 0`` 用帧自带时刻（与 parquet 的
+        hardware_ns 同源，口径与 tools/audit_frame_gaps.py 逐字一致）；
+        ``hw_ns = 0``（无时间戳的槽位，如 lite 路径恒传 0）退化为出队瞬间的
+        宿主单调钟。**两者绝不混用**——混源会把两个时钟的基准差当成一次天文
+        数字级的空洞，这正是 GapWatch 内部拦掉的那种误判。
+
+        标称间隔恒取 RECORDING_FPS 的倒数：写线程对每个外部槽位每 tick 只取
+        一帧，输出行的间距就是 tick 的整数倍，与源的帧率无关。因此日志报的
+        毫秒数与事后原样重算 parquet 得到的数字相同。
+        """
+        nominal_ns = int(1e9 / max(1.0, float(settings.RECORDING_FPS)))
+        watch = self._ext_gap_watches.get(sid)
+        if watch is None:
+            watch = GapWatch(
+                nominal_ns, settings.GRIPPER_RGB_GAP_MIN_MS * 1_000_000)
+            self._ext_gap_watches[sid] = watch
+
+        if hw_ns and hw_ns > 0:
+            ts_ns, source = int(hw_ns), "hw"
+        else:
+            ts_ns, source = time.monotonic_ns(), "mono"
+        gap_ns = watch.note(ts_ns, source)
+        if gap_ns < settings.GRIPPER_RGB_GAP_ALERT_MS * 1_000_000:
+            return gap_ns
+
+        # 洞起点 = 本帧时刻 − 空洞 − 标称间隔；相对首帧即「开录后多久」
+        snap = watch.snapshot()
+        start_ns = ts_ns - gap_ns - nominal_ns
+        rel_s = (start_ns - snap["first_ns"]) / 1e9 if snap["first_ns"] else 0.0
+        self.recording_log.emit(
+            f"[录制] RGB 帧空洞 {gap_ns / 1e6:.0f}ms（槽 {sid}，"
+            f"开录后 {rel_s:.1f}s 起）——该段视频静止后跳变")
+        return gap_ns
+
+    def _inject_ext_gap_stats(self):
+        """把落盘侧空洞并入本段 drop_stats（在 end_episode 之前调用）。
+
+        键一律以 ``_ms`` / ``_count`` 结尾 ⇒ 被 ``is_frame_drop_key`` 排除在
+        帧数口径之外（见 core/pipeline.py 顶部的键命名约定）。
+        """
+        for sid, watch in self._ext_gap_watches.items():
+            snap = watch.snapshot()
+            if not snap["frames"]:
+                continue
+            # 走 note_drop_stats：零值不落键、*_max_ms 走峰值的规则只此一份
+            self.note_drop_stats({
+                f"{sid}_gap_ms": int(round(snap["gap_ns"] / 1e6)),
+                f"{sid}_gap_max_ms": int(round(snap["gap_max_ns"] / 1e6)),
+                f"{sid}_gap_count": snap["gap_count"],
+            })
+
+    def note_drop_stats(self, stats: Dict[str, int]):
+        """外部（UI/bridge）把采集侧的计数并入本段 drop_stats。
+
+        ``*_max_ms`` 结尾的键是峰值（走 note_max），其余累加。零值不落键——
+        与既有各计数器一致（只有出过事才会有键）。由 UI 在 finish_recording
+        **之前**调用；落盘侧的空洞由 pipeline 自己注入，两边合起来才是
+        「相机 → 视频文件」这条链的完整账。
+        """
+        for key, value in (stats or {}).items():
+            value = int(value)
+            if value == 0:
+                continue
+            if key.endswith("_max_ms"):
+                self._drop_stats.note_max(key, value)
+            else:
+                self._drop_stats.inc(key, value)
 
     def _write_loop(self):
         """独立写入线程 —— 用 time.perf_counter() 精确按 30fps 写入帧。"""
@@ -674,6 +789,11 @@ class CameraPipeline(QObject):
                         frame, hw_ns, imu_s = item
                     else:  # 兼容旧格式（仅帧）
                         frame, hw_ns, imu_s = item, 0, None
+                    # v1.3.10 落盘侧空洞计量。放在这里（取到帧之后、写之前）
+                    # 而非生产者侧：只统计「确实进了队列、确实写进了视频」的
+                    # 帧，队列满丢掉的帧已由 write_external_frame 的 ext: 计数
+                    # 认领，两边不重复也不互相掩盖。
+                    self._note_ext_gap(sid, hw_ns)
                     # IMU 样本只随主槽位写入（左右目共享同一份，
                     # 避免 data/imu/ 出现重复行；S80M/夹爪各自的主槽）
                     if sid not in self._imu_external_slots:
@@ -1008,6 +1128,11 @@ class CameraPipeline(QObject):
         self._timer_running = False
         self._duration_timer.stop()
 
+        # v1.3.11（L0-1）：收尾窗口计时。这一段（join + 排空 + 快照）与
+        # 后台的 flush/parquet 合起来就是「点停止 → 落盘完成」的全长；
+        # 2026-09-18 的断链与位姿发散都发生在这个窗口里，先量再修
+        sw = Stopwatch()
+
         # 等待写入线程退出
         if self._write_thread is not None and self._write_thread.is_alive():
             self._write_thread.join(timeout=3.0)
@@ -1024,17 +1149,31 @@ class CameraPipeline(QObject):
 
         # v1.0.9 丢帧统计快照（含 IMU 溢出次数）：供录制完成回调提示与
         # writer 元数据回写；在 _finish_async（end_episode）之前注入
+        # v1.3.10：写线程已 join，此处读 _ext_gap_watches 无竞态
+        self._inject_ext_gap_stats()
         self._last_drop_stats = self._drop_stats.snapshot()
         self._last_drop_stats["imu_overflow"] = self._imu_overflow_count
         if self._writer is not None:
             self._writer.set_drop_stats(self._last_drop_stats)
 
+        sw.lap("join")
         path = self._session_path
-        threading.Thread(target=self._finish_async, args=(path,), daemon=True).start()
+        threading.Thread(target=self._finish_async, args=(path, sw),
+                         daemon=True).start()
 
-    def _finish_async(self, path: str):
-        if self._writer:
-            self._writer.end_episode()
+    def _finish_async(self, path: str, sw: Optional[Stopwatch] = None):
+        writer = self._writer
+        if writer:
+            writer.end_episode()
+            if sw is not None:
+                # 一行给出整条收尾路径的分段耗时（flush = 编码器收尾，
+                # parquet = 力矩阵列建数组那段，meta = 元数据/统计合并）。
+                # getattr：测试里的假 writer 没有这个属性，不能让它把
+                # 收尾线程带下去（daemon 线程静默死掉＝数据不落盘）
+                for stage, ms in (getattr(writer, "finalize_timing", None)
+                                  or {}).items():
+                    sw.add(stage, ms)
+                self.recording_log.emit(f"[录制] 收尾 {sw.format()}")
             self._writer = None
         self._session_path = None
         self.session_changed.emit(None)
@@ -1059,8 +1198,17 @@ class CameraPipeline(QObject):
         threading.Thread(target=self._abort_async, daemon=True).start()
 
     def _abort_async(self):
-        if self._writer:
-            self._writer.abort_episode()
+        writer = self._writer
+        if writer:
+            writer.abort_episode()
+            # 中止也要有耗时读数：与「完成」路径的 flush/parquet 对比，
+            # 是判断「断链到底由哪一段引起」的那条判据（2026-09-18：中止
+            # 同样收尾 ffmpeg 却 0/6 断链）
+            timing = getattr(writer, "finalize_timing", None) or {}
+            if timing:
+                self.recording_log.emit(
+                    "[录制] 收尾(中止) " +
+                    " ".join(f"{k}={v}ms" for k, v in timing.items()))
             self._writer = None
         self._session_path = None
         self.session_changed.emit(None)

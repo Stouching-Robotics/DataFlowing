@@ -51,6 +51,7 @@
 | `core/sensor_config_dialogs.py` | PyQt5 传感器配置对话框（矩阵行列 / 仿生手掌逐部位） |
 | `core/sensor_hand_config.py` | 仿生手掌配置加载/传感器列有效性过滤（纯函数，零 Qt） |
 | `core/helpers.py` | 通用工具函数（约 47 个：ID/时间/格式化/路径/会话扫描） |
+| `core/frame_gap.py` | 帧间隔空洞看门狗 `GapWatch`（纯算术，零 Qt/零 IO；录制侧与 `tools/audit_frame_gaps.py` 共用同一份空洞定义） |
 | `core/gripper/` | UMI 夹爪 rig 自包含**子包**（Fays SLAM + Sightac 触觉 + 出厂标定生成），与上面平铺模块分开，见下文「夹爪」节 |
 
 （`core/__init__.py` 为空包标记；`core/gripper/__init__.py` 为其子包标记。）
@@ -177,6 +178,24 @@ RGB（BGR 三通道）+ 深度（uint16，归一化毫米）两路信号。左�
 | `CameraPipeline.is_recording` / `elapsed` / `last_recording_frames` | property | 录制状态/已录时长/上一轮每相机帧数快照 | 对应值 |
 
 **关键数据**：写入线程节拍 `frame_interval = 1.0 / settings.RECORDING_FPS`（30fps），sleep 到目标前 ~1ms 后 busy-wait 补齐；每帧先排空传感器队列取最新数据，CameraSlot 队列"排空取最新帧"、外部帧源队列"取一帧不排空"（输出均匀无抖动）；单目路径写 MP4 时上下翻转、外部双目帧路径已在 `ui/main_window._on_stereo_frame` 翻转故 `flip_vertical=False`；IMU 样本只随 `stereo_left` 写入（左右目共享一份，避免 `data/imu/` 重复行）；可选 `settings.CAMERA_MIRROR_HORIZONTAL` 水平镜像。**深度 MP4 补拍**（v1.0.11）：`_write_one_frame` 每个 master 槽节拍至多消费一帧深度——队列有新帧则写热力图 MP4 +（raw_depth 时）PNG16 并缓存于 `_last_depth_frames`；队列空（S80C 深度引擎 ~20fps 低于录制 30fps）则重写缓存帧到热力图 MP4（不落 PNG、不推进序号），保证深度 MP4 时长与 RGB 对齐。
+
+**帧空洞与丢帧口径（v1.3.10）**：写入线程对每个外部槽跑一个 `core.frame_gap.GapWatch`
+（`_ext_gap_watches`，每槽一个，基座由该槽首帧锁定），取帧成功后、`_write_one_frame`
+之前记账——
+不 sleep、不 IO、不加锁，空洞 ≥ `settings.GRIPPER_RGB_GAP_ALERT_MS` 时经既有
+`recording_log` 信号当场告警（`[录制] RGB 帧空洞 …ms`）。`DropStats` 另有
+`note_max(key, value)`（峰值语义）与两个共用 helper：
+
+```python
+is_frame_drop_key(key)   # 帧数键才为真：ext:<slot> / sensor_queue / imu_overflow
+frame_drop_total(stats)  # 两处 UI 汇总共用，替代各自硬编的排除逻辑
+```
+
+键约定：`*_ms` / `*_ns` / `*_count` 后缀一律是**时长/次数，不是帧数**（`imu_overflow`
+是遗留的次数键）。`CameraPipeline.note_drop_stats(mapping)` 由 UI 在停止录制前把
+桥接的采集侧仪表（`bridge.rgb_quality_snapshot()`）推进 `drop_stats`。**parquet 只是
+多几个 JSON 键，列与录制时序一个没动**——「丢帧统计」与「换编码器」提示的文案也
+一个字没改。
 
 **调用关系**：被 `ui/main_window.py`（主程序）、`tools/tests/d435_e2e_test.py`、`tools/tests/device_panel_gui_smoke_test.py`、`tools/tests/exposure_control_test.py` 引用；调用了 `core/camera.py` 与 `core/egodata_writer.py`。
 
@@ -933,6 +952,36 @@ rows/cols 映射，点击"选择"弹出子级 `MatrixConfigDialog` 逐部位编�
 
 **调用关系**：被 `core/`（`recording_record.py`、`egodata_writer.py`、`hand_tracking.py`、`session_timeline.py`、`session_catalog.py`）、`ui/`（`main_window.py`、`camera_widget.py`、`playback_dialog.py`、`upload_dialog.py`）、`scripts/process_hands.py`、`tools/tests/` 各 import 点引用；其中 `session_summary` 供录制历史面板生成"摄像机"列摘要，`send_to_recycle_bin` 供回放对话框删除会话。自身 `from config import settings`。
 
+### core/frame_gap.py
+
+**作用**：帧间隔**空洞**看门狗，纯算术类（零 Qt、零 IO、零第三方依赖，故离线
+审计脚本能直接 import）。录制侧（`core/pipeline.py` 的写入线程）与
+`tools/audit_frame_gaps.py` **共用这一个类**——空洞的定义只此一份，否则两边口径
+迟早漂移。
+
+```
+空洞 = 相邻两帧时间差 − 标称帧间隔（30fps → 33_333_333 ns）
+```
+
+只报「断了多久」，不判「丢了几帧」（帧率本就不恒定，反推帧数会给出看似精确实则错
+的数字）。日志里 `[录制] RGB 帧空洞 4648ms` 与 parquet 的 `*_gap_ms` 报的就是这个数。
+
+| 名称 | 签名要点 | 作用 |
+|---|---|---|
+| `GapWatch` | `(nominal_ns, min_gap_ns)` | `min_gap_ns` 是**间隔**下限（不是超出量），默认取 `settings.GRIPPER_RGB_GAP_MIN_MS`；间隔 ≥ 它才记为空洞 |
+| `GapWatch.note` | `(ts_ns, source) -> int` | 记一帧，返回本次空洞 ns（0 = 正常/跳过）。`source`：`"hw"`（帧自带的采集时刻）/ `"mono"`（出队瞬间的宿主单调钟，用于无时间戳槽位）；**本段首帧决定基座**，之后 source 不符的帧只累加 `frames`、不参与空洞计算 |
+| `GapWatch.snapshot` | `() -> dict` | `frames / span_ns / gap_ns / gap_max_ns / gap_count / gap_max_at_ns / resyncs …`（全 int） |
+| `GapWatch.reset` | `()` | 每段录制开始时归零 |
+
+**两个坑（都写进了回归用例）**：① `ts_ns == 0` 是「无时间戳」哨兵，但**负值是合法
+时刻**——早年段的设备钟是有符号 32 位计数器，按 `<= 0` 跳过会把整段负值区当「无戳」
+并凭空造出假空洞；② 混源（设备钟与宿主钟混喂）会把两个时钟的基准差当成一次天文
+数字级的空洞，所以基座一旦锁定就不再接受另一种 source。
+
+**调用关系**：被 `core/pipeline.py`（`_ext_gap_watch`）与 `tools/audit_frame_gaps.py`
+import；回归 `tools/tests/test_frame_gap.py`。背景见
+[postmortem 第四节](postmortem_trajectory_and_rgb.md)。
+
 ### core/stereo_depth.py
 
 **作用**：双目深度计算模块。`StereoDepthComputer` 基于手写 OpenCV
@@ -972,6 +1021,7 @@ rows/cols 映射，点击"选择"弹出子级 `MatrixConfigDialog` 逐部位编�
 | `core/gripper/fays_serial_probe.py` | 经官方 VI Kit SDK 读 S80M 产品序列号 |
 | `core/gripper/bridge.py` | 夹爪 rig 与主程序的 Qt 桥（后台线程采集 → 队列信号回主线程） |
 | `core/gripper/decxin_exposure.py` | 连夹爪时把 DECXIN 的曝光/白平衡写回自动档（状态存在相机机身里、逐台各一份） |
+| `core/gripper/rgb_quality.py` | RGB 采集质量仪表：`RgbReadWatch`（read() 失败连击的进入/限频/恢复三态告警）+ `MaxLagWatch`（emit 与派发滞后峰值）；纯记账，日志行由调用方 `_log` |
 | `core/gripper/affinity.py` | 夹爪 CPU 预留（主进程掩码收窄 + raw 流接收线程专用核） |
 | `core/gripper/tactile_process_worker.py` | Sightac 触觉计算子进程 |
 | `core/gripper/slam/` | 桥接进程控制器与 stdout 协议解析（`process_controller.py` / `protocol.py`） |
@@ -1069,6 +1119,33 @@ WBTmp=6500/ET=312 是原厂存储态。异常一律不外泄：枚举失败＝�
 才能 v4l2-ctl」的由来）。纯附加动作，异常只记日志（画面暗是小事，连不上是
 大事）。离线回归 `tools/tests/test_decxin_exposure.py`，含「调用点必须早于
 `select()`」的静态断言。
+
+### core/gripper/rgb_quality.py
+
+**作用（v1.3.10）**：RGB 采集质量的**纯记账**仪表。2026-09-18 那 4.68s 空洞当时
+在所有计数器里都是 0——因为「相机侧没帧可读」「emit 帧槽被顶掉」「GUI 主线程卡顿」
+这三条路在 parquet 里留下**完全相同的签名**，日志里一行都没写。本模块把三条路分开
+记账，只返回日志行列表，由调用方（`bridge._log`）落地。
+
+| 类 | 接口 | 语义 |
+|---|---|---|
+| `RgbReadWatch` | `note_fail(mono_ns, *, reconnects, error)` / `note_ok(mono_ns, *, reconnects, error)` / `snapshot()` | `read()` 失败连击的**进入一次 / 按 `GRIPPER_RGB_STALL_REPEAT_S` 限频 / 恢复一次**三态告警（去抖契约照抄 `slam/process_controller.py` 的 `FaysRateAlarm`）；停摆期间的错误信息本地留一份带进恢复行（`read()` 一成功相机会清掉 `last_transport_error`，否则最有用的那句正好在恢复时丢掉） |
+| `MaxLagWatch` | `note(lag_ns)` / `snapshot()` | 滞后峰值 + 样本数，emit 滞后与 GUI 派发滞后各一个实例 |
+| `RgbReadWatch.note_overwrite()` | `()` | latest-wins 帧槽被顶掉的计数（「帧采到了、但没人及时取走」的唯一证据） |
+
+`snapshot()` 的键全为 int，直接喂 `CameraPipeline.note_drop_stats` 落进 parquet
+的 `drop_stats`（键带 `_ms`/`_count` 后缀，**不加进帧数**，见
+`core/pipeline.is_frame_drop_key`）。
+
+**线程契约**：类内自带锁（O(1)、无分配，除告警那一次）；`bridge` 侧只在 RGB 线程
+写、主线程读；`reconnect_count` 是普通 int、**只算段内增量**（reset 时记基座）。
+**RGB 线程绝不做文件 IO、绝不 emit**（`_emit_loop` 是桥接唯一的信号出口）。
+
+**调用关系**：`core/gripper/bridge.py`（`_rgb_run` 的失败/成功分支、`_post_frame`
+的早退分支、`_emit_loop` 的滞留测量）、`ui/main_window.py` 与 `ui/lite_window.py`
+（派发滞后 + 录制结束汇总）；离线回归 `tools/tests/test_rgb_quality.py`，含
+「门槛差 1ms 不许开火」的反向用例。判据表见
+[postmortem §4.6](postmortem_trajectory_and_rgb.md)。
 
 ## 数据流
 

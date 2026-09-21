@@ -25,7 +25,8 @@ Windows 下用 `run.bat`（自动设置 Qt 平台插件路径后运行 `main.py`
 python -m venv venv && venv/bin/pip install -r requirements.txt
 ```
 
-说明：`pyrealsense2`、`opencv-python`、`torch` 等未列入 `requirements.txt`
+说明：`opencv-python`、`pyrealsense2`、`scipy` / `pydantic` / `polars` / `loguru`
+（手套骨架解算）均在 `requirements.txt` 内；`mediapipe`、`torch` 等可选依赖未列入
 （按需在 venv 内安装；`main.py` 对 torch 做可选导入，缺失时自动跳过）。
 
 首次运行无需手动建配置：`data/tasks.json` 在首次读取时由程序写入内置种子
@@ -130,7 +131,7 @@ VENV_PY=/path/to/python ./tools/hand_3d_d435/run_live_d435.sh
 | `data/` | 本地配置（仓库提供 `*.example.json` 模板与出厂默认 `device_params.json`；其余配置、录制数据、SQLite 均 gitignore） | `docs/data.md`（本文档集） |
 | `tools/demos/` | 交付版 demo：S80M 深度引擎 demo、双目 2D demo、手套关键点 demo、hdf5 演示、标定自检脚本 | `docs/demos.md` |
 | `tools/hand_detection/` | 手部检测：YOLO 手套检测（`best.pt`、`world_detector.py`）、MediaPipe 裸手管线、`demo_stereo_hands.py` | `docs/hand_detection.md` |
-| `scripts/` | 录制后离线处理：手部关键点提取/标注/可视化导出（`process_hands.py`） | `docs/scripts.md` |
+| `scripts/` | 录制后离线处理：手部关键点提取/标注/可视化导出（`process_hands.py`）；离线部署打包（`pack_wheels.py`）与手套工具包裁剪（`pack_toolkit.py`） | `docs/scripts.md` |
 | `tools/stereo_s80m/` | S80M 双目工具：`read_stereo_rgb.py`、`stereo_triangulate.py`、`render_stereo.py`、`hand_3d/`、离线 SLAM 导出（`export_offline_slam_dataset.py`、`validate_offline_dataset.py`） | `docs/stereo_s80m.md` |
 | `tools/` | 诊断与手部 3D 工具：`diag_*.py`、`hand_3d_d435/`（独立 D435 3D 手部管线模块）、`hand_3d_s80c/`（S80C 双目实时裸手/手套关键点 demo，含自包含 SDK）、`fayssense_depth_sdk/`（FaysSense VI Kit 深度引擎 SDK，专有）、`glove_package/`、`tests/`（回归/冒烟测试）、`weights/`（大权重）、`models/`（模型权重） | `docs/tools.md` |
 | `ui/` | PyQt5 界面：`main_window.py`、`camera_grid.py`、`playback_dialog.py`（回放）、`upload_dialog.py`、`task_page.py`、`device_panel.py`（设备检测面板）等 | `docs/ui.md` |
@@ -138,6 +139,7 @@ VENV_PY=/path/to/python ./tools/hand_3d_d435/run_live_d435.sh
 | `keypoints_output/` | 录制后手部关键点输出（镜像录制目录结构，gitignore） | — |
 | `dist/` | 自包含 demo 发布包（gitignore） | — |
 | `venv/`、`tools/weights/` | 虚拟环境、CLIP 等大权重（均 gitignore） | — |
+| `stouch_glove_toolkit*/` | 手套工具包（骨架解算运行时；由 `start.bat`/`start.sh` 的 `[4/7]` 从 `wheels/toolkit/glove_toolkit.zip` 展开到项目根，gitignore） | `docs/scripts.md`（`pack_toolkit.py`） |
 | `docs/` | 本文档目录 | — |
 
 ### 根目录文件
@@ -145,9 +147,9 @@ VENV_PY=/path/to/python ./tools/hand_3d_d435/run_live_d435.sh
 | 文件 | 说明 |
 |---|---|
 | `main.py` | 主入口：qt-material `dark_teal` 暗色主题；先做 torch 可选导入（避免 DLL 冲突），并修复 cv2 覆盖 `QT_QPA_PLATFORM_PLUGIN_PATH` 导致的 Qt 平台插件加载问题，然后启动 `ui.main_window.MainWindow` |
-| `start.bat` / `start.sh` | Windows / Linux 一键部署：无 Python 时自动安装、建 venv、装依赖并启动主程序；子命令 `reinstall` / `extras` / `extras-torch` / `help` |
+| `start.bat` / `start.sh` | Windows / Linux 一键部署（7 步）：无 Python 时自动安装、建 venv、装依赖、展开随包手套工具包（`[4/7]`，缺失只告警）、冒烟自检并启动主程序；子命令 `reinstall` / `extras` / `extras-torch` / `help` |
 | `.gitattributes` | 换行符规范化：`*.bat` 强制 CRLF，保证客户从 GitLab 下载后双击可用 |
-| `requirements.txt` | 核心依赖：PyQt5、numpy（<2）、pyarrow、imageio-ffmpeg、bleak、qt-material、h5py、requests、pygrabber、comtypes、pyvista、pyvistaqt |
+| `requirements.txt` | 核心依赖：PyQt5、numpy（<2）、opencv-python、pyarrow、imageio-ffmpeg、bleak、qt-material、h5py、requests、pygrabber、comtypes、pyvista、pyvistaqt、pyserial、**pyrealsense2**（D435/D405）+ 骨架解算组 **scipy / pydantic / polars / loguru**（共 19 项） |
 | `.gitignore` | 排除录制数据（`data/recordings/`、`data/*.db`）、真实配置文件、venv、keypoints_output、大权重等 |
 | `run.sh` / `run.bat` | Linux / Windows 启动脚本（使用 venv 解释器运行 `main.py`） |
 | `README.md` | 仓库说明（开发者向，中英双语合并版：英文在前、中文在后，顶部章节导航表） |

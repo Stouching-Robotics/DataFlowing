@@ -24,6 +24,10 @@ from config.i18n import tr
 def encode_gripper_force_matrix(m: np.ndarray, spec: str = "int16") -> list:
     """触觉力矩阵编码（P4 泵线程，返回扁平数值列表）。
 
+    **只是 `encode_gripper_force_matrix_array(...).tolist()` 的皮**：编码只有
+    一份实现（在 array 版里），本函数保证与它逐位同值。落盘主路径已改走
+    array 版（见那边的说明），本函数留给历史调用方与测试。
+
     spec 取 settings.GRIPPER_FORCE_MATRIX_SPECS 之一。
 
     **注意**：省略 spec 时走的是函数签名默认 "int16"（兼容历史调用的冻结
@@ -56,13 +60,36 @@ def encode_gripper_force_matrix(m: np.ndarray, spec: str = "int16") -> list:
       倍率必须由 info.json features.scale 携带，writer 与 demo 都按
       scale + 列类型共同判别，不要只看元素类型。
     """
+    return encode_gripper_force_matrix_array(m, spec).tolist()
+
+
+def encode_gripper_force_matrix_array(m: np.ndarray,
+                                      spec: str = "int16") -> np.ndarray:
+    """同上，但返回**一维 ndarray**（不 .tolist()，值逐位相同）。
+
+    为什么要多这一版（2026-09-18 实测）：writer 建 `list<int16>` 列时，
+    pyarrow 对 Python list 是**逐值装箱**——185 帧 × 187500 点 = 538ms 且
+    全程持 GIL；换成 ndarray 后同一列 13.5ms、最长停摆 3.6ms（噪声底
+    0.9ms）。那 538ms 正好落在收尾窗口，把原始流接收线程挡在 `recv()`
+    外面，服务端 16 包队列（≈0.53s）一满就主动 close ⇒ 停止即断链
+    （实测 55 次「完成」54 次断链，中止路径不写 parquet ⇒ 0/11）。
+    所以省掉的不只是 0.6s，是那条断链的成因。
+
+    ★ **返回值一定是自己的副本**，绝不是 `m` 的视图：`m` 来自桥接的
+      latest-wins 单槽（下一帧原地改写），交视图出去会让整段落盘变成
+      最后一帧的值——不报错、只是数据全错。
+
+    ★ 落盘契约没变：元素仍是 int16 系 / float32 系两家族，倍率照旧只靠
+      info.json features.scale 携带（见上面 list 版的说明）。
+    """
     if spec not in settings.GRIPPER_FORCE_MATRIX_SPECS:
         raise ValueError(f"未知力矩阵规格 {spec!r}")
     arr = np.asarray(m, dtype=np.float32)
     if spec == "float32":
-        # 与整数档同为「扁平 250×750 列表」，只有元素类型不同：
-        # 读取端统一 reshape(-1,750) 后再按 dtype 决定是否 cumsum
-        return arr.reshape(-1).tolist()
+        # 与整数档同为「扁平 250×750」，只有元素类型不同：
+        # 读取端统一 reshape(-1,750) 后再按 dtype 决定是否 cumsum。
+        # copy=True：m 可能就是调用方那块复用缓冲，必须拷出来。
+        return np.array(arr.reshape(-1), dtype=np.float32, copy=True)
     scale = settings.GRIPPER_FORCE_MATRIX_SCALES[spec]
     rows = int(arr.shape[0])
     flat = arr.reshape(rows, -1)
@@ -75,7 +102,8 @@ def encode_gripper_force_matrix(m: np.ndarray, spec: str = "int16") -> list:
     d = np.empty_like(q)
     d[:, 0] = q[:, 0]
     d[:, 1:] = q[:, 1:] - q[:, :-1]   # int16 mod 2^16 回绕
-    return np.frombuffer(d.tobytes(), dtype=np.int16).tolist()
+    # d 是这里新分配的，直接当返回值交出去（不是 m 的视图）
+    return d.reshape(-1)
 
 
 def describe_gripper_matrix_spec(spec: str) -> str:

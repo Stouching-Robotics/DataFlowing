@@ -36,7 +36,9 @@ exports/
 # 本地取回的录制素材与上色产物（双目原视频等，体积大且属外部数据）
 rec001(1)/
 tools/weights/
-wheels/          # scripts/pack_wheels.py 生成的离线部署包（不入库，拷给客户用）
+# scripts/pack_wheels.py 生成的离线部署包（不入库，拷给客户用）
+# 注意: 行尾不能写 # 注释 —— gitignore 只认行首的 #，行尾的会被当成模式正文
+wheels/
 imgui.ini
 .polyscope.ini
 tools/stereo_s80m/offline_slam_output/
@@ -94,3 +96,6 @@ core/gripper/orb_slam_src/FaysSense_VI_Kit_Release/config
 # scripts/pack_lite.py 收集时复制进去的产物，同样不入库——原先的 !负向规则
 # 已随之删除，否则每次重打包都会留下未跟踪副本。
 lite_package/*
+
+# 对外接口文档等 Word 产物：随包发送，不入代码库
+*.docx

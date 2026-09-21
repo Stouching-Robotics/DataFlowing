@@ -15,6 +15,14 @@ import os
 _base = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _base)
 
+# ── 运行环境守卫（必须在 PyQt5 import 之前）────────────────────────
+# 用错解释器（没激活 venv_lite / 激活了 conda 或别的 venv）时，真正的报错是
+# "No module named 'PyQt5'" 这种看不出该怎么办的信息。这里提前判断关键依赖
+# 是否真的缺，缺了就直接给出可照抄的启动命令（细节见模块注释）。
+from core.startup_guard import enforce as _enforce_env
+
+_enforce_env(_base, "lite")
+
 from PyQt5.QtWidgets import QApplication, QDesktopWidget
 from PyQt5.QtCore import Qt
 

@@ -20,7 +20,7 @@ import numpy as np
 from PyQt5.QtWidgets import QApplication
 
 from config import settings
-from core.pipeline import CameraPipeline
+from core.pipeline import CameraPipeline, frame_drop_total
 
 OUT_ROOT = "/tmp/imu_pending_test"
 FAILS = []
@@ -144,10 +144,18 @@ def main():
         time.sleep(0.02)
     check(bool(finished), "recording_finished 触发（_finish_async 完成）")
     check(writer.ended, "writer.end_episode 被调用")
-    check(pip.last_drop_stats == {"ext:stereo_left": 3, "imu_overflow": 2},
+    # v1.3.10 起落盘侧还会记帧空洞：本用例合成的时间轴是 A(i=0)/B(i=1)/F(i=5)，
+    # F 与 B 之间正好跨 4 个标称间隔（133.3ms ≥ 100ms 门槛）——这不是噪声，
+    # 正是「帧确实到了队列、但落盘行之间有空」的形态，被如实记成 1 个 100ms 的洞。
+    expect = {"ext:stereo_left": 3, "imu_overflow": 2,
+              "stereo_left_gap_ms": 100, "stereo_left_gap_max_ms": 100,
+              "stereo_left_gap_count": 1}
+    check(pip.last_drop_stats == expect,
           f"last_drop_stats 快照: {pip.last_drop_stats}")
-    check(writer.drop_stats == {"ext:stereo_left": 3, "imu_overflow": 2},
+    check(writer.drop_stats == expect,
           "丢帧统计注入 writer（元数据回写路径）")
+    check(frame_drop_total(pip.last_drop_stats) == 3,
+          "帧数口径只数 ext:（空洞键不算丢帧，否则用户会被指去调编码器）")
 
     print()
     if FAILS:

@@ -1,0 +1,22 @@
+[Unit]
+Description=EgoData remote data storage mount
+After=network-online.target
+Wants=network-online.target
+Before=egodata-backend.service egodata-api.service egodata-worker.service
+# 挂载是整条链路的地基:网络/换网/休眠导致断线时不要放弃重试,一直试到挂上为止
+StartLimitIntervalSec=0
+
+[Service]
+Type=forking
+# 断线后挂载点可能残留成"僵尸挂载"(Transport endpoint is not connected):
+# 此时 mkdir/stat 都会失败,重试再多次也挂不上。先强制(惰性)卸载清掉残留,
+# 失败用 "-" 前缀忽略(本来就没挂载时 fusermount 会返回非零)。
+ExecStartPre=-/usr/bin/fusermount3 -u -z /home/stouching/.cache/egodata-data
+ExecStartPre=/usr/bin/mkdir -p /home/stouching/.cache/egodata-data
+ExecStart="/home/stouching/Desktop/Date-V/processor/.tools/sshfs/usr/bin/sshfs" "Stouch@192.168.110.41:/vol1/docker/odoo-dev/Data Acquisition/data" /home/stouching/.cache/egodata-data -o IdentityFile=/home/stouching/.ssh/id_rsa -o StrictHostKeyChecking=no -o reconnect -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o idmap=user -o cache=yes -o cache_timeout=10
+ExecStop=/usr/bin/fusermount3 -u -z /home/stouching/.cache/egodata-data
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

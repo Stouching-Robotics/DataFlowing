@@ -1,0 +1,17 @@
+[Unit]
+Description=EgoData processing worker
+After=network-online.target egodata-api.service egodata-storage.service
+Requires=egodata-storage.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/stouching/Desktop/Date-V/processor
+EnvironmentFile=%h/.config/egodata-worker-env
+ExecStart=/home/stouching/Desktop/Date-V/processor/.venv-linux/bin/python -m worker
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

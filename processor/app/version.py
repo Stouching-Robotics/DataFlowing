@@ -33,4 +33,9 @@
 # 1.8.5 顺带删掉 renderGroupedWorkspaceLegacy(187 行死代码,全仓库零调用,
 #       里面还留着一份同样的 × 按钮)。它不渲染,删它纯粹是防止将来有人
 #       复活它把 × 带回来 —— 用户可见行为与 1.8.4 完全相同
-__version__ = "1.8.5"
+# 1.8.6 部署加固:systemd 单元入库(scripts/systemd/host-units/,含安装脚本与
+#       说明)。修「换网络/休眠后整套服务静默挂掉」:挂载加僵尸态自愈
+#       (启动前 fusermount3 -u -z)、API/worker 改 Requires+After 挂载、
+#       Restart 一律 always;另加每分钟看门狗自动重挂/重启。纯运维配置,
+#       无代码行为与用户可见变化
+__version__ = "1.8.6"

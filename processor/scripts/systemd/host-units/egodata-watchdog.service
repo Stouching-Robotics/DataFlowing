@@ -1,0 +1,7 @@
+[Unit]
+Description=EgoData watchdog (storage mount + API health)
+
+[Service]
+Type=oneshot
+ExecStart=/home/stouching/.local/bin/egodata-watchdog.sh
+Environment=XDG_RUNTIME_DIR=/run/user/1000

@@ -1,0 +1,18 @@
+[Unit]
+Description=EgoData API (uvicorn, port 8000)
+After=network-online.target egodata-storage.service
+# 数据在 NAS 上:挂载没就绪就别启动(否则启动扫描会撞上死挂载直接崩)
+Requires=egodata-storage.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/stouching/Desktop/Date-V/processor
+ExecStart=/home/stouching/Desktop/Date-V/processor/.venv-linux/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

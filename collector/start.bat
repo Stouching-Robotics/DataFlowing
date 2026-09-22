@@ -72,7 +72,11 @@ if not exist "main.py"          goto :errG
 if not exist "requirements.txt" goto :errG
 
 rem ────────────────────────────────────────────────────────────
-rem  [1/7] 定位 Python（版本需 >= 3.10，推荐 3.12）
+rem  [1/7] 定位 Python 3.10（SDK 加密链的 ABI 要求，不是「及以上」）
+rem  为什么不接受 3.12: tools\glove_sdk\algorithm\ 是 PyArmor 按 3.10 ABI 加密的
+rem  （引用了 3.11 起移除的 _PyFloat_Pack8），别的版本下 import sdk.api 直接
+rem  失败 —— 那时整条手套链路都不可用，不是「少个骨架」那么轻。
+rem  所以候选只认 3.10: py -3 / python 留在后面，是给「恰好就是 3.10」的机器兜底。
 rem ────────────────────────────────────────────────────────────
 set "PY="
 set "VPY=venv\Scripts\python.exe"
@@ -82,16 +86,18 @@ goto :have_python
 
 :find_py
 echo  [1/7] 检查 Python 环境 ...
-call :try_py py -3.12
+call :try_py py -3.10
 if defined PY goto :have_python
 call :try_py py -3
 if defined PY goto :have_python
 call :try_py python
 if defined PY goto :have_python
 
-rem ── 未检测到 → 自动下载并静默安装 Python 3.12 ──
-echo  [1/7] 未检测到 Python，自动下载安装 Python 3.12（约 25MB）...
-set "PY_VER=3.12.10"
+rem ── 未检测到 → 自动下载并静默安装 Python 3.10 ──
+rem  3.10.11 是 3.10 系列最后一个带 Windows 安装包的版本（3.10.12 起只有源码包）。
+rem  三个镜像的路径格式与官方一致，实测都是 29037240 字节（== python.org 官方站）。
+echo  [1/7] 未检测到 Python，自动下载安装 Python 3.10.11（约 28MB）...
+set "PY_VER=3.10.11"
 set "PY_EXE=%TEMP%\python-%PY_VER%-amd64.exe"
 set "PY_URL=https://mirrors.aliyun.com/python-release/windows/python-%PY_VER%-amd64.exe"
 set "PY_URL2=https://registry.npmmirror.com/-/binary/python/%PY_VER%/python-%PY_VER%-amd64.exe"
@@ -111,7 +117,7 @@ copy /y "wheels\python-%PY_VER%-amd64.exe" "%PY_EXE%" >nul
 echo  [1/7] 静默安装 Python 中（请勿关闭窗口，约 1 分钟）...
 "%PY_EXE%" /quiet InstallAllUsers=0 PrependPath=1 Include_pip=1 Include_test=0 Include_launcher=1
 del "%PY_EXE%" >nul 2>&1
-call :try_py py -3.12
+call :try_py py -3.10
 if defined PY goto :have_python
 goto :errA
 
@@ -130,16 +136,25 @@ rem 这两类都不该让用户去猜: 一律先离线修（ensurepip 用 Python 自带组件），
 rem 修不动就整目录重建（同样不联网）。
 if not exist "%VPY%" goto :make_venv
 if "%FORCE%"=="1" goto :reinstall_venv
-rem 体检 ①: 解释器本身能不能跑、版本够不够（拷来的 venv 在这里现形）
-"%VPY%" -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
+rem 体检 ①: 解释器本身能不能跑（拷来的 venv 在这里现形）
+"%VPY%" -c "import sys" >nul 2>&1
 if errorlevel 1 goto :venv_broken
-rem 体检 ②: pip 是否完整（半装 pip 在这里现形）
+rem 体检 ②: 版本必须**恰好** 3.10（不是 >=）—— 3.12 的 venv 起得来，但手套
+rem  SDK 在里面 import 不了。这类「起得来但功能缺一块」的失败最难排查，而且
+rem  老客户机上那个 venv 正是 3.12 的，所以当成「venv 不可用」直接重建。
+"%VPY%" -c "import sys; sys.exit(0 if sys.version_info[:2] == (3, 10) else 1)" >nul 2>&1
+if errorlevel 1 goto :venv_wrong_ver
+rem 体检 ③: pip 是否完整（半装 pip 在这里现形）
 "%VPY%" -m pip --version >nul 2>&1
 if not errorlevel 1 goto :deps_check
 echo  [2/7] 检测到 venv 的 pip 不完整，正在离线修复 ...
+call :purge_pip
 "%VPY%" -m ensurepip --upgrade >nul 2>&1
 "%VPY%" -m pip --version >nul 2>&1
 if not errorlevel 1 goto :deps_check
+:venv_wrong_ver
+echo  [2/7] 已有 venv 不是 Python 3.10，自动重建 —— 手套 SDK 要求 3.10。
+goto :reinstall_venv_do
 :venv_broken
 echo  [2/7] venv 不可用（pip 缺失或解释器异常），自动重建（不需要联网，约 1 分钟）...
 goto :reinstall_venv_do
@@ -149,6 +164,11 @@ echo  [2/7] reinstall: 删除旧 venv ...
 rmdir /s /q "venv" 2>nul
 if exist "%VPY%" goto :errC2
 :make_venv
+rem PY 可能正指向刚被删掉的那只 venv python —— reinstall 与「体检不过自动重建」
+rem 走的都是这条路: 原脚本在这里拿已删除的解释器去建 venv，于是静默失败
+rem （start.bat reinstall 一直是坏的）。清空 PY，重新走一遍解释器查找。
+if /i "%PY%"=="%VPY%" set "PY="
+if not defined PY goto :find_py
 echo  [2/7] 创建虚拟环境 venv（首次约 1 分钟）...
 rem 注意: PY 是命令（py -3.12 / python），不能加引号
 %PY% -m venv "venv"
@@ -191,60 +211,83 @@ if errorlevel 1 goto :errD
 > "venv\.deps-ok" echo %SIG%
 
 rem ────────────────────────────────────────────────────────────
-rem  [4/7] 手套工具包（手部骨架解算）
-rem  实时骨架解算依赖项目根同级的 stouch_glove_toolkit*（core\glove_keypoint_solver.py
-rem  的 find_toolkit_dir() 按目录名找）。裁剪版随 wheels\ 分发，首次部署在这里展开。
-rem  **缺失只警告、不拦截** —— 触觉/IMU/相机录制都不受影响。
+rem  [4/7] 手套厂商 SDK（传输 + 触觉降噪 + 骨架解算）
+rem  手套链路（串口采集、设备枚举、骨架解算）整体走 tools\glove_sdk\
+rem  （core\glove_sdk_boot.py 的 find_sdk_dir() 找它）。裁剪版随 wheels\ 分发，
+rem  首次部署在这里展开。**缺失只警告、不拦截** —— 相机录制等都不受影响。
 rem ────────────────────────────────────────────────────────────
 :toolkit_check
 set "TOOLKIT="
-rem 注意: for /d 的集合加引号会当作字面名，通配符不展开 —— 不能加引号
-for /d %%D in (stouch_glove_toolkit*) do if not defined TOOLKIT set "TOOLKIT=%%~fD"
-if defined TOOLKIT goto :toolkit_verify
-if not exist "wheels\toolkit\glove_toolkit.zip" goto :toolkit_missing
+if exist "tools\glove_sdk\sdk\__init__.py" set "TOOLKIT=%CD%\tools\glove_sdk"
 
-echo  [4/7] 展开随包的手套工具包（骨架解算）...
-"%VPY%" -c "import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall('.')" "wheels\toolkit\glove_toolkit.zip"
-rem 注意: for /d 的集合加引号会当作字面名，通配符不展开 —— 不能加引号
-for /d %%D in (stouch_glove_toolkit*) do if not defined TOOLKIT set "TOOLKIT=%%~fD"
-if not defined TOOLKIT goto :toolkit_missing
+rem SDK 版本跟随 wheels\toolkit\glove_sdk.zip。**不能只看目录在不在**:
+rem 老机器上目录早就有了而 zip 换了版本 —— 只看目录名会永远不解压，症状是
+rem 「手套连上了但没反应/没有骨架」。所以按 zip 的大小+时间判断要不要覆盖解压
+rem （extractall 覆盖同名文件，天然即升级）。解压与探针各自独立记账，
+rem 探针因缺依赖失败时不至于每次启动都重解压 18MB。
+set "TK_ZIP_SIG=none"
+if exist "wheels\toolkit\glove_sdk.zip" for %%Z in ("wheels\toolkit\glove_sdk.zip") do set "TK_ZIP_SIG=%%~zZ-%%~tZ"
+if not exist "wheels\toolkit\glove_sdk.zip" goto :toolkit_verify
+set "TK_UNPACK="
+if exist "venv\.toolkit-unpacked" set /p TK_UNPACK=<"venv\.toolkit-unpacked"
+rem 要展开的两种情况: (1) zip 换了（戳不匹配）(2) 戳说"已展开"但目录不在 ——
+rem 陈旧戳（误删 / 上次解压中断 / 杀软隔离）。少了 (2) 就会「zip 就在旁边，
+rem 却永远不解压，还提示去开发机重打包」。
+set "TK_NEED="
+if not "%TK_UNPACK%"=="%TK_ZIP_SIG%" set "TK_NEED=1"
+if not defined TOOLKIT set "TK_NEED=1"
+if not defined TK_NEED goto :toolkit_verify
+
+echo  [4/7] 展开随包的手套 SDK ...
+"%VPY%" -c "import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall('tools')" "wheels\toolkit\glove_sdk.zip"
+if exist "tools\glove_sdk\sdk\__init__.py" set "TOOLKIT=%CD%\tools\glove_sdk"
+rem 只在真解出目录时才落戳，否则下次启动会自动重试（而不是永远跳过）
+if not defined TOOLKIT goto :toolkit_verify
+> "venv\.toolkit-unpacked" echo %TK_ZIP_SIG%
 
 :toolkit_verify
-rem 工具包在 != 能用: 解算链还要 scipy/pydantic/polars 等依赖，而它们都是惰性
-rem 导入 —— 上面的冒烟自检(import main)查不到。这里按「工具包 + 依赖签名」缓存结论。
-set "TK_SIG=%TOOLKIT%;%SIG%"
+if not defined TOOLKIT goto :toolkit_missing
+rem SDK 在 != 能用: 导入期还要 scipy/pydantic/loguru，且解释器必须是 3.10
+rem （加密链的 ABI）。冒烟自检(import main)查不到这些 —— 都是惰性导入，缺了
+rem 要到连手套时才报错。这里按「SDK 目录 + 依赖签名 + zip 签名」缓存结论。
+set "TK_SIG=%TOOLKIT%;%SIG%;%TK_ZIP_SIG%"
 if not exist "venv\.toolkit-ok" goto :toolkit_probe
 set /p TK_STAMP=<"venv\.toolkit-ok"
 if "%TK_STAMP%"=="%TK_SIG%" goto :toolkit_ok
 
 :toolkit_probe
-echo  [4/7] 校验骨架解算链 ...
-"%VPY%" -c "import sys; sys.path.insert(0,sys.argv[1]); from glove_sdk.interfaces.solver import HandSolver" "%TOOLKIT%" 2>"%TEMP%\daq_toolkit_err.txt"
+echo  [4/7] 校验手套 SDK ...
+rem 探针走 core\glove_sdk_boot 的自检入口（真实装配 + 传输/触觉/解算三段，
+rem 不是脚本里手写 sys.path + import —— 后者能过而主程序仍会失败），
+rem 错误原文由 Python 写文件、下面用 type 原样打 —— cmd 的 for /f 读
+rem 文件会按控制台代码页做一次转换、中文全变成 ?（见 glove_sdk_boot._main）。
+set "TK_ERR=%TEMP%\daq_toolkit_err.txt"
+del "%TK_ERR%" >nul 2>&1
+"%VPY%" -m core.glove_sdk_boot "%TK_ERR%" >nul 2>&1
 if not errorlevel 1 goto :toolkit_pass
-set "TK_ERR="
-for /f "usebackq delims=" %%L in ("%TEMP%\daq_toolkit_err.txt") do set "TK_ERR=%%L"
-del "%TEMP%\daq_toolkit_err.txt" >nul 2>&1
-echo  [4/7] [警告] 工具包在，但解算链导入失败（多半是依赖没装全）。
-echo         原因: !TK_ERR!
+echo  [4/7] [警告] SDK 目录在，但导入失败（多半是依赖没装全，或解释器
+echo         不是 3.10 —— 本 SDK 要求 3.10）。
+echo         原因:
+type "%TK_ERR%" 2>nul
+del "%TK_ERR%" >nul 2>&1
 echo         重装依赖: start.bat reinstall
-echo         主程序照常启动，只是没有手部骨架。
+echo         主程序照常启动，只是手套功能不可用。
 goto :after_deps
 
 :toolkit_pass
 del "%TEMP%\daq_toolkit_err.txt" >nul 2>&1
 > "venv\.toolkit-ok" echo %TK_SIG%
 :toolkit_ok
-echo  [4/7] 手套工具包就绪：实时手部骨架解算已具备
+echo  [4/7] 手套 SDK 就绪：采集 + 触觉降噪 + 骨架解算已具备
 goto :after_deps
 
 :toolkit_missing
-echo  [4/7] [警告] 未找到手套工具包 —— 主程序照常启动，但没有实时手部骨架解算。
-echo         补装: 在开发机执行 python scripts\pack_toolkit.py，
-echo         把生成的 wheels\ 整个拷到本目录后重跑 start.bat
+echo  [4/7] [警告] 未找到手套 SDK 目录（tools\glove_sdk\）—— 主程序照常启动，
+echo         但没有手套的采集与骨架解算。
+echo         补装: 把 wheels\toolkit\glove_sdk.zip 放到 wheels\toolkit\ 下重跑，
+echo         或在开发机执行 python scripts\pack_toolkit.py 生成它。
 goto :after_deps
 
-rem ────────────────────────────────────────────────────────────
-rem  [5/7] 依赖冒烟自检（导入完整主程序链）
 rem ────────────────────────────────────────────────────────────
 :after_deps
 echo  [5/7] 依赖自检 ...
@@ -307,21 +350,34 @@ goto :errF
 
 rem ────────────────────────────────────────────────────────────
 rem  子程序: 校验并记录可用 Python 解释器
-rem  参数: 解释器命令（如 "py -3.12" / "python"）
+rem  参数: 解释器命令（如 "py -3.10" / "python"）
 rem ────────────────────────────────────────────────────────────
 :try_py
-%* -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
+%* -c "import sys; sys.exit(0 if sys.version_info[:2] == (3, 10) else 1)" >nul 2>&1
 if errorlevel 1 exit /b 1
 set "PY=%*"
 exit /b 0
 
 rem ────────────────────────────────────────────────────────────
+rem ────────────────────────────────────────────────────────────
+rem  子程序: 清掉残缺的 pip（包目录 + dist-info）
+rem  ensurepip 的判据是 dist-info: 半装 pip 时包里的文件被删了、dist-info 还在，
+rem  而它的版本又恰好等于 Python 自带的那只 wheel → ensurepip 判「已满足」,
+rem  什么都不做（2026-09-21 在 Wine 真 cmd 里实测到）。必须先清干净再让它装回。
+rem  用解释器自己删而不用 .bat 通配符: for /d 的集合一加引号就不展开通配符,
+rem  不加引号又会在含空格的路径上出事 —— 这里不值得赌。
+rem ────────────────────────────────────────────────────────────
+:purge_pip
+"%VPY%" -c "import glob,os,shutil,sys;r=os.path.dirname(os.path.dirname(sys.executable));[shutil.rmtree(p,ignore_errors=True) for pat in (r+'/Lib/site-packages/pip',r+'/Lib/site-packages/pip-[0-9]*.dist-info',r+'/lib/python*/site-packages/pip',r+'/lib/python*/site-packages/pip-[0-9]*.dist-info') for p in glob.glob(pat)]" >nul 2>&1
+exit /b 0
+
 rem  子程序: pip 半装时的离线自救
 rem  ensurepip 用 Python 自带组件重装 pip，不联网；修不好返回非零，
 rem  由调用方决定是重试安装还是直接报错（再不行就只能重建 venv）。
 rem ────────────────────────────────────────────────────────────
 :repair_pip
 echo  [3/7] pip 异常，尝试离线修复 ...
+call :purge_pip
 "%VPY%" -m ensurepip --upgrade >nul 2>&1
 "%VPY%" -m pip --version >nul 2>&1
 exit /b %errorlevel%
@@ -399,17 +455,20 @@ rem  异常处理（错误码 A-G，与 使用说明.md 对应）
 rem ────────────────────────────────────────────────────────────
 :errA
 echo.
-echo  [错误 A] 未能找到或自动安装 Python 3.12
+echo  [错误 A] 未能找到或自动安装 Python 3.10
 echo  ------------------------------------------------------------
-echo   0. 已有 Python 但版本低于 3.10？按下面步骤安装 3.12 即可
-echo   1. 离线环境: 将 python-3.12.10-amd64.exe 放入本目录 wheels\ 后重试
+echo   注意: 必须是 3.10，**3.11/3.12 都不行** —— 手套 SDK 的解算核心按 3.10
+echo         ABI 加密，别的版本下 import 会失败、手套功能整体不可用。
+echo   0. 已有 Python 但版本不对（3.11/3.12 都算不对）？按下面装 3.10.11
+echo   1. 离线环境: 将 python-3.10.11-amd64.exe 放入本目录 wheels\ 后重试
 echo      （由管理员用 scripts\pack_wheels.py 生成，见使用说明.md）
-echo   2. 手动安装: 即将打开官网下载页，请下载 Python 3.12.x 64 位
+echo   2. 手动安装: 即将打开官网下载页，请下载 Python 3.10.11 64 位
+echo      （3.10 系列只有 3.10.11 及更早带安装包；3.10.12 起只有源码包）
 echo      安装时务必勾选 "Add python.exe to PATH"
 echo   3. 已安装仍报错: 电脑可能装有 Microsoft Store 版 Python 干扰，
 echo      请在 设置-应用 中卸载后安装官网版
 echo.
-start https://www.python.org/downloads/
+start https://www.python.org/downloads/release/python-31011/
 pause
 exit /b 1
 
@@ -442,7 +501,7 @@ echo   先看上一屏的报错，再对症处理:
 echo.
 echo   · 报 ModuleNotFoundError: pip._internal.cli / No module named 'pip'
 echo     → venv 里的 pip 坏了（升级被打断 / 杀软删了文件），不是网络问题。
-echo       直接双击 start.bat reinstall 重建 venv（约 1 分钟，不需要联网）。
+echo       重跑一次 start.bat 就会自动离线修好（几秒，不用重装）；仍报同一句再双击 start.bat reinstall 重建 venv（约 1 分钟，不需要联网）。
 echo   · 报 No Python at ... / 找不到 Python
 echo     → venv 是从别的机器拷来的，双击 start.bat reinstall 重建即可。
 echo   · 报 Could not find a version / connection / timeout / 证书错误

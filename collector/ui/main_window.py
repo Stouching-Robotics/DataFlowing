@@ -1423,6 +1423,12 @@ class MainWindow(QMainWindow):
         prefer = {"l": "left_glove", "r": "right_glove"}.get(
             (dev.display_name or "").strip().lower(), "")
         role = settings.assign_glove_sensor_role(dev.key, prefer)
+        if not role:
+            self._log(tr("[错误] 手套列已用满（{}），无法为 {} 分配传感器列；"
+                         "拒绝连接（再连会把两只手套写成同一列）",
+                         "/".join(settings.SENSOR_NAMES),
+                         self._device_label(dev)))
+            return False
         slot = f"sensor:{dev.key}"
         if slot not in self.grid.slot_ids():
             w = GloveWidget(slot, dev.address, role, self._device_label(dev))
@@ -1457,19 +1463,32 @@ class MainWindow(QMainWindow):
         from core.device_detector import usb_glove_prefer_side
         prefer = usb_glove_prefer_side(dev.serial or "")
         role = settings.assign_glove_sensor_role(dev.key, prefer)
+        if not role:
+            self._log(tr("[错误] USB 手套 {} 分配不到传感器列（{} 都已被占用）—— "
+                         "拒绝连接。未注册的序列号只能按空闲列分配（顺序即左右手），"
+                         "请把序列号写进 glove_devices.json 对应侧的 usb_serials "
+                         "后再连（否则会把两只手套写成同一列）",
+                         dev.serial or "-",
+                         "/".join(settings.SENSOR_NAMES)))
+            return False
         self._log(tr("[USB手套] 序列号 {} → 传感器列 {}（{}{}）",
                      dev.serial or "-", role,
-                     tr("工具包注册 ") if prefer else tr("未注册，"),
-                     prefer or tr("按空闲列分配")))
+                     tr("注册表绑定 ") if prefer else tr("未注册！"),
+                     prefer or tr("按空闲列分配（顺序即左右手，换手套请先注册）")))
+        # 画面已在网格里就别再造一个（与 BLE 路径 _open_glove 同款守卫）：
+        # 上面的 `dev.key in _workers` 幂等判据与末尾的 _workers 赋值之间有窗口，
+        # 面板开关连点/重扫时能走到这里两次，而 GloveWidget.start() 每调一次就
+        # 重连一遍 5 个 engine 信号（无去重）⇒ 同一路数据被推两遍。
         slot = f"sensor:{dev.key}"
-        w = GloveWidget(slot, dev.address, role, self._device_label(dev),
-                        engine=UsbGloveEngine(dev.address), on_log=self._log)
-        self.grid.add_widget(slot, w)
-        w.set_pipeline(self._pipeline)
-        w.start(dev.address)
+        if slot not in self.grid.slot_ids():
+            w = GloveWidget(slot, dev.address, role, self._device_label(dev),
+                            engine=UsbGloveEngine(dev.address), on_log=self._log)
+            self.grid.add_widget(slot, w)
+            w.set_pipeline(self._pipeline)
+            w.start(dev.address)
         self._pipeline.register_sensor(role)
         self._workers[dev.key] = self._device_manager.glove_entry(
-            slot, role, w, self._device_label(dev))
+            slot, role, self.grid.camera_widget(slot), self._device_label(dev))
         return True
 
     def _close_glove(self, dev_key: str):

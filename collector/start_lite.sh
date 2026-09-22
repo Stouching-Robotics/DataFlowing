@@ -15,6 +15,9 @@
 #
 #  夹爪(UMI/Fays S80M): 原生资源 core/gripper/native（约 460MB）随本包
 #  下发，[B] 会逐项校验，缺失报 [错误 B] 并拒启；Windows 包不带该资源。
+#
+#  ⚠️ 本脚本要求 Python **3.10**（不是"3.10 及以上"）: 手套的串口采集走厂商
+#     SDK 的传输层，而该 SDK 是按 3.10 ABI 加密的，别的版本下 import 即失败。
 # ============================================================
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -100,24 +103,43 @@ else
     echo "[B] 夹爪资源自检通过（7 项）"
 fi
 
-# ── [1/6] 定位 Python（>= 3.10，推荐 3.12）──
+# ── [1/6] 定位 Python 3.10（手套 SDK 加密链的 ABI 要求，**不是"及以上"**）──
+# 极简版虽然不解算骨架，但**手套的串口采集走 SDK 的传输层**，而 SDK 根下的
+# `algorithm/`（PyArmor 按 3.10 ABI 加密）就摆在那里 —— 版本不对时 `import sdk`
+# 是否失败取决于载荷是否含 algorithm，属于"看情况坏"，所以一律按 3.10 要求。
 PY=""
+PY_OK='import sys; sys.exit(0 if sys.version_info[:2] == (3, 10) else 1)'
 find_python() {
-    for c in python3.12 python3.11 python3.10 python3; do
-        if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+    for c in python3.10 python3 python; do
+        if command -v "$c" >/dev/null 2>&1 && "$c" -c "$PY_OK" 2>/dev/null; then
             PY="$(command -v "$c")"
             return 0
         fi
     done
     return 1
 }
-if [ -x venv_lite/bin/python ]; then
-    PY="venv_lite/bin/python"
-elif ! find_python; then
-    echo "[错误 A] 未找到 Python >= 3.10。请先安装:"
-    echo "  Ubuntu/Debian:  sudo apt install python3.12 python3.12-venv"
-    echo "  CentOS/RHEL:    sudo dnf install python3.12"
-    echo "  conda:          conda create -n daq_lite python=3.12"
+
+# 已有 venv_lite 的解释器版本也要查：老客户机上那个是 3.12 的，直接拿来用会
+# **静默**失去手套采集（升级后一切照旧，只有连手套时才现形）。
+VENV_PY="venv_lite/bin/python"
+VENV_REBUILD=0
+if [ -x "$VENV_PY" ]; then
+    if "$VENV_PY" -c "$PY_OK" 2>/dev/null; then
+        PY="$VENV_PY"
+    else
+        VENV_REBUILD=1
+        VENV_VER="$("$VENV_PY" -V 2>&1 || echo '无法运行')"
+        echo "[1/6] 已有 venv_lite 不是 Python 3.10（$VENV_VER），自动重建 —— 手套 SDK 要求 3.10。"
+    fi
+fi
+if [ -z "$PY" ] && ! find_python; then
+    echo "[错误 A] 未找到 Python 3.10。手套 SDK 按 3.10 ABI 加密，"
+    echo "         3.11/3.12 下 import 会失败、手套采集不可用。请先安装:"
+    echo "  Ubuntu 22.04:   sudo apt install python3.10 python3.10-venv"
+    echo "  Ubuntu 24.04+:  sudo add-apt-repository ppa:deadsnakes/ppa"
+    echo "                  sudo apt install python3.10 python3.10-venv"
+    echo "  CentOS/RHEL:    sudo dnf install python3.10"
+    echo "  conda:          conda create -n daq_lite python=3.10"
     exit 1
 fi
 echo "[1/6] 使用 Python: $PY"
@@ -130,32 +152,60 @@ echo "[1/6] 使用 Python: $PY"
 #      所有 pip 命令都报 ModuleNotFoundError: pip._internal.cli。
 # 这两类都不该让用户去猜: 先离线修（ensurepip 用 Python 自带组件），
 # 修不动就整目录重建（同样不联网）。
+purge_pip() {
+    # ensurepip 的判据是 dist-info: 半装 pip 时包里的文件被删了、dist-info 还在，
+    # 而它的版本又恰好等于 Python 自带的那只 wheel → ensurepip 判「已满足」，
+    # 什么都不做（2026-09-21 在 Wine 真 cmd 里实测到）。必须先清干净再让它装回。
+    rm -rf venv_lite/lib/python*/site-packages/pip venv_lite/lib/python*/site-packages/pip-[0-9]*.dist-info 2>/dev/null || true
+}
+
 venv_healthy() {
-    "$VPY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
+    # 版本必须**恰好** 3.10（不是 >=）—— 3.12 的 venv 起得来，但手套 SDK
+    # 在里面 import 不了，这类"起得来但功能缺一块"的失败最难排查。
+    "$VPY" -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 10) else 1)' \
         >/dev/null 2>&1 || return 1
     "$VPY" -m pip --version >/dev/null 2>&1 && return 0
     echo "[2/6] 检测到 venv_lite 的 pip 不完整，正在离线修复 ..."
+    purge_pip
     "$VPY" -m ensurepip --upgrade >/dev/null 2>&1 || true
     "$VPY" -m pip --version >/dev/null 2>&1
 }
 
+make_venv() {
+    # PY 可能正指向刚被删掉的那只 venv python —— reinstall 与「体检不过自动重建」
+    # 走的都是这条路，原脚本在这里拿已删除的解释器去建 venv，于是静默失败
+    # （./start_lite.sh reinstall 一直是坏的）。这时重新找一个系统 Python。
+    case "$PY" in
+        venv/*|venv_lite/*)
+            PY=""
+            find_python || {
+                echo "[错误 A] 未找到可用于重建 venv 的 Python 3.10"
+                exit 1
+            } ;;
+    esac
+    echo "[2/6] 创建虚拟环境 venv_lite（首次约 1 分钟）..."
+    "$PY" -m venv venv_lite
+}
+
 VPY="venv_lite/bin/python"
 if [ ! -x "$VPY" ]; then
-    echo "[2/6] 创建虚拟环境 venv_lite（首次约 1 分钟）..."
-    "$PY" -m venv venv_lite
-elif [ "$FORCE" = 1 ]; then
-    echo "[2/6] reinstall: 删除旧 venv_lite ..."
+    make_venv
+elif [ "$FORCE" = 1 ] || [ "$VENV_REBUILD" = 1 ]; then
+    if [ "$FORCE" = 1 ]; then
+        echo "[2/6] reinstall: 删除旧 venv_lite ..."
+    else
+        echo "[2/6] 旧 venv_lite 解释器版本不符，重建为 Python 3.10 ..."
+    fi
     rm -rf venv_lite
-    echo "[2/6] 创建虚拟环境 venv_lite（首次约 1 分钟）..."
-    "$PY" -m venv venv_lite
+    make_venv
 elif ! venv_healthy; then
     echo "[2/6] venv_lite 不可用（pip 缺失或解释器异常），自动重建（不需要联网，约 1 分钟）..."
     rm -rf venv_lite
-    "$PY" -m venv venv_lite
+    make_venv
 fi
 if [ ! -x "$VPY" ]; then
     echo "[错误 C] 虚拟环境创建失败:"
-    echo "  ① Ubuntu/Debian 先装: sudo apt install python3.12-venv"
+    echo "  ① Ubuntu/Debian 先装: sudo apt install python3.10-venv"
     echo "  ② 磁盘空间不足（需约 2GB）；③ 目录写权限；④ 路径含特殊字符"
     exit 1
 fi
@@ -186,7 +236,7 @@ err_d() {
     echo "  先看上一屏的报错再对症处理:"
     echo "  · 报 ModuleNotFoundError: pip._internal.cli / No module named 'pip'"
     echo "    → venv_lite 里的 pip 坏了（升级被打断 / 被杀软删了文件），不是网络问题。"
-    echo "      执行 ./start_lite.sh reinstall 重建（约 1 分钟，不需要联网）。"
+    echo "      重跑一次 ./start_lite.sh 就会自动离线修好（几秒，不用重装）；仍报同一句再执行 ./start_lite.sh reinstall 重建（约 1 分钟，不需要联网）。"
     echo "  · 报 Could not find a version / connection / timeout / 证书错误"
     echo "    → 才是网络问题: 检查网络；内网环境请用 scripts/pack_wheels.py --lite 生成 wheels/ 离线包。"
     exit 1
@@ -208,6 +258,7 @@ if [ "$NEED_INSTALL" = 1 ]; then
             err_d
         fi
         echo "[3/6] pip 异常，尝试离线修复 ..."
+        purge_pip
         "$VPY" -m ensurepip --upgrade >/dev/null 2>&1 || true
         "$VPY" -m pip --version >/dev/null 2>&1 || err_d
         echo "[3/6] pip 已修复，重试安装 ..."
@@ -216,18 +267,84 @@ if [ "$NEED_INSTALL" = 1 ]; then
     echo "$HASH" > venv_lite/.deps-lite-ok
 fi
 
-# ── [4/6] 冒烟自检 ──
-echo "[4/6] 依赖自检 ..."
+# ── [4/6] 手套 SDK（串口采集 + 触觉降噪）──
+# 极简版**不解算骨架**（不含 sdk.solver / algorithm），但手套的串口采集走
+# SDK 的传输层，触觉降噪也换成了它 —— 所以载荷与探针只覆盖这两段。
+# **缺失只警告、不拦截**：相机/夹爪录制都不受影响。
+TOOLKIT=""
+if [ -d "tools/glove_sdk" ]; then TOOLKIT="tools/glove_sdk"; fi
+
+TK_UNPACK_MARK="venv_lite/.toolkit-unpacked"
+TK_ZIP_SIG="none"
+if [ -f wheels/toolkit/glove_sdk.zip ]; then
+    TK_ZIP_SIG="$(md5sum wheels/toolkit/glove_sdk.zip | cut -d' ' -f1)"
+fi
+# 要展开的两种情况：①zip 换了（戳不匹配）②戳说"已展开"但目录不在 ——
+# 陈旧戳（误删 / 上次解压中断 / 杀软隔离）。少了 ② 就会「zip 就在旁边，
+# 却永远不解压，还提示去开发机重打包」。
+TK_NEED=""
+if [ -f wheels/toolkit/glove_sdk.zip ]; then
+    [ "$(cat "$TK_UNPACK_MARK" 2>/dev/null || echo '')" != "$TK_ZIP_SIG" ] \
+        && TK_NEED=1
+    [ -z "$TOOLKIT" ] && TK_NEED=1
+fi
+if [ -n "$TK_NEED" ]; then
+    echo "[4/6] 展开随包的手套 SDK ..."
+    # zip 里是裸的 glove_sdk/（不含 tools/ 前缀），所以解压目标是 tools/
+    # —— 位置只写在这一处，zip 本身与位置无关（再挪地方不用重打包）。
+    # extractall 会自己建 tools/，不必事先存在。
+    "$VPY" -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall("tools")' \
+        wheels/toolkit/glove_sdk.zip
+    [ -d "tools/glove_sdk" ] && TOOLKIT="tools/glove_sdk"
+    # 只在真解出目录时才落戳，否则下次启动会自动重试（而不是永远跳过）
+    [ -n "$TOOLKIT" ] && echo "$TK_ZIP_SIG" > "$TK_UNPACK_MARK"
+fi
+
+if [ -z "$TOOLKIT" ]; then
+    echo "[4/6] [警告] 未找到手套 SDK 目录（tools/glove_sdk/）—— 主程序照常启动，"
+    echo "        但手套采集不可用。补装: 把 wheels/toolkit/glove_sdk.zip 放到"
+    echo "        wheels/toolkit/ 下再重跑 ./start_lite.sh"
+else
+    TK_MARK="venv_lite/.toolkit-ok"
+    TK_SIG="$TOOLKIT:$HASH:$TK_ZIP_SIG"
+    if [ -f "$TK_MARK" ] && [ "$(cat "$TK_MARK" 2>/dev/null)" = "$TK_SIG" ]; then
+        echo "[4/6] 手套 SDK 就绪：$TOOLKIT"
+    else
+        echo "[4/6] 校验手套 SDK（$TOOLKIT）..."
+        # 探针走 core/glove_sdk_boot 的真实装配逻辑，且**只查传输与触觉两段**
+        # —— 查 solver_parts() 会把"极简版没有解算链"误判成"SDK 不可用"。
+        # 探针走 core/glove_sdk_boot 的自检入口，`--no-solver` 只查传输与
+        # 触觉两段 —— 查 solver_parts() 会把「极简版没有解算链」误判成
+        # 「SDK 不可用」。**错误原文由 Python 写文件、这里原样读**（让 cmd
+        # 去读会把中文变成 ?，原因见 glove_sdk_boot._main 的注释）。
+        TK_ERR_FILE="venv_lite/.toolkit-err.txt"
+        rm -f "$TK_ERR_FILE"
+        if "$VPY" -m core.glove_sdk_boot "$TK_ERR_FILE" --no-solver \
+                >/dev/null 2>&1; then
+            echo "$TK_SIG" > "$TK_MARK"
+            echo "[4/6] 手套 SDK 就绪：采集 + 触觉降噪已具备（骨架解算不在极简版内）"
+        else
+            echo "[4/6] [警告] SDK 目录在，但导入失败（多半是依赖没装全或"
+            echo "        解释器版本不对 —— 本 SDK 要求 Python 3.10）。"
+            echo "        原因: $(head -n 1 "$TK_ERR_FILE" 2>/dev/null)"
+            echo "        重装依赖: ./start_lite.sh reinstall"
+            echo "        主程序照常启动，只是手套采集不可用。"
+        fi
+    fi
+fi
+
+# ── [5/6] 冒烟自检 ──
+echo "[5/6] 依赖自检 ..."
 if ! "$VPY" -c "import main_lite" >/dev/null 2>&1; then
     echo "[错误 E] 依赖自检失败。查看具体原因:"
     echo "  venv_lite/bin/python -c \"import main_lite\""
     echo "重装: ./start_lite.sh reinstall"
     exit 1
 fi
-echo "[4/6] 依赖自检通过"
+echo "[5/6] 依赖自检通过"
 
-# ── [5/6] 启动 ──
-echo "[5/6] 启动极简采集 ..."
+# ── [6/6] 启动 ──
+echo "[6/6] 启动极简采集 ..."
 echo
 echo "【操作指引】"
 echo "  · 设备: 插入后约 2 秒自动出现在列表，选中后点 开启"

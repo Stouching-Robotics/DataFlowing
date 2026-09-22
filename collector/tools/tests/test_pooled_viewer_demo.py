@@ -327,6 +327,19 @@ def main() -> int:
               and vf.shape == (240, 320, 3))
         vf2 = s.videos[0][3]        # 跳转 seek
         check("数据层: 视频跳转读", isinstance(vf2, np.ndarray))
+        # 解码器位置契约：缓存命中只是"手上那一帧已经有了"，不该去 seek、
+        # 更不该顺手把顺序位置改写成 i+1 —— 那会让下一次顺序读从解错的位置
+        # 取帧（合成帧 B 通道 = 255*i/n，串帧一眼可见）。
+        rv = s.videos[0]
+        rv[20]                      # seek → cap 停在 21，20 进缓存
+        rv[5]                       # 再 seek → cap 停在 6
+        rv[20]                      # 缓存命中（此处若谎报位置 → _seq_next=21）
+        seqf = rv[21]               # 顺序读：必须真是第 21 帧
+        want_b = 255.0 * 21 / 30
+        check("数据层: 缓存命中后顺序读不串帧",
+              abs(float(seqf[10, 10, 0]) - want_b) < 8,
+              f"B={float(seqf[10, 10, 0]):.0f} 期望≈{want_b:.0f}"
+              f"（串帧会读成第 6 帧 ≈{255.0 * 6 / 30:.0f}）")
         vf3 = s.videos[0][99]       # 越界 → 保持最后一帧
         check("数据层: 视频越界保持", vf3 is not None)
 
@@ -335,7 +348,7 @@ def main() -> int:
               f"depth_videos={[v.name for v in s.depth_videos]}")
         check("数据层: 深度流全部可解码", not s.skipped_depth,
               f"skipped={s.skipped_depth}")
-        dv0 = s.depth_videos[0].read(0)
+        dv0 = s.depth_videos[0].read_sync(0)   # read() 非阻塞，取精确帧要 sync
         mean_bgr = tuple(int(x) for x in dv0.mean(axis=(0, 1)))
         check("数据层: 深度帧 JET 伪彩", isinstance(dv0, np.ndarray)
               and dv0.shape == (240, 320, 3)
@@ -344,31 +357,92 @@ def main() -> int:
         check("数据层: 近/远区域颜色分层",
               tuple(dv0[165, 160]) != tuple(dv0[20, 20]),
               f"hand {tuple(dv0[165, 160])} vs bg {tuple(dv0[20, 20])}")
-        dv_jump = s.depth_videos[0].read(10)     # 跳转 seek
+        dv_jump = s.depth_videos[0].read_sync(10)     # 跳转 seek
         check("数据层: 深度跳转读", isinstance(dv_jump, np.ndarray))
 
         # 深度随机访问回归：后退/大跳必须返回目标帧（旧实现后退返回
-        # 错帧——拖进度条时深度面板不动、与其它面板错帧的根因）
+        # 错帧——拖进度条时深度面板不动、与其它面板错帧的根因）。
+        # 解码现在跑在后台线程（read() 非阻塞），要精确帧走 read_sync。
         dv = s.depth_videos[0]
         old_max = mod.DepthVideo._PULL_FWD_MAX
         mod.DepthVideo._PULL_FWD_MAX = 5   # 缩小阈值，让 30 帧夹具覆盖重建路径
         try:
             ref = mod.DepthVideo(dv.path)
-            ref._open(5)
-            f5_ref = ref.read(5)
-            dv.read(0)
-            dv.read(25)          # 大跳前进 → -ss 重建
-            f5_back = dv.read(5)   # 后退 → 必须帧精确
+            f5_ref = ref.read_sync(5)
+            dv.read_sync(0)
+            dv.read_sync(25)       # 大跳前进 → -ss 重建
+            f5_back = dv.read_sync(5)   # 后退 → 必须帧精确
             check("深度: 后退 seek 帧精确",
                   isinstance(f5_ref, np.ndarray) and isinstance(f5_back, np.ndarray)
                   and np.array_equal(f5_ref, f5_back))
-            f7 = dv.read(7)        # 小步前进（顺序 pull 路径）
+            f7 = dv.read_sync(7)   # 小步前进（顺序 pull 路径）
             check("深度: 小步前进帧精确",
                   isinstance(f7, np.ndarray) and not np.array_equal(f7, f5_back))
             check("深度: 越界返回 None", dv.read(s.n + 5) is None)
         finally:
             mod.DepthVideo._PULL_FWD_MAX = old_max
             ref.close()
+
+        # ── 深度解码搬去后台线程（2026-09-21 卡顿修复）──
+        # 旧实现把 kill+`-ss` 重建+解码全放在 Qt 主线程上：后退 5 帧
+        # 242ms/前进 35 帧 157ms（848x480 HEVC 实测），拖进度条、←/→
+        # 跳帧都在主线程上等这一下 —— 这是"很卡"的主因。
+        dv3 = mod.DepthVideo(dv.path)
+        try:
+            dv3.read_sync(0)
+            t0 = time.perf_counter()
+            stale = dv3.read(len(dv3) - 1)     # 缓存里没有 → 后台重建
+            dt = time.perf_counter() - t0
+            check("深度: read() 非阻塞（最远跳转 < 20ms）", dt < 0.02,
+                  f"{dt * 1000:.1f} ms，返回的是旧帧 ready_idx={dv3.ready_idx}")
+            check("深度: 未就绪时交出旧帧不报错", stale is not None)
+            got = dv3.read_sync(len(dv3) - 1, timeout=20)
+            check("深度: 后台解好后收敛到目标帧",
+                  isinstance(got, np.ndarray) and dv3.ready_idx == len(dv3) - 1,
+                  f"ready_idx={dv3.ready_idx}")
+
+            # latest-wins：连着一串请求，后台不按排队逐个 seek（合并成最新那个）
+            before = dv3.reopen_count
+            for i in (2, 11, 4, 19, 7, 23, 1, 27, 13, 29):
+                dv3.read(i)
+            time.sleep(0.05)                   # 让后台只来得及开工一次
+            burst = dv3.reopen_count - before
+            dv3.read_sync(29, timeout=20)
+            check("深度: 一串跳转请求合并（不逐个重建）", burst <= 3,
+                  f"10 次请求触发 {burst} 次重建")
+
+            # 已解码帧有缓存：拖回去不该再重建
+            dv3.read_sync(29)
+            before = dv3.reopen_count
+            check("深度: 重复取同一帧走缓存不重建",
+                  dv3.read_sync(29) is not None
+                  and dv3.reopen_count == before,
+                  f"重建 {dv3.reopen_count - before} 次")
+        finally:
+            dv3.close()
+
+        # 触觉面板：脏格重画必须与"每帧新画布全量重画"逐像素一致 ——
+        # _TactilePanel 只重画变了的格，漏擦旧数字/漏补分区框都会在这里露出来
+        bl_r = s.tactile_baselines["right_glove"]
+        rng2 = np.random.default_rng(4242)
+        mismatched = 0
+        for _side in ("right", "left"):
+            for _use in (True, False):
+                panel = mod._TactilePanel(780, 560, _side)
+                cur = s.tactile_frame("right_glove", 0)
+                for i in range(25):
+                    if i:
+                        cur = np.clip(cur + rng2.normal(0, 900, (16, 16)),
+                                      0, 5000).astype(np.float32)
+                        if i % 7 == 0:
+                            cur = np.zeros((16, 16), np.float32)  # 整块归零
+                    a = panel.paint(cur, bl_r, _use).copy()
+                    b = mod._TactilePanel(780, 560, _side).paint(
+                        cur, bl_r, _use)
+                    if not np.array_equal(a, b):
+                        mismatched += 1
+        check("触觉: 脏格重画与全量重画逐像素一致", mismatched == 0,
+              f"{mismatched}/100 帧不一致")
 
         # 渲染函数单测（厂商 Glove-test V1.4 移植：只留分区网格，
         # 手形热图已按用户要求移除）
@@ -379,16 +453,28 @@ def main() -> int:
         grid = mod.render_tactile_grid(tf, side="right", baseline=base,
                                        use_baseline=True, w=780, h=560)
         check("渲染: 分区网格(右手)", grid.shape == (560, 780, 3))
-        grid_l = mod.render_tactile_grid(tf, side="left", baseline=base,
+        # 同一份物理刺激分别以**各自手的固件原始帧**进来 → 必须出同一张图
+        # （左右手共用一套坐标）。左手的原始帧是规范系的 `[::-1, ::-1].T`；
+        # 基线也按同一变换带过去 —— 契约规定基线在**原始帧**里扣。
+        _pull = lambda a: np.ascontiguousarray(a[::-1, ::-1].T)      # noqa: E731
+        grid_l = mod.render_tactile_grid(_pull(tf), side="left",
+                                         baseline=_pull(base),
                                          use_baseline=True, w=780, h=560)
-        check("渲染: 分区网格(左手翻转)", grid_l.shape == (560, 780, 3)
-              and not np.array_equal(grid, grid_l), "左右布局不同")
+        check("渲染: 左手原始帧归到规范系后与右手同图",
+              grid_l.shape == (560, 780, 3) and np.array_equal(grid, grid_l),
+              "同一份刺激两只手同一张图（拇指恒朝左）")
+        # 反证：同一帧**不转**就喂左手 → 必然不同图（否则上面那条恒真）
+        grid_b = mod.render_tactile_grid(tf, side="left", baseline=base,
+                                         use_baseline=True, w=780, h=560)
+        check("反证: 不转就喂左手会出另一张图",
+              not np.array_equal(grid, grid_b), "⇒ 上面不是恒真")
         grid_z = mod.render_tactile_grid(np.zeros((16, 16), np.float32),
                                          side="right", w=780, h=560)
         check("渲染: 全零矩阵不崩", grid_z.shape == (560, 780, 3))
 
-        # 手指分区框要扣在"该手指的行落点"上：左手行序镜像（拇指 15-13），
-        # 翻转后拇指框仍在画面左侧 —— 旧写法把左右手的框整体对调了
+        # 手指分区框要扣在"该手指的行落点"上，且**两只手拇指框都在画面左侧**
+        # —— 规范系下拇指恒为行 1–3、拇指框恒在最左，谁都不翻（旧写法按
+        # "左手=右手整块镜像"把左手的框整体对调了）
         def _leftmost(img, bgr):
             m = np.all(img == np.array(bgr, np.uint8), axis=-1)
             xs = np.nonzero(m.any(axis=0))[0]

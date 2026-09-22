@@ -273,8 +273,8 @@ data/recordings/                          # 录制根目录（settings.RECORDING
   | `frame_index` | int64 | 帧序号 |
   | `timestamp` | float32 | 会话时间（秒） |
   | `task_index` | int64 | 任务序号（当前固定 0） |
-  | `observation.<sensor>` | list<float32, 256> | 传感器读数（16×16 展平；缺帧补零） |
-  | `observation.left_hand_pose` / `observation.right_hand_pose` | list<float32, 63> | 手部关键点（21 关节 × xyz；USB 手套录制时由 IMU 实时解算回填，无手套或未解算时为零占位） |
+  | `observation.<sensor>` | list<float32, 256> | 传感器读数（16×16 展平；缺帧补零）。**手套压力矩阵落盘的是固件原始通道号**，不做任何手型重排 —— 右手帧恰好等于规范系，左手帧是规范系的 `[::-1, ::-1].T`（转置 + 180°）。任何把矩阵当"手"来读的消费方（分区显示、掌区映射、跨模态对齐）**必须先过 `core.render_engine.canonical_pressure_matrix(m, side)`**，否则左手会整体转 90°（2026-09-21 修的就是这个；契约见该函数 docstring） |
+  | `observation.left_hand_pose` / `observation.right_hand_pose` | list<float32, 63> | 手部关键点（21 关节 × xyz，**米**，腕部相对系；USB 手套录制时由 IMU 实时解算回填，无手套或未解算时为零占位）。**全链无平滑**：写的是 SDK 的 `KeypointFrame.joints_m` 原始解算输出，不含 `sdk/glove.py` 那层 35ms EMA（改用它会引入不可逆相位滞后，见 `core/glove_keypoint_solver.py` 的 `joints_m` 注释） |
   | `action` | list<float32, 1> | 动作（当前固定 `[0.0]`） |
   | `status.<device_id>` | string | 该设备在本帧的连接状态（默认 `"connected"`） |
 

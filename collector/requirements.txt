@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+# PEP 263 编码声明：下方的中文注释是 UTF-8。
 # ── 主程序 GUI 必需依赖（start.bat / start.sh 一键部署与本清单一致）──
 PyQt5>=5.15.0
 numpy>=1.24

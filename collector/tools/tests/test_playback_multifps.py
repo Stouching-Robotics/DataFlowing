@@ -151,8 +151,8 @@ def main():
               f"传感器格标题: {cell.title_label.text() if cell else None}")
         check(len(dlg._sensor_widgets) == 1,
               f"传感器面板按 info['sensors'] 动态 1 路: {len(dlg._sensor_widgets)}")
-        check(dlg._sensor_modes == ["hand"],
-              f"默认模式仿生手掌: {dlg._sensor_modes}")
+        check(dlg._sensor_modes == ["tactile"],
+              f"默认模式触觉矩阵: {dlg._sensor_modes}")
         check(tr("🎧 其他蓝牙: {} 台", 1) in dlg._info_label.text(),
               f"信息栏蓝牙台数: {dlg._info_label.text()}")
 

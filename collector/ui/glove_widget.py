@@ -1,6 +1,7 @@
-"""手套传感器控件 —— 仿生手掌画面，直接嵌入主网格（统一设备体系）。
+"""手套传感器控件 —— 触觉分区网格画面，直接嵌入主网格（统一设备体系）。
 
-替代旧底部传感器 dock：面板开关打开手套 → 主网格出现仿生手掌渲染，
+替代旧底部传感器 dock：面板开关打开手套 → 主网格出现 16×16 分区网格
+渲染（厂商 PressureMatrixCanvas 移植，与回放页/查看器同一实现），
 录制时数据经 pipeline.write_sensor 写入 parquet 对应传感器列。
 """
 
@@ -14,15 +15,16 @@ from PyQt5.QtCore import QObject, QTimer
 from config.i18n import tr
 from core.ble_engine import SensorBLEEngine
 from core.glove_keypoint_solver import GloveKeypointSolver
-from core.render_engine import render_hand, render_skeleton, fit_skeleton_dist
-from core.sensor_hand_config import load_sensor_hand_config
+from core.render_engine import (
+    render_skeleton, fit_skeleton_dist, render_tactile_grid, glove_side_of,
+)
 from ui.camera_widget import CameraWidget
 
 
 class GloveWidget(CameraWidget):
-    """仿生手掌实时画面（固定 hand 渲染模式，复用 CameraWidget 覆盖条）。"""
+    """触觉分区网格实时画面（固定 tactile 渲染模式，复用 CameraWidget 覆盖条）。"""
 
-    # 固定渲染画布尺寸（仿生手掌锚点基于 1280×720 设计，与旧面板一致）
+    # 固定渲染画布尺寸（与旧仿生手掌面板一致；网格几何按此等比自适应）
     _RENDER_W = 1280
     _RENDER_H = 720
 
@@ -37,7 +39,6 @@ class GloveWidget(CameraWidget):
         self._engine: Optional[SensorBLEEngine] = engine
         self._running = False
         self._pipeline = None
-        self._current_vmax = 5000.0
 
         # 骨架叠加（USB 手套）：连接时建解算器，渲染循环内解算 + 小窗叠加
         self._solver = None          # GloveKeypointSolver（BLE 手套恒 None）
@@ -46,9 +47,14 @@ class GloveWidget(CameraWidget):
         self._on_log = on_log or (lambda msg: None)   # 主窗口日志（USB 路径传）
         self._fps_logged = False     # 硬件帧率只报一次（与 GloveDataPump 同口径）
 
-        # 左/右手套使用不同仿生手掌映射配置（口径在
-        # core.sensor_hand_config，与回放对话框共用同一份）
-        self.hand_config = load_sensor_hand_config(sensor_column)
+        # 左右手区分：网格布局按传感器列名判手（glove_side_of）。两只手**共用
+        # 一套坐标**（拇指恒朝左，谁都不翻）—— 固件的左手帧是规范系的
+        # `[::-1, ::-1].T`，由 canonical_pressure_matrix 在取整前归位；别再在这
+        # 儿加翻转（2026-09-21 那次左手整体转 90° 就是"左手=右手整块镜像"这个
+        # 假设造的，契约见 core/render_engine.canonical_pressure_matrix）。
+        # 仿生手掌那套 config 映射（左/右不同配置文件）随 render_hand 一起
+        # 只留在回放页的模式下拉里。
+        self.side = glove_side_of(sensor_column)
 
         # 渲染定时器（30ms ≈ 30fps；未连接时 tick 直接返回）
         self._render_timer = QTimer(self)
@@ -136,7 +142,7 @@ class GloveWidget(CameraWidget):
         if self._engine is None or not self._running:
             return
 
-        processed, max_signal = self._engine.process_frame()
+        processed, _max_signal = self._engine.process_frame()
 
         if processed is None:
             if self._engine.is_calibrating:
@@ -165,18 +171,21 @@ class GloveWidget(CameraWidget):
                     self._pipeline.write_glove_keypoints(
                         self.sensor_column, self._kpts)
 
-        fps = self._engine.hardware_fps
-        gate = self._engine.base_noise_gate
-        dyn = self._engine.dynamic_noise_ratio
-        spatial = self._engine.spatial_filter_enabled
-
         try:
-            frame, self._current_vmax = render_hand(
-                processed, max_signal, self.hand_config,
-                (self._RENDER_W, self._RENDER_H),
-                self._current_vmax, fps, gate, dyn, spatial,
-                self._engine.drift_baseline_val,
-            )
+            # baseline=None + use_baseline=True 是刻意的，两件事各取所需：
+            #   · 数值 —— 实时矩阵在引擎里已经扣过标定基线
+            #     （ble/usb 引擎都做 max(0, smoothed - baseline_map)），
+            #     这里再扣一次就重复了，所以 baseline 传 None；
+            #   · 配色 —— 色带档位只看 use_baseline（校正档 333/666/999/
+            #     1333/1666 vs 原始档 2000/2400/2800/3200/3600），实时值域
+            #     就是校正后的，要的正是校正档。
+            # 返回的是**共享面板画布本身**（同尺寸复用 + 逐格脏重画），
+            # 下面还要往上叠骨架小窗和覆盖条 —— 先拷一份，别把覆盖物
+            # 烙进缓存画布（下一帧同格不算脏、不会被重画，会一直留着）。
+            frame = render_tactile_grid(
+                processed, side=self.side, baseline=None, use_baseline=True,
+                w=self._RENDER_W, h=self._RENDER_H,
+            ).copy()
         except Exception:
             import traceback
             print(f"[{self.sensor_column}] render error:")
@@ -188,9 +197,11 @@ class GloveWidget(CameraWidget):
 
     # ── 骨架叠加（USB 手套：IMU → HandSolver → 小窗透视画面） ──
 
-    # 骨架小窗：1280×720 画布左下角（仿生手掌锚点 x 350..930 之外的空区）
+    # 骨架小窗：1280×720 画布右下空白区（换触觉网格后左下角不再空 —— 网格
+    # 占 x 54..698 / y 54..698，图例文字在 x 716..~890 / y 68..338，右下
+    # x 930..1270 / y 400..700 是唯一放得下 340×300 的位置）
     _SKEL_W, _SKEL_H = 340, 300
-    _SKEL_POS = (8, 412)
+    _SKEL_POS = (930, 400)
 
     def _solve_keypoints(self, quats, valid, ts_us):
         """IMU 帧 → 骨架关键点 (21,3)；解算器不可用/未 warmup 返回 None。"""
@@ -213,29 +224,43 @@ class GloveWidget(CameraWidget):
         x, y = self._SKEL_POS
         frame[y:y + self._SKEL_H, x:x + self._SKEL_W] = panel
 
+    # 状态条：USB 三行（传感器名 / 帧率+帧龄 / IMU+触觉帧率）画在**面板下方**
+    # 的独立带里 —— 面板上边距只有 54px，而三行条高 68px，画在 (0,0) 会切掉
+    # 最上一行（y=15 指尖）左起约 6 格的顶部 14px。带高按三行文本留 68px，
+    # 面板本身仍是 1280x720（几何与查看器逐像素一致，一点没动）。
+    _STATUS_H = 68
+
     def _display_frame(self, frame: np.ndarray):
         """渲染好的 BGR 帧 → 画面（叠加传感器名 + 数据帧龄诊断）。"""
         import cv2
         now_us = int(time.time() * 1_000_000)
         age_ms = (now_us - self._engine.latest_data_ts_us) / 1000.0
         hw_fps = self._engine.hardware_fps
-        # USB 手套：覆盖条追加 IMU 有效数 + 触觉帧率（BLE 引擎无此属性）
+        # USB 手套：状态条追加 IMU 有效数 + 触觉帧率（BLE 引擎无此属性）
         has_imu = hasattr(self._engine, "imu_present_count")
-        box_h = 68 if has_imu else 52
-        cv2.rectangle(frame, (0, 0), (260, box_h), (0, 0, 0), -1)
-        cv2.putText(frame, self.sensor_column, (6, 18),
+        if has_imu:
+            # 面板 + 下方状态带；整条带子黑底，不与任何格区重叠
+            out = np.zeros((frame.shape[0] + self._STATUS_H, frame.shape[1], 3),
+                           np.uint8)
+            out[:frame.shape[0]] = frame
+            top, box_h = frame.shape[0], self._STATUS_H
+        else:
+            # BLE 两行条只有 52px，够不着网格上边距（54px），保持原位
+            out, top, box_h = frame, 0, 52
+            cv2.rectangle(out, (0, top), (260, top + box_h), (0, 0, 0), -1)
+        cv2.putText(out, self.sensor_column, (6, top + 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(frame, f'HW: {hw_fps:.0f} fps  Age: {age_ms:.0f} ms',
-                    (6, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+        cv2.putText(out, f'HW: {hw_fps:.0f} fps  Age: {age_ms:.0f} ms',
+                    (6, top + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                     (0, 255, 0) if age_ms < 100 else
                     (0, 255, 255) if age_ms < 300 else (0, 0, 255), 1)
         if has_imu:
             imu_ok = self._engine.imu_present_count
             tac_fps = getattr(self._engine, "tactile_fps", 0.0)
-            cv2.putText(frame, f'IMU: {imu_ok}/16  Tac: {tac_fps:.0f} fps',
-                        (6, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+            cv2.putText(out, f'IMU: {imu_ok}/16  Tac: {tac_fps:.0f} fps',
+                        (6, top + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                         (0, 255, 0) if imu_ok >= 16 else (0, 255, 255), 1)
-        self.video_widget.set_frame(frame)
+        self.video_widget.set_frame(out)
 
 
 class GloveDataPump(QObject):

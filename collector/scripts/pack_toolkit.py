@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""裁剪手套工具包（stouch_glove_toolkit*）供随包分发，使普通版一键部署自带骨架解算。
+"""⚠️ **本脚本尚未跟上 2026-09-21 的 SDK v2.1.0 迁移，当前跑不通也产不出正确产物。**
+   迁移计划 S7 整体重写。重写时必须满足下面这条**位置契约**：
+
+       zip 名      wheels/toolkit/glove_sdk.zip
+       zip 顶层    裸的 `glove_sdk/`（**不含** tools/ 前缀 —— 产物与位置无关）
+       解压目标    tools/      ← 由 start.sh / start.bat / start_lite.* 指定
+       落点        <项目根>/tools/glove_sdk/  （core/glove_sdk_boot.py 的
+                   find_sdk_dir() 找的就是这里）
+
+   位置只写在分发壳那一处，zip 本身不含路径假设 —— 再挪地方不用重打包。
+
+裁剪手套工具包（stouch_glove_toolkit*）供随包分发，使普通版一键部署自带骨架解算。
 
 背景: 骨架解算依赖第三方手套工具包（项目根同级的 stouch_glove_toolkit*，
 core/glove_keypoint_solver.py 的 find_toolkit_dir() 按目录名找）。本地参考副本

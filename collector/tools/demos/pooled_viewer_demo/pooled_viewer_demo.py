@@ -44,7 +44,11 @@ parquet 稀疏列约定（与 core/egodata_writer 一致）:
 行序 i 对应时刻 t=i/fps，各路视频按各自帧时钟取 round(t×fps) 帧
 （帧率一致即按帧号读；不一致时按比例映射，保证两路画面时间一致）。
 RGB 顺序读/跳转 seek、帧数不足保持尾帧；深度小步前进顺序解、后退/
-大跳 -ss 重建流（帧精确）；拖动进度条节流渲染、松手落定。
+大跳 -ss 重建流（帧精确）—— 但这一切都在**后台线程**里做：深度面板
+的 read() 非阻塞，主线程只登记目标帧号并画手上现有的那一帧，后台解到
+之后再补画一次（见 DepthVideo / _poll_depth），拖动进度条不再卡主线程；
+拖动进度条节流渲染、松手落定。触觉面板静态底图画一次缓存，每帧只重画
+值变了的格（见 _TactilePanel）。
 
 依赖 (见 requirements.txt):
     numpy, pyarrow, opencv-python, PyQt5
@@ -59,6 +63,8 @@ import shutil
 import argparse
 import json
 import subprocess
+import threading
+from collections import OrderedDict
 
 import numpy as np
 import pyarrow as pa
@@ -118,9 +124,9 @@ class Mp4Stream:
     def __getitem__(self, i):
         i = int(i)
         if i in self._cache:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-            self.cap.read()
-            self._seq_next = i + 1
+            # 命中就直接给：原来这里还白做一次 set+read（33ms），只为把
+            # _seq_next 写成 i+1。而命中根本不理解码器 —— cap 没动，
+            # _seq_next 本来就是准的，动它反而会让下一次顺序读串帧。
             return self._cache[i]
         if i == self._seq_next:
             ok, frame = self.cap.read()
@@ -191,11 +197,32 @@ def _depth_to_heatmap_bgr(mm_or_codes, is_mm):
 
 
 class DepthVideo:
-    """单路深度视频随机访问（顺序读复用流，大跳 -ss 快进）。
+    """单路深度视频随机访问（后台解码线程，调用线程永不阻塞）。
 
-    与 Mp4Stream 同口径：连续播放走顺序 pull，拖进度条才重建流；
-    解码失败/越界返回 None（调用方画占位帧）。
+    旧实现把 ffmpeg 的 kill / `-ss` 重建 / 解码全放在调用线程上，而调用
+    线程就是 Qt 主线程：每一次「跳帧」——后退一帧、拖进度条、PageUp/
+    PageDown——都要先 kill 掉当前进程再用 `-ss` 重建（实测 848x480 HEVC
+    前进 35 帧 157ms、后退 5 帧 242ms，`close()` 里还有个 `wait(timeout=3)`
+    兜底），主线程被摁住不动：进度条拖不动、按钮点下去没反应。
+
+    现在 ffmpeg 归后台线程所有，调用线程的 read() 只做两件事：
+      1. 把「想要第几帧」登记成最新目标（latest-wins —— 排队中的旧请求
+         直接被顶掉，拖进度条时一串请求自动合并成一次 seek）；
+      2. 把**已经解好的最近一帧**原样交出去（可能不是刚请求的那帧，帧号
+         见 ready_idx；要精确帧用 read_sync，或在 ready_idx 追上来后重画）。
+
+    顺序 pull 与 `-ss` 重建的取舍不变（见 _decode），只是不再挡路；
+    已解码帧另存一份 LRU 缓存，拖回去/来回拖不重建。
     """
+
+    # 顺序拉帧上限：实测 848x480 HEVC 顺序 ~2ms/帧、-ss 重建 21~57ms，
+    # 30 帧附近两者打平时才重建。现在重建发生在后台，但进程生死本身就不
+    # 便宜（Windows 上每次 CreateProcess 一个 ffmpeg 还要过杀软），放宽到
+    # 90 帧（3 秒）：拉满 90 帧约 180ms，仍比重建划算，还省一次进程生死。
+    _PULL_FWD_MAX = 90
+
+    # 已解码帧缓存预算：只影响拖回去要不要重建，24MB ≈ 848x480 的 19 帧
+    _CACHE_BYTES = 24 << 20
 
     def __init__(self, path):
         self.path = path
@@ -243,6 +270,22 @@ class DepthVideo:
         self._next_idx = 0
         self._frame_bytes = self.width * self.height * 2
 
+        # ── 后台解码线程的状态 ──
+        self._cv = threading.Condition()    # 护着下面这几项
+        self._proc_lock = threading.Lock()  # 护着 ffmpeg 进程（worker/close 抢）
+        self._want = None          # 最新请求的帧号（latest-wins）
+        self._ready = None         # 已解好的最近一帧（BGR，勿原地改）
+        self._ready_idx = -1       # 上面那帧的帧号
+        self._shown_idx = -1       # read() 最近一次交出去的帧的帧号
+        self._cache = OrderedDict()  # 帧号 → BGR（LRU）
+        self._cache_max = max(
+            4, self._CACHE_BYTES // max(1, self.width * self.height * 3))
+        self.reopen_count = 0      # ffmpeg 重建次数（状态栏可见，越小越顺）
+        self._stopped = False
+        self._thread = threading.Thread(
+            target=self._run, name=f"depth-{self.name}", daemon=True)
+        self._thread.start()
+
     @property
     def _probe_text(self):
         if not hasattr(self, "_probe_text_cache"):
@@ -277,12 +320,104 @@ class DepthVideo:
     def __len__(self):
         return self.total
 
-    # 顺序拉帧上限：实测 848x480 HEVC 顺序 ~2ms/帧、-ss 重建 ~21-57ms，
-    # 30 帧附近两者打平；超过或后退一律 -ss 重建（帧精确、O(1)）
-    _PULL_FWD_MAX = 30
+    # ── 调用线程（UI）接口：非阻塞 ──────────────────────────────
+
+    @property
+    def ready_idx(self):
+        """read() 最近一次交出去的那一帧的帧号（-1 = 还没交过）。"""
+        with self._cv:
+            return self._shown_idx
 
     def read(self, idx):
-        """读取帧 idx（0-based）→ BGR JET 热力图；越界/EOF 返回 None。
+        """非阻塞取帧：登记目标帧 idx，返回手上现有的最好一帧。
+
+        返回帧的帧号是 self.ready_idx —— 可能不是 idx（后台还没解完），
+        解好后 ready_idx 会变成 idx，调用方据此决定要不要重画一次。
+        越界返回 None，调用方画占位帧。
+        """
+        if idx >= self.total:
+            return None
+        with self._cv:
+            hit = self._cache.get(idx)
+            if hit is not None:
+                self._cache.move_to_end(idx)
+                self._ready, self._ready_idx = hit, idx
+                self._shown_idx = idx
+                return hit
+            if self._want != idx:
+                self._want = idx
+                self._cv.notify_all()
+            self._shown_idx = self._ready_idx
+            return self._ready
+
+    def read_sync(self, idx, timeout=10.0):
+        """阻塞等到帧 idx 解好再返回（离屏自检/取精确帧用，UI 不要调）。
+
+        超时或越界返回 None。
+        """
+        if idx >= self.total:
+            return None
+        deadline = time.monotonic() + timeout
+        with self._cv:
+            hit = self._cache.get(idx)
+            if hit is not None:
+                self._cache.move_to_end(idx)
+                self._ready, self._ready_idx = hit, idx
+                self._shown_idx = idx
+                return hit
+            self._want = idx
+            self._cv.notify_all()
+            while self._ready_idx != idx and not self._stopped:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                self._cv.wait(left)
+            self._shown_idx = self._ready_idx
+            return self._ready if self._ready_idx == idx else None
+
+    def close(self):
+        """停后台线程 + 杀 ffmpeg（可重入；之后 read/read_sync 恒返回 None）。"""
+        with self._cv:
+            self._stopped = True
+            self._want = None
+            self._cv.notify_all()
+        if self._thread is not threading.current_thread():
+            self._thread.join(timeout=3.0)
+        with self._proc_lock:
+            self._kill_proc()
+        with self._cv:
+            self._cache.clear()
+            self._ready = None
+            self._ready_idx = -1
+            self._shown_idx = -1
+
+    # ── 后台线程 ────────────────────────────────────────────────
+
+    def _run(self):
+        while True:
+            with self._cv:
+                while self._want is None and not self._stopped:
+                    self._cv.wait(0.2)
+                if self._stopped:
+                    return
+                want, self._want = self._want, None
+            with self._proc_lock:
+                if self._stopped:
+                    return
+                frame = self._decode(want)
+            with self._cv:
+                if self._stopped:
+                    return
+                if frame is not None:
+                    self._cache[want] = frame
+                    self._cache.move_to_end(want)
+                    while len(self._cache) > self._cache_max:
+                        self._cache.popitem(last=False)
+                    self._ready, self._ready_idx = frame, want
+                self._cv.notify_all()
+
+    def _decode(self, idx):
+        """解出帧 idx 的 BGR 热力图（阻塞，只在后台线程里跑）；失败返回 None。
 
         访问策略: 小步前进（≤_PULL_FWD_MAX）顺序 pull；后退/大跳 -ss
         重建流。旧实现只在进程死亡时重建——后退时顺序流已越过目标帧
@@ -290,8 +425,6 @@ class DepthVideo:
         与其它面板错帧的根因），前进大跳则逐帧解出数千帧（一次 11s+
         的卡死，进度条拖不动的根因）。
         """
-        if idx >= self.total:
-            return None
         if (self._proc is None or self._proc.poll() is not None
                 or idx < self._next_idx
                 or idx > self._next_idx + self._PULL_FWD_MAX):
@@ -301,21 +434,23 @@ class DepthVideo:
                 return None
         return self._pull()
 
-    def close(self):
+    def _kill_proc(self):
         if self._proc is not None:
             try:
                 self._proc.kill()
             except Exception:
                 pass
             try:
-                self._proc.wait(timeout=3)
+                # 只等 0.5s：kill 之后进程必然退出，回收不必挡着谁
+                self._proc.wait(timeout=0.5)
             except Exception:
                 pass
             self._proc = None
         self._buf = b""
 
     def _open(self, idx):
-        self.close()
+        self.reopen_count += 1
+        self._kill_proc()
         if not self._ffmpeg:
             return
         cmd = [self._ffmpeg, "-hide_banner", "-nostdin"]
@@ -554,19 +689,26 @@ class PooledSession:
 # glove_qt_visualizer.py 的 PressureMatrixCanvas
 # （QPainter → OpenCV，QColor → BGR，中文字串 → 英文，布局/配色照搬）:
 #   render_tactile_grid —— 16x16 分区网格（手指区 y=12…15 / 手掌区 y=3…11 /
-#                         空值区 y≤2，左右手行翻转；行列号 + 逐格数值 + 图例）
+#                         空值区 y≤2；行列号 + 逐格数值 + 图例）
 #   （2026-09-04 起按用户要求移除手形热图 PressureHandCanvas 移植，只留矩阵）
-# 触觉矩阵映射（2026-09-04 与实机录制数据逐格核对）:
-#   行 = 手指（右手 拇指 1-3/食指 4-6/中指 7-9/无名 10-12/小指 13-15；
-#             左手镜像 拇指 15-13 … 小指 3-1），行 0 为空；
-#   列 12-15 = 指骨，列序 [14,12,13,15] = 根→尖；列 3-11 = 掌心
-#   （右手传感列 [10,9,8,6,4] / 左手 [10,9,8,6]），列 0-2 为空。
-# 面板内拇指统一朝左：网格 x 轴 = 矩阵行，左手翻转、右手不翻
-# （与厂商网格恰好对调，因左手行序与厂商 README 假定相反）。
-# 手指分区框与图例里的 x 区间也按各手的行序给（左手 拇指 x=13..15、
-# 小指 x=1..3），所以两只手的拇指框都落在画面左侧 —— 2026-09-20 修正：
-# 旧写法按「两只手拇指都在行 1-3」摆框，左手的五个框整体对调了
-# （分区框/图例与 Spare 框、掌心框口径不一致）。
+# 触觉矩阵映射（2026-09-21 定案，与厂商 SDK 的规范系逐项对齐）:
+#   **规范系 (canonical)** —— 行 = 跨手指方向、列 = 沿手指/掌长方向：
+#     行 1-3 拇指 / 4-6 食指 / 7-9 中指 / 10-12 无名 / 13-15 小指，
+#       行递增 = 拇指侧 → 小指侧（同一根手指的 3 行也按这个方向排）；
+#     列 12-15 = 手指，12 → 15 = 指根 → 指尖（列 12 约在远端指节）；
+#     列 3-11 = 掌心，3 → 11 = 掌根 → 指根；
+#     行 0 与列 0-2 为空。有效格 195 = 掌 15×9 + 五指 5×(3×4)。
+#   **右手帧就是规范系**；左手帧是规范系的 `[::-1, ::-1].T`（转置 + 180°），
+#   由 `canonical_pressure_matrix()` 反变换回来 —— 所以本节的每一处
+#   （坐标表、图例、分区框、空值/Spare 判据）**两只手走同一段代码**，
+#   没有任何按手分支。
+# 面板内拇指统一朝左：网格 x 轴 = 规范行，两只手都不翻（厂商 SDK 的
+# gui/rendering/tactile.py 把这条变换预先烘进左手表，同样不翻）。
+#
+# ⚠️ 本节与 core/render_engine.py 的同名实现**逐像素一致**（demo 单文件
+# 自包含、不 import 主程序，与 render_skeleton 同属"demo 保副本、主程序放
+# 实现"的既定模式）；改任何一份都必须同步另一份，
+# tools/tests/test_tactile_grid_render.py 会逐像素比对两份实现。
 
 _TACTILE_FINGER_NAMES = ("Thumb", "Index", "Middle", "Ring", "Pinky")
 # 手指区分区框颜色（厂商 _FINGER_COLORS，BGR）
@@ -598,6 +740,24 @@ def glove_side_of(sensor: str) -> str:
     return "left" if "left" in low else "right"
 
 
+def canonical_pressure_matrix(matrix, side: str):
+    """原始触觉帧 → **规范系**（16×16 float32）；按 `side` 决定是否反变换。
+
+    与 core/render_engine.py 的同名函数、以及厂商 SDK
+    `tools/glove_sdk/gui/rendering/tactile_pressure_hand.py` 的那份**逐字一致**
+    （判据用「名字里有没有 left」而非 SDK 的 `== "right"`：后者在传进完整
+    传感器名 `"right_glove"` 时会给右手套套上左手变换）。
+
+    **右手帧本来就是规范系**，左手帧是规范系的转置 + 180°（固件把左手接成
+    了右手帧的 `values[::-1, ::-1].T`）。反变换是自逆的，拿不准帧的来历时
+    不要用它"试一下"：两边都会得到一个像模像样的矩阵。
+    """
+    values = np.asarray(matrix, dtype=np.float32).reshape(16, 16)
+    if "left" not in str(side).lower():
+        return values
+    return np.ascontiguousarray(values[::-1, ::-1].T)
+
+
 def _tactile_heat_color(value, use_baseline):
     bands = _TACTILE_BANDS_CORRECTED if use_baseline else _TACTILE_BANDS_RAW
     for upper, bgr in bands:
@@ -606,130 +766,244 @@ def _tactile_heat_color(value, use_baseline):
     return bands[-1][1]
 
 
+_TACTILE_TEXT_DARK = (7, 16, 25)
+_TACTILE_TEXT_LIGHT = (255, 246, 238)
+_TACTILE_MARGIN = 54.0
+_TACTILE_BOTTOM_MARGIN = 22.0
+_TACTILE_LEGEND_W = 250.0
+
+
+def _tactile_lut(use_baseline):
+    """值 → BGR 查表（_tactile_heat_color 的等价向量化）。
+
+    上界取色带里最后一个有限上界；再补一格给"超出上界"（原实现落
+    bands[-1]，与 ≤ 上界的那一格未必同色，所以要多留一格再 clip）。
+    """
+    bands = _TACTILE_BANDS_CORRECTED if use_baseline else _TACTILE_BANDS_RAW
+    top = int(bands[-2][0])
+    lut = np.empty((top + 2, 3), np.uint8)
+    for i in range(top + 2):
+        lut[i] = _tactile_heat_color(i, use_baseline)
+    return lut
+
+
+_TACTILE_LUTS = {True: _tactile_lut(True), False: _tactile_lut(False)}
+
+# 面板画布缓存：key = (w, h, side)，最多留 _PANEL_CACHE_MAX 块
+_PANEL_CACHE_MAX = 6
+_TACTILE_PANELS = OrderedDict()
+
+
+class _TactilePanel:
+    """一块 (w, h, side) 触觉面板的可复用画布 + 逐格脏标记。
+
+    旧实现每帧把整块面板重画一遍：16x16 格 ×（填充 + 斜线/边框 + 数值
+    putText）连同坐标标签、分区框、图例，单面板上千次 OpenCV 调用 ——
+    实测 1.4~2.5 ms/面板、双手 3~5 ms（Windows 打包机上更高），30fps 下
+    光触觉就吃掉一成以上预算，而且**每一帧画的像素几乎和上一帧一样**。
+
+    现在：底色/坐标/图例这些静态部分画一次存在 base 里；每帧只重画
+    **值或配色变了的格**（先擦回 base 再画，避免新旧数字叠字），实测基线
+    校正后每帧只有 ~28/256 格变化。分区框/掌心框那 8 笔照旧每帧补画 ——
+    纯色无抗锯齿，重画幂等，但会被上面"擦回 base"抹掉，必须补。
+    """
+
+    def __init__(self, w, h, side):
+        self.w, self.h, self.side = int(w), int(h), side
+        self.cell = max(10.0, min(
+            (w - _TACTILE_MARGIN - _TACTILE_LEGEND_W) / 16.0,
+            (h - _TACTILE_MARGIN - _TACTILE_BOTTOM_MARGIN) / 16.0))
+        self.grid_left = self.grid_top = _TACTILE_MARGIN
+        self.base = self._draw_chrome()
+        self.canvas = self.base.copy()
+        self.vals = None            # 上次画上去的值（None = 全脏）
+        self.lut_key = None         # 上次用的配色档（值相同但档不同也要重画）
+
+    # ── 静态底图：底色 + 坐标 + 图例（与格区不重叠）──
+    def _draw_chrome(self):
+        w, h = self.w, self.h
+        cell, grid_left, grid_top = self.cell, self.grid_left, self.grid_top
+        img = np.full((h, w, 3), _TACTILE_BG, np.uint8)
+        cv2.putText(img, "X -> 0..15",
+                    (int(grid_left) + 16 * int(cell) // 2 - 70, 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, _TACTILE_TEXT_DIM,
+                    1, cv2.LINE_AA)
+        for display_x in range(16):
+            cv2.putText(img, str(display_x),
+                        (int(grid_left + display_x * cell) + int(cell) // 2 - 5,
+                         int(grid_top) - 26),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, _TACTILE_TEXT_DIM,
+                        1, cv2.LINE_AA)
+        for display_row in range(16):
+            cv2.putText(img, f"y={15 - display_row}",
+                        (6, int(grid_top + display_row * cell + cell / 2 + 4)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, _TACTILE_TEXT_DIM,
+                        1, cv2.LINE_AA)
+        legend_left = int(grid_left + 16 * cell + 18.0)
+        if legend_left < w - 10:
+            cv2.putText(img, "Fingers  y=12..15",
+                        (legend_left, int(grid_top) + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, _TACTILE_TEXT,
+                        1, cv2.LINE_AA)
+            for group in range(5):
+                top = int(grid_top + 28.0 + group * 24.0)
+                cv2.rectangle(img, (legend_left, top),
+                              (legend_left + 15, top + 15),
+                              _TACTILE_FINGER_BGR[group], -1)
+                row_lo = 1 + 3 * group
+                cv2.putText(img,
+                            f"{_TACTILE_FINGER_NAMES[group]}: "
+                            f"x={row_lo}..{row_lo+2}",
+                            (legend_left + 23, top + 13),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, _TACTILE_TEXT,
+                            1, cv2.LINE_AA)
+            cv2.putText(img, "Spare col: x=0, y=3..15",
+                        (legend_left, int(grid_top + 166.0)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, _TACTILE_TEXT_FAINT,
+                        1, cv2.LINE_AA)
+            cv2.putText(img, "Palm  x=1..15, y=3..11",
+                        (legend_left, int(grid_top + 208.0)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, _TACTILE_PALM_BLUE,
+                        1, cv2.LINE_AA)
+            cv2.putText(img, "Empty zone: y=0..2",
+                        (legend_left, int(grid_top + 232.0)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, _TACTILE_TEXT,
+                        1, cv2.LINE_AA)
+            cv2.putText(img, "Top of view = y=15..0",
+                        (legend_left, int(grid_top + 258.0)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, _TACTILE_TEXT_FAINT,
+                        1, cv2.LINE_AA)
+            cv2.putText(img, "fingers point upward",
+                        (legend_left, int(grid_top + 280.0)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, _TACTILE_TEXT_FAINT,
+                        1, cv2.LINE_AA)
+        return img
+
+    # ── 每帧补画的分区框/掌心框（压在格子上，会被"擦回 base"抹掉）──
+    def _draw_overlay(self, img):
+        cell, grid_left, grid_top = self.cell, self.grid_left, self.grid_top
+        finger_height = 4.0 * cell
+        for group in range(5):
+            # 框要扣在该手指的行落点上：规范系里第 g 组恒为 1+3g（拇指 1-3
+            # → 小指 13-15），而显示列 = 规范行，所以框恒落在显示列
+            # 1+3g..3+3g，拇指向来在画面左侧。与下面 Spare 框（行 0）、
+            # 掌心框（行 1..15）同一口径 —— 三者现在无一处按手分支。
+            display_start_x = 1 + group * 3
+            x0 = int(grid_left + display_start_x * cell)
+            y0 = int(grid_top)
+            cv2.rectangle(img, (x0 + 2, y0 + 2),
+                          (x0 + int(3 * cell) - 2,
+                           y0 + int(finger_height) - 2),
+                          _TACTILE_FINGER_BGR[group], 2)
+        spare_x = 0
+        x0 = int(grid_left + spare_x * cell)
+        cv2.rectangle(img, (x0 + 1, int(grid_top) + 1),
+                      (x0 + int(cell) - 1, int(grid_top + finger_height) - 1),
+                      _TACTILE_SPARE_LINE, 1)
+        x0 = int(grid_left + cell)
+        y0 = int(grid_top + 4.0 * cell)
+        cv2.rectangle(img, (x0 + 2, y0 + 2),
+                      (x0 + int(15 * cell) - 2, y0 + int(9 * cell) - 2),
+                      _TACTILE_PALM_BLUE, 2)
+        cv2.line(img, (x0, y0), (x0 + int(15 * cell), y0), _TACTILE_WHITE, 2)
+
+    # ── 逐格脏重画 ──
+    def paint(self, matrix, baseline, use_baseline):
+        m = np.asarray(matrix, np.float32).reshape(16, 16)
+        # 值：原实现是 max(0, m - base) 再 round —— 配色档位用的是入参
+        # use_baseline（不是"baseline is not None"），这里照抄。
+        # 基线在**原始帧**里扣：基线（回放页的逐格中位）本来就是按原始列算
+        # 的，在原始帧里扣就不必给基线也加一道变换。
+        if use_baseline and baseline is not None:
+            m = np.maximum(
+                0.0, m - np.asarray(baseline, np.float32).reshape(16, 16))
+        # 归到规范系（左手帧是规范系的 [::-1,::-1].T）—— 纯下标置换，与上面
+        # 的减法、与下面的 rint 都可交换，放哪一步都逐位等价；放最前面，
+        # 底下就全在规范系里算了。
+        # ⚠️ 必须在**取整前**过这一步：canonical_pressure_matrix 收 float32，
+        # 喂 int32 会被静默升位，回头 `lut[view]` 当场 IndexError。
+        vals = np.rint(canonical_pressure_matrix(m, self.side)).astype(np.int32)
+        # 规范 (行 x, 列 y) → 显示 (行 = 15-y 在顶, 列 = x)。**两只手同一段**。
+        view = np.ascontiguousarray(vals.T[::-1])
+        # 颜色 = LUT[值]，所以"值没变"只在**同一档 LUT**下才等价于"没变"：
+        # 切基线开关时，基线为 0 的格值不变、颜色却要换一档，必须整块重画。
+        lut_key = bool(use_baseline)
+        if (self.vals is not None and self.lut_key == lut_key
+                and np.array_equal(view, self.vals)):
+            return self.canvas        # 一格没变 → 整块复用（含分区框）
+
+        img = self.canvas
+        cell, grid_left, grid_top = self.cell, self.grid_left, self.grid_top
+        lut = _TACTILE_LUTS[lut_key]
+        colors = lut[np.clip(view, 0, len(lut) - 1)]
+        # 亮度判字色：原式 0.299*R + 0.587*G + 0.114*B（BGR 存的是 R 在 [2]）
+        lum = (0.299 * colors[..., 2].astype(np.float32)
+               + 0.587 * colors[..., 1] + 0.114 * colors[..., 0])
+        dark = lum > 145
+        draw_text = cell >= 11
+        stale = self.vals if self.lut_key == lut_key else None   # 换档 ⇒ 全脏
+        for display_row in range(16):
+            y = 15 - display_row
+            row_top = grid_top + display_row * cell
+            y0, y1 = int(row_top), int(row_top + cell)
+            is_empty = y <= 2
+            for display_x in range(16):
+                if stale is not None and stale[display_row, display_x] == \
+                        view[display_row, display_x]:
+                    continue
+                x = display_x
+                x0 = int(grid_left + display_x * cell)
+                x1 = int(grid_left + (display_x + 1) * cell)
+                fill = (int(colors[display_row, display_x, 0]),
+                        int(colors[display_row, display_x, 1]),
+                        int(colors[display_row, display_x, 2]))
+                img[y0:y1, x0:x1] = self.base[y0:y1, x0:x1]   # 擦掉旧内容
+                cv2.rectangle(img, (x0, y0), (x1, y1), fill, -1)
+                if is_empty or (y >= 3 and x == 0):
+                    cv2.rectangle(img, (x0, y0), (x1, y1),
+                                  _TACTILE_EMPTY_OVERLAY, -1)
+                    cv2.line(img, (x0, y0), (x1, y1), _TACTILE_EMPTY_LINE, 1)
+                    cv2.line(img, (x1, y0), (x0, y1), _TACTILE_EMPTY_LINE, 1)
+                cv2.rectangle(img, (x0, y0), (x1, y1),
+                              _TACTILE_GRID_BORDER, 1)
+                if draw_text:
+                    # 数字比格子宽（cell 15.5px 时 "500" 有 16px），会溢到右
+                    # 邻格上。旧实现每帧把右邻格也重画一遍，溢出被邻格的填充+
+                    # 边框盖掉；只重画脏格就盖不住了 —— 所以按格裁掉溢出，
+                    # 与旧版落到的像素完全一致。
+                    cv2.putText(img[y0:y1, x0:x1],
+                                str(int(view[display_row, display_x])),
+                                (2, int(cell) - 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.28,
+                                _TACTILE_TEXT_DARK if dark[display_row, display_x]
+                                else _TACTILE_TEXT_LIGHT, 1, cv2.LINE_AA)
+        self.vals = view
+        self.lut_key = lut_key
+        self._draw_overlay(img)
+        return img
+
+
 def render_tactile_grid(matrix, side="right", baseline=None,
                         use_baseline=True, w=780, h=560):
     """16x16 压力矩阵 → 分区确认网格（厂商 PressureMatrixCanvas 移植）。
 
-    网格行 = 矩阵列（y=15 在顶 = 指尖），网格列 = 矩阵行（拇指朝左：
-    左手翻转、右手不翻）；baseline 为 16x16 中位基线（可 None）。
+    入参是**原始帧**（左手那位先由 canonical_pressure_matrix 反变换到规范
+    系）。网格行 = 规范列（y=15 在顶 = 指尖），网格列 = 规范行（拇指恒朝
+    左，两只手都不翻）；baseline 为 16x16 中位基线（可 None，原始帧口径）。
+
+    同一 (w, h, side) 复用同一块画布，只重画变了的格 —— 返回值是该画布
+    本身，**下一次同尺寸调用会原地改写它**，需要的调用方自己拷贝。
     """
-    m = np.asarray(matrix, np.float32).reshape(16, 16)
-    # 网格 (x, y) = (矩阵行, 矩阵列) —— 厂商网格即直接读 m[x, y]，不转置
-    img = np.full((h, w, 3), _TACTILE_BG, np.uint8)
-    left_margin, top_margin, bottom_margin = 54.0, 54.0, 22.0
-    legend_width = 250.0
-    flip = (side == "left")                     # 左手行序反转 → 网格 x 翻转
-    cell = max(10.0, min((w - left_margin - legend_width) / 16.0,
-                         (h - top_margin - bottom_margin) / 16.0))
-    grid_left, grid_top = left_margin, top_margin
-    if baseline is not None:
-        base = np.asarray(baseline, np.float32).reshape(16, 16)
-
-    def display_value(x, y):
-        value = float(m[x, y])
-        if use_baseline and baseline is not None:
-            value = max(0.0, value - float(base[x, y]))
-        return int(round(value))
-
-    cv2.putText(img, "X -> 0..15" if not flip else "X -> 15..0",
-                (int(grid_left) + 16 * int(cell) // 2 - 70, 16),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, _TACTILE_TEXT_DIM,
-                1, cv2.LINE_AA)
-    for display_x in range(16):
-        x = display_x if not flip else 15 - display_x
-        cv2.putText(img, str(x),
-                    (int(grid_left + display_x * cell) + int(cell) // 2 - 5,
-                     int(grid_top) - 26),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, _TACTILE_TEXT_DIM,
-                    1, cv2.LINE_AA)
-    for display_row in range(16):
-        y = 15 - display_row
-        row_top = grid_top + display_row * cell
-        cv2.putText(img, f"y={y}",
-                    (6, int(row_top + cell / 2 + 4)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, _TACTILE_TEXT_DIM,
-                    1, cv2.LINE_AA)
-        for display_x in range(16):
-            x = display_x if not flip else 15 - display_x
-            value = display_value(x, y)
-            x0 = int(grid_left + display_x * cell)
-            y0 = int(row_top)
-            x1 = int(grid_left + (display_x + 1) * cell)
-            y1 = int(row_top + cell)
-            fill = _tactile_heat_color(value, use_baseline)
-            cv2.rectangle(img, (x0, y0), (x1, y1), fill, -1)
-            is_empty = y <= 2
-            is_spare = y >= 3 and x == 0
-            if is_empty or is_spare:
-                cv2.rectangle(img, (x0, y0), (x1, y1),
-                              _TACTILE_EMPTY_OVERLAY, -1)
-                cv2.line(img, (x0, y0), (x1, y1), _TACTILE_EMPTY_LINE, 1)
-                cv2.line(img, (x1, y0), (x0, y1), _TACTILE_EMPTY_LINE, 1)
-            cv2.rectangle(img, (x0, y0), (x1, y1), _TACTILE_GRID_BORDER, 1)
-            lum = (0.299 * fill[2] + 0.587 * fill[1] + 0.114 * fill[0])
-            text_color = (7, 16, 25) if lum > 145 else (255, 246, 238)
-            if cell >= 11:
-                cv2.putText(img, str(value), (x0 + 2, y0 + int(cell) - 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.28, text_color,
-                            1, cv2.LINE_AA)
-
-    finger_height = 4.0 * cell
-    for group in range(5):
-        # 框要扣在该手指的行落点上：右手行序 1..15（拇指 1-3），左手镜像
-        # （拇指 15-13）→ 翻转后第 g 组落在显示列 3g..3g+2，拇指仍在画面
-        # 左侧。与下面 Spare 框（行 0）、掌心框（行 1..15）同一口径。
-        display_start_x = 3 * group if flip else 1 + group * 3
-        x0 = int(grid_left + display_start_x * cell)
-        y0 = int(grid_top)
-        cv2.rectangle(img, (x0 + 2, y0 + 2),
-                      (x0 + int(3 * cell) - 2, y0 + int(finger_height) - 2),
-                      _TACTILE_FINGER_BGR[group], 2)
-    spare_x = 0 if not flip else 15
-    x0 = int(grid_left + spare_x * cell)
-    cv2.rectangle(img, (x0 + 1, int(grid_top) + 1),
-                  (x0 + int(cell) - 1, int(grid_top + finger_height) - 1),
-                  _TACTILE_SPARE_LINE, 1)
-    palm_left = grid_left + (cell if not flip else 0.0)
-    x0 = int(palm_left)
-    y0 = int(grid_top + 4.0 * cell)
-    cv2.rectangle(img, (x0 + 2, y0 + 2),
-                  (x0 + int(15 * cell) - 2, y0 + int(9 * cell) - 2),
-                  _TACTILE_PALM_BLUE, 2)
-    cv2.line(img, (x0, y0), (x0 + int(15 * cell), y0), _TACTILE_WHITE, 2)
-
-    legend_left = int(grid_left + 16 * cell + 18.0)
-    if legend_left < w - 10:
-        cv2.putText(img, "Fingers  y=12..15", (legend_left, int(grid_top) + 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, _TACTILE_TEXT, 1, cv2.LINE_AA)
-        for group in range(5):
-            top = int(grid_top + 28.0 + group * 24.0)
-            cv2.rectangle(img, (legend_left, top),
-                          (legend_left + 15, top + 15),
-                          _TACTILE_FINGER_BGR[group], -1)
-            row_lo = 13 - 3 * group if flip else 1 + 3 * group
-            cv2.putText(img, f"{_TACTILE_FINGER_NAMES[group]}: x={row_lo}..{row_lo+2}",
-                        (legend_left + 23, top + 13),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, _TACTILE_TEXT, 1, cv2.LINE_AA)
-        cv2.putText(img, "Spare col: x=0, y=3..15",
-                    (legend_left, int(grid_top + 166.0)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, _TACTILE_TEXT_FAINT,
-                    1, cv2.LINE_AA)
-        cv2.putText(img, "Palm  x=1..15, y=3..11",
-                    (legend_left, int(grid_top + 208.0)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, _TACTILE_PALM_BLUE,
-                    1, cv2.LINE_AA)
-        cv2.putText(img, "Empty zone: y=0..2",
-                    (legend_left, int(grid_top + 232.0)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, _TACTILE_TEXT, 1, cv2.LINE_AA)
-        cv2.putText(img, "Top of view = y=15..0",
-                    (legend_left, int(grid_top + 258.0)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, _TACTILE_TEXT_FAINT,
-                    1, cv2.LINE_AA)
-        cv2.putText(img, "fingers point upward",
-                    (legend_left, int(grid_top + 280.0)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, _TACTILE_TEXT_FAINT,
-                    1, cv2.LINE_AA)
-    return img
+    key = (int(w), int(h), side)
+    panel = _TACTILE_PANELS.get(key)
+    if panel is None:
+        panel = _TactilePanel(w, h, side)
+        _TACTILE_PANELS[key] = panel
+        while len(_TACTILE_PANELS) > _PANEL_CACHE_MAX:
+            _TACTILE_PANELS.popitem(last=False)   # 拖窗口边缘会连续出新尺寸
+    else:
+        _TACTILE_PANELS.move_to_end(key)
+    return panel.paint(matrix, baseline, use_baseline)
 
 
 def put_label(img, text, pos, color=(255, 255, 255)):
@@ -1068,6 +1342,11 @@ class DemoWindow(QMainWindow):
         self._skel_dists = {}    # 骨架相机距离（每侧，整段数据一次拟合后固定）
         self._skel_centers = {}  # 骨架居中点（每侧，整段数据一次计算后固定）
         self.tactile_sensors = []  # 触觉面板显示的传感器（优先左手，无左手回退右手）
+        # 深度面板：want = 本轮请求的帧号，drawn = 实际画上去的帧号，
+        # 两者不等说明后台还在解 —— 由 _poll_depth 在解好后补画一次
+        self._depth_want = {}
+        self._depth_drawn = {}
+        self._depth_panels = {}  # (流, 帧号) → 已缩放贴好标签的面板
 
         central = QWidget()
         # 暗色底：面板被隐藏时，空网格单元不露出白色窗口背景。
@@ -1155,6 +1434,12 @@ class DemoWindow(QMainWindow):
         self.timer.setInterval(33)   # 30fps；加载后按数据 fps 重设
         self.timer.timeout.connect(self.next_frame)
 
+        # 深度帧补画计时器：解码在后台线程，主线程只轮询"我要的那帧
+        # 到了没"。30ms 一次纯字典比较，没到就什么都不做
+        self.depth_timer = QTimer(self)
+        self.depth_timer.setInterval(30)
+        self.depth_timer.timeout.connect(self._poll_depth)
+
         if parquet_path:
             self.load(parquet_path)
 
@@ -1178,6 +1463,10 @@ class DemoWindow(QMainWindow):
         self.idx = 0
         self._skel_dists = {}
         self._skel_centers = {}
+        self._depth_want = {}
+        self._depth_drawn = {}
+        self._depth_panels = {}
+        self.depth_timer.setInterval(30)
         self.has_tactile = self.data.has_tactile()
         self.has_depth = self.data.has_depth()
         self.has_imu = self.data.has_imu()
@@ -1238,6 +1527,10 @@ class DemoWindow(QMainWindow):
         self.setWindowTitle(
             f"Pooled Data Viewer - {os.path.basename(path)} "
             f"({self.n} 帧 @ {self.play_fps:g}fps, episode {self.data.episode_index})")
+        if self.has_depth:
+            self.depth_timer.start()
+        else:
+            self.depth_timer.stop()
         self.render_frame(0)
         bits = [f"{self.n} 帧", f"fps {self.play_fps:g}",
                 f"RGB 视频 {len(self.data.videos)} 路",
@@ -1360,6 +1653,23 @@ class DemoWindow(QMainWindow):
         else:
             super().keyPressEvent(ev)
 
+    def _poll_depth(self):
+        """后台解到本轮要的那一帧了 → 补画一次（深度面板收敛靠它）。
+
+        read() 不再等解码：解好之前它交出来的是上一帧，所以拖进度条松手、
+        跳转、PageUp/PageDown 之后面板会先停在旧画面上，等这里补一帧落到
+        正确画面。平时播放时后台跟得上，这里每轮都是空转（几次字典比较）。
+        """
+        if self.data is None or not self.data.depth_videos:
+            return
+        for dv in self.data.depth_videos:
+            want = self._depth_want.get(dv)
+            if want is None or self._depth_drawn.get(dv) == want:
+                continue
+            if dv.ready_idx == want:      # 要的那帧到了，重画落到它上面
+                self.render_frame(self.idx)
+                return
+
     # ── 渲染 ──
     def render_frame(self, idx):
         # 拖动中不 setValue：会把拇指弹回已渲染位置，与用户拖拽打架
@@ -1385,6 +1695,10 @@ class DemoWindow(QMainWindow):
                     hh = max(1, int(round(frame.shape[0] * w / frame.shape[1])))
                     frame = cv2.resize(frame, (w, hh),
                                        interpolation=cv2.INTER_AREA)
+                else:
+                    # 宽度正好相等 → 没有 resize，拿到的还是解码缓存里那
+                    # 一份数组，put_label 是原地写，必须拷一份再画
+                    frame = frame.copy()
                 put_label(frame, v.name, (12, 26), (0, 255, 255))
                 panels.append(frame)
             if len(panels) > 1:
@@ -1405,18 +1719,37 @@ class DemoWindow(QMainWindow):
             w = self.lbl_video.width() or 1280
             panels = []
             for dv in self.data.depth_videos:
-                frame = dv.read(self._video_frame_for(dv, idx))
+                fidx = self._video_frame_for(dv, idx)
+                # 非阻塞：解码在后台线程，这里拿到的是"手上现有的最好一帧"
+                # （可能是上一帧，帧号见 ready_idx）。登记 want/drawn，后台
+                # 解到目标帧后由 _poll_depth 补画一次 —— 主线程不再为一次
+                # 深度 seek 停 150~250ms
+                frame = dv.read(fidx)
+                self._depth_want[dv] = fidx
+                self._depth_drawn[dv] = dv.ready_idx
                 if frame is None:
                     frame = np.full((360, 640, 3), 15, np.uint8)
                 frame = np.asarray(frame)
                 if frame.ndim != 3:
                     frame = np.full((360, 640, 3), 15, np.uint8)
+                key = (dv, dv.ready_idx)
+                cached = self._depth_panels.get(key)
+                if cached is not None and cached.shape[1] == w:
+                    panels.append(cached)
+                    continue
                 if frame.shape[1] != w:
                     hh = max(1, int(round(frame.shape[0] * w / frame.shape[1])))
                     frame = cv2.resize(frame, (w, hh),
                                        interpolation=cv2.INTER_AREA)
+                else:
+                    # 宽度正好相等 → 没有 resize，拿到的还是解码缓存里那
+                    # 一份数组，put_label 是原地写，必须拷一份再画
+                    frame = frame.copy()
                 put_label(frame, dv.name + " (depth, JET)", (12, 26),
                           (0, 255, 255))
+                if len(self._depth_panels) > 32:
+                    self._depth_panels.clear()
+                self._depth_panels[key] = frame
                 panels.append(frame)
             if len(panels) > 1:
                 pad = np.full((6, w, 3), 10, np.uint8)
@@ -1526,6 +1859,7 @@ class DemoWindow(QMainWindow):
 
     def closeEvent(self, ev):
         self.timer.stop()
+        self.depth_timer.stop()
         if self.data:
             self.data.close()
         super().closeEvent(ev)

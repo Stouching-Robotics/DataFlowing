@@ -1,7 +1,7 @@
 # collector — Multimodal Data Acquisition SDK · 多模态数据采集 SDK
 
-![Version](https://img.shields.io/badge/version-1.3.9-blue)
-![Python](https://img.shields.io/badge/python-3.12-blue)
+![Version](https://img.shields.io/badge/version-1.3.11-blue)
+![Python](https://img.shields.io/badge/python-3.10-blue)
 ![License](https://img.shields.io/badge/license-TBD-lightgrey)
 
 
@@ -77,7 +77,7 @@ weights, and tests.
 #### Install dependencies
 
 ```bash
-python -m venv venv
+python -m venv venv            # Python must be exactly 3.10 (glove SDK ABI)
 venv/bin/pip install -r requirements.txt
 ```
 
@@ -89,11 +89,13 @@ venv/bin/pip install -r requirements.txt
 
 #### Windows one-click deployment (recommended for customers)
 
-Double-click **`start.bat`** in the repo root: it installs Python 3.12
-(silent download if absent), creates the venv, installs dependencies, unpacks
-the bundled glove toolkit ([4/7] — needed for the live hand skeleton; if it is
-missing only a warning is printed and the program still starts), and
-launches the main program; already-deployed machines start instantly. Common
+Double-click **`start.bat`** in the repo root: it installs Python **3.10**
+(silent download if absent — the glove SDK's solver core is encrypted for the
+3.10 ABI, so 3.11/3.12 will not do), creates the venv, installs dependencies,
+unpacks the bundled glove SDK ([4/7] — serial capture, tactile filtering and
+the live hand skeleton; if it is missing only a warning is printed and the
+program still starts), and launches the main program; already-deployed machines
+start instantly. Common
 commands:
 
 ```bat
@@ -328,6 +330,12 @@ venv/bin/python tools/tests/test_camera_log_archive.py
 venv/bin/python tools/tests/test_audit_frame_gaps.py
 # whole-library frame-gap audit (read-only; exit 1 when picture loss is proven)
 venv/bin/python tools/audit_frame_gaps.py
+# glove SDK v2.1.0 migration (v1.3.11)
+venv/bin/python tools/tests/test_glove_sdk_boot.py
+venv/bin/python tools/tests/test_glove_registry.py
+venv/bin/python tools/tests/test_glove_backend_parity.py
+venv/bin/python tools/tests/test_glove_engine_sdk_guards.py
+venv/bin/python tools/tests/test_sdk_python_version.py
 # hardware tests require the corresponding device attached: d405_worker_test,
 # d435_e2e_test, d435_gui_smoke_test, mono_regression, d435_playback_test, etc.
 ```
@@ -389,6 +397,21 @@ are documented in [docs/index.md](docs/index.md#开发约定).
 
 ### Changelog
 
+- **v1.3.11** — the glove path moves to the vendor SDK v2.1.0 (`tools/glove_sdk/`,
+  replacing the forked `core/glove_usb`), which pins the whole stack to **Python
+  3.10**: the SDK's `algorithm/` is PyArmor-encrypted for the 3.10 ABI, so on
+  3.11+ `import sdk.api` fails outright — you lose **the whole glove path**, not
+  just the skeleton. The four launchers now demand *exactly* 3.10 and rebuild a
+  3.12 venv in place. Four silent failures fixed: skeleton columns permanently
+  blank with no error (the SDK swapped the warmup key for the inverted
+  `warming_up`); the left-hand tactile picture rotated 90° (left frames are the
+  canonical frame's `[::-1, ::-1].T`, not a row mirror); a third glove silently
+  taking the left column and overwriting the real left hand; and both venv
+  failures of one-click deployment. The engine also guards two SDK transport
+  defects: `stop()` does not terminate (an orphan reader holds the tty forever —
+  the "must restart the program" symptom) and one shared lock lets the silent
+  stream starve. Gripper side (L0/L1): finalize-stage timings, a raw-stream stall
+  watchdog, a SLAM divergence audit and a force-matrix schema contract test.
 - **v1.3.10** — silent holes in the gripper RGB stream are now instrumented,
   alarmed and archived. `episode-099.mp4`'s frozen opening is not a missing
   stream at the start: the first 45 frames are real (the scene is simply still)
@@ -900,7 +923,7 @@ HTTP 上传，输出 [EgoData](https://github.com/facebookresearch/egodata) /
 #### 安装依赖
 
 ```bash
-python -m venv venv
+python -m venv venv            # Python 必须**恰好** 3.10（手套 SDK 的 ABI 要求）
 venv/bin/pip install -r requirements.txt
 ```
 
@@ -910,9 +933,10 @@ venv/bin/pip install -r requirements.txt
 
 #### Windows 一键部署（推荐客户使用）
 
-双击根目录 **`start.bat`**：自动安装 Python 3.12（无则静默下载安装）、创建 venv、
-安装依赖、展开随包的手套工具包（[4/7]，实时骨架解算用；缺了只打印警告、主程序照常
-启动）并启动主程序；已部署过则秒开。常用命令：
+双击根目录 **`start.bat`**：自动安装 Python **3.10**（无则静默下载安装；手套 SDK 的
+解算核心按 3.10 ABI 加密，3.11/3.12 不行）、创建 venv、安装依赖、展开随包的手套
+SDK（[4/7]，串口采集 + 触觉降噪 + 实时骨架解算；缺了只打印警告、主程序照常启动）
+并启动主程序；已部署过则秒开。常用命令：
 
 ```bat
 start.bat               部署并启动（默认）
@@ -1129,6 +1153,12 @@ venv/bin/python tools/tests/test_camera_log_archive.py
 venv/bin/python tools/tests/test_audit_frame_gaps.py
 # 全库帧空洞审计（只读；画面证实丢帧时退出码 1）
 venv/bin/python tools/audit_frame_gaps.py
+# 手套 SDK v2.1.0 迁移（v1.3.11）
+venv/bin/python tools/tests/test_glove_sdk_boot.py
+venv/bin/python tools/tests/test_glove_registry.py
+venv/bin/python tools/tests/test_glove_backend_parity.py
+venv/bin/python tools/tests/test_glove_engine_sdk_guards.py
+venv/bin/python tools/tests/test_sdk_python_version.py
 # 真机相关测试需连接对应设备：d405_worker_test、d435_e2e_test、
 # d435_gui_smoke_test、mono_regression、d435_playback_test 等
 ```
@@ -1180,6 +1210,22 @@ i18n 文案经 `tr()` 翻译、PyQt5 信号参数用 `object` 封送大整数、
 
 ### 更新记录
 
+- **v1.3.11** — 手套链路整体换厂商 SDK v2.1.0（`tools/glove_sdk/`，取代 fork 的
+  `core/glove_usb`），全栈因此锁到 **Python 3.10**：SDK 的 `algorithm/` 是 PyArmor
+  按 3.10 ABI 加密的，3.11+ 下 `import sdk.api` 直接失败 ⇒ 丢的是**整条手套链路**，
+  不是「少个骨架」。四个分发壳的判据改成「**恰好** 3.10」，客户机上 3.12 的 venv
+  自动重建。同一版修掉四个静默坏：①骨架列**永久空白且零报错**（SDK 把 warmup 判据
+  换成反极性的 `warming_up`，旧键名 `warmup_completed` 恒 False ⇒ `process()` 永远
+  返回 None）；②左手触觉画面**整体转 90°**（左手帧是规范系的 `[::-1, ::-1].T`，不是
+  「右手整块行镜像」，现由 `canonical_pressure_matrix()` 反变换、两只手共用同一段
+  渲染代码）；③第 3 只手套被判成左手并与真左手**同列**互写（删掉 `SENSOR_NAMES[-1]`
+  兜底，改由调用方拒绝连接）；④一键部署的两类 venv 故障。另兜住 SDK 传输层两处
+  缺陷：`stop()` 不终结 ⇒ 孤儿读线程永久占 tty（症状是「必须重启程序」）、单锁竞争
+  把静默那条流饿死。夹爪侧观测性（L0/L1）：采集收尾分段计时、原始流接收停滞看门狗、
+  SLAM 位姿发散审计脚本、力矩阵落盘 schema 契约测试。注册表读取收归
+  `core/glove_registry.py`（SDK 的 `load_device_registry` 会抛**裸 `ValueError`**
+  炸掉整个设备面板，而 SDK 任何一次绑定写入都会**抹掉注册表里的其它键**），
+  `glove_devices.json` 升至 schema v2 复数数组（换机/改号后旧号仍认得出）。
 - **v1.3.10** — 夹爪 RGB 的**静默空洞**从此有仪表、有告警、有留档。`episode-099.mp4`
   开头那一段静止不是「开头没流」：前 45 帧是真帧（场景本身静止），真正丢的是
   **row44→row45 之间的 4.68 秒**（`hardware_ns` +4680.8ms 与 `wall_time` +4666.4ms

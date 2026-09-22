@@ -68,6 +68,15 @@
 
 ### `scripts/pack_toolkit.py`
 
+> ⚠️ **本脚本尚未跟上 2026-09-21 的 SDK v2.1.0 迁移 —— 当前跑不通，产出的名字与布局也都是旧工具包时代的。**
+> 迁移计划 S7 整体重写。新的**位置契约**（四个分发壳 start.sh / start.bat /
+> start_lite.sh / start_lite.bat 已按它改好）：
+> `wheels/toolkit/glove_sdk.zip` → zip 顶层是**裸的 `glove_sdk/`**（不含 `tools/` 前缀）
+> → 解压目标 **`tools/`** → 落点 `<项目根>/tools/glove_sdk/`
+> （`core/glove_sdk_boot.py` 的 `find_sdk_dir()` 找的就是这里）。位置只写在分发壳那一处，
+> zip 本身不含路径假设，再挪地方不用重打包。
+> 下面这段描述的是**旧工具包**的布局，重写前不要照它理解。
+
 **作用**：把项目根同级的手套工具包（`stouch_glove_toolkit*`，本地参考副本约 2.1GB）按白名单裁成约 6.0MB 的 `wheels/toolkit/glove_toolkit.zip`，使普通版一键部署自带实时骨架解算（解算链由 `core/glove_keypoint_solver.py` 的 `find_toolkit_dir()` 按目录名在项目根查找，故解压后须落在项目根同级）。
 
 **类/函数**：

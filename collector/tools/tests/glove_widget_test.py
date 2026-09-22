@@ -158,17 +158,14 @@ def main():
               f"stop() 状态文案: {w.video_widget._status_text}")
         check(pipe.events and pipe.events[-1] == ("right_glove", "disconnected"),
               f"连接/断开事件: {pipe.events}")
-        # 左手套 → 左配置文件（两文件键同值异：各自加载结果比对
-        # 验证 role→文件路由 + DEFAULT_HAND 之外部位存在）
-        from core.sensor_hand_config import load_sensor_hand_config
-        from core.render_engine import DEFAULT_HAND
+        # 左手套 → 左手判（触觉网格按传感器列名判手；两只手共用一套坐标、
+        # 谁都不翻，见 core/render_engine.canonical_pressure_matrix）
+        from core.render_engine import glove_side_of
         wl = gw.GloveWidget("sensor:ble:BB:22:33:44:55:66",
                             "BB:22:33:44:55:66", "left_glove", "左手套")
-        check(w.hand_config == load_sensor_hand_config("right_glove"),
-              "right_glove 加载右配置文件")
-        check(wl.hand_config == load_sensor_hand_config("left_glove")
-              and len(wl.hand_config) > len(DEFAULT_HAND),
-              f"left_glove 使用扩展仿生配置 ({len(wl.hand_config)} 部位)")
+        check(w.side == "right" and wl.side == "left",
+              f"role → 左右手判手: {w.side} / {wl.side}")
+        check(glove_side_of("glove") == "right", "无左右标识默认右手")
     finally:
         gw.SensorBLEEngine = orig_cls
 
@@ -389,6 +386,10 @@ def main():
             self.dynamic_noise_ratio = 0.0
             self.spatial_filter_enabled = True
             self.drift_baseline_val = 0
+            # UsbGloveEngine 独有：覆盖条据此多画一行（BLE 引擎没有，
+            # 状态带位置也随之不同 —— 见 GloveWidget._display_frame）
+            self.imu_present_count = 16
+            self.tactile_fps = 30.0
 
         def process_frame(self):
             return np.random.rand(16, 16).astype(np.float32) * 3000, 3000.0
@@ -430,9 +431,22 @@ def main():
     frame = np.frombuffer(ptr, np.uint8).reshape(
         qimg.height(), qimg.bytesPerLine())[:, :qimg.width() * 3].reshape(
         qimg.height(), qimg.width(), 3)
-    region = frame[412:712, 8:348]
+    # USB 画面 = 触觉面板 1280x720 + 面板**下方**的状态带 68px：三行状态
+    # 画在 (0,0) 时条高 68px > 网格上边距 54px，会切掉最上一行（y=15 指尖）
+    # 左起约 6 格的顶部 14px —— 挪到面板外才不会压住任何格区
+    check(frame.shape == (788, 1280, 3),
+          f"USB 画面 = 面板 720 + 状态带 68: {frame.shape}")
+    seg = frame[54:68, 54:314]        # 网格首行左起约 6 格的顶部 14px
+    check(not np.any(np.all(seg == 0, axis=-1)),
+          "状态带不再压住网格首行（该区域无纯黑像素）")
+    band = frame[720:788, 0:300]
+    check(int(band.max()) > 40, f"面板下方画出了状态带（max {int(band.max())}）")
+    # 骨架小窗位置随触觉网格改到右下空白区（见 GloveWidget._SKEL_POS）
+    region = frame[400:700, 930:1270]
     check(int(region.max()) > 40,
-          f"左下角骨架小窗出现（区域 max {int(region.max())}）")
+          f"右下角骨架小窗出现（区域 max {int(region.max())}）")
+    # 旧位置已被触觉网格占用：网格底色/格线都比纯黑亮
+    check(int(frame[412:712, 8:348].max()) > 40, "左下角已有触觉网格内容")
     # 解算器不可用: 不写骨架、不叠小窗
     wgt._kpts = None
     wgt._solver = FakeSolver(None)

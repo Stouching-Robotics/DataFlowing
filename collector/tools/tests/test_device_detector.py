@@ -498,6 +498,23 @@ def _main():
         check(_settings.assign_glove_sensor_role("usbglove:2096376E3032",
                                                  "right_glove") == "right_glove",
               "USB 手套重连保持绑定（幂等）")
+        # 注册表改侧别 ⇒ 历史绑定必须让位。用户把序列号挪到另一侧（同一只
+        # 手套换到另一只手上）时，改注册表是全程序**唯一**的修法 —— 没有任何
+        # UI 能改手套的列名绑定。若历史绑定优先，重连还是老样子：用户改完
+        # 注册表会发现"改了也没用"，且日志一切正常。
+        _settings.save_device_name("usbglove:2096376E3032", "右手套",
+                                   sensor="right_glove")
+        role_moved = _settings.assign_glove_sensor_role("usbglove:2096376E3032",
+                                                        "left_glove")
+        check(role_moved == "left_glove"
+              and _settings.device_sensor_role("usbglove:2096376E3032")
+              == "left_glove",
+              f"注册表改侧别压过历史绑定（改了注册表要生效）: {role_moved}")
+        check(_settings.device_name("usbglove:2096376E3032") == "右手套",
+              "改侧别不得丢掉用户命名")
+        # 改回来，免得影响下面的用例（同一临时文件）
+        _settings.assign_glove_sensor_role("usbglove:2096376E3032",
+                                           "right_glove")
         # 非 usbglove 键（BLE）保持原有碰撞规避语义：right 被占 → 落 left
         check(_settings.assign_glove_sensor_role("ble:FF:11:22:33:44:55",
                                                  "right_glove") == "left_glove",
@@ -518,6 +535,51 @@ def _main():
           f"右手套备用序列号（换机/固件变更）→ right_glove: {side_map}")
     check(side_map.get("2067376f3032") == "left_glove",
           f"左手套序列号 → left_glove: {side_map}")
+    # 2026-09-21 新到的这对（用户报告右手被判成左手）。**注册表是本程序里
+    # 唯一按序列号说明左右手的地方**，漏登记 ⇒ prefer 为空 ⇒ 只能按连接
+    # 先后抢空闲列 ⇒ 谁先插谁当右手。用户换手套时这一条会红，照改注册表。
+    check(side_map.get("364133593535") == "right_glove",
+          f"新右手套 364133593535 → right_glove: {side_map}")
+    check(side_map.get("364933593535") == "left_glove",
+          f"新左手套 364933593535 → left_glove: {side_map}")
+
+    print("── 12b. 未注册手套 + 两列都被占：必须拒绝，不得猜 left_glove ──")
+    # 复现用户报的那次误判：新序列号不在注册表里（prefer 为空），而两只
+    # **不在位**的旧手套在 device_names.json 里各占着一列 ⇒ 旧版落到
+    # `return SENSOR_NAMES[-1]`，把这只新手套判成 left_glove，与真左手同列、
+    # 两个 write_sensor 互相覆盖，且猜测不落盘 ⇒ 每次连接都重复同一个错答案。
+    tmp2 = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+    tmp2_path = tmp2.name
+    tmp2.close()
+    _settings2 = _settings
+    _orig2 = _settings2.DEVICE_NAMES_FILE
+    _settings2.DEVICE_NAMES_FILE = tmp2_path
+    try:
+        _settings2.save_device_name("usbglove:2095376E3032", "旧右手套",
+                                    sensor="right_glove")
+        _settings2.save_device_name("usbglove:2090376E3032", "旧左手套",
+                                    sensor="left_glove")
+        role = _settings2.assign_glove_sensor_role("usbglove:364133593535", "")
+        check(role != "left_glove",
+              f"未注册手套不得被判成左手（旧版正是 left_glove）: {role!r}")
+        check(role == "", f"无空闲列时返回空串交调用方拒绝: {role!r}")
+        check(_settings2.device_sensor_role("usbglove:2095376E3032")
+              == "right_glove",
+              "拒绝时不得动别人的绑定（宁可开不了，不能串列）")
+        # 边界：拒绝**只**针对"认不出是哪只手"的。同一套占位下，注册过的
+        # 序列号（prefer 权威）照旧拿回自己那一列 —— 否则上面那条会恒真。
+        role2 = _settings2.assign_glove_sensor_role("usbglove:364133593535",
+                                                   "right_glove")
+        check(role2 == "right_glove",
+              f"注册过的序列号（prefer 权威）不受占位影响: {role2!r}")
+        check(_settings2.device_sensor_role("usbglove:2095376E3032") == "",
+              "权威侧别抢占后释放了旧手套在该列的绑定")
+    finally:
+        _settings2.DEVICE_NAMES_FILE = _orig2
+        try:
+            os.unlink(tmp2_path)
+        except OSError:
+            pass
 
     print("── 13. 真机段（蓝牙在位时） ──")
     if os.path.exists("/usr/bin/bluetoothctl") or os.path.exists("/usr/local/bin/bluetoothctl"):

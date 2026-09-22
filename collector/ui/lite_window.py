@@ -839,6 +839,11 @@ class LiteWindow(QMainWindow):
         prefer = {"l": "left_glove", "r": "right_glove"}.get(
             (dev.display_name or "").strip().lower(), "")
         role = settings.assign_glove_sensor_role(dev.key, prefer)
+        if not role:
+            self._log(tr("[错误] 手套列已用满（{}），无法为 {} 分配传感器列；"
+                         "拒绝连接（再连会把两只手套写成同一列）",
+                         "/".join(settings.SENSOR_NAMES), dev.label))
+            return False
         self._pipeline.register_sensor(role)
         engine = SensorBLEEngine()
         pump = LiteGlovePump(role, engine, on_log=self._log)
@@ -862,6 +867,13 @@ class LiteWindow(QMainWindow):
             return False
         prefer = usb_glove_prefer_side(dev.serial or "")
         role = settings.assign_glove_sensor_role(dev.key, prefer)
+        if not role:
+            self._log(tr("[错误] USB 手套 {} 分配不到传感器列（{} 都已被占用）"
+                         "—— 拒绝连接；请把序列号写进 glove_devices.json "
+                         "对应侧的 usb_serials",
+                         dev.serial or dev.label,
+                         "/".join(settings.SENSOR_NAMES)))
+            return False
         self._pipeline.register_sensor(role)
         engine = UsbGloveEngine(dev.address)
         pump = LiteGlovePump(role, engine, on_log=self._log)

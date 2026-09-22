@@ -48,7 +48,7 @@ SPECS = {
 
 _ASCII_FALLBACK = """\
 ============================================================
- WRONG PYTHON INTERPRETER
+ {headline_en}
 ============================================================
  interpreter: {exe}
  missing:     {missing}
@@ -109,21 +109,39 @@ def enforce(base_dir: str, app: str) -> None:
     spec = SPECS[app]
     venv_name = spec["venv"]
     missing = missing_modules(spec["modules"])
-    fallback = _ASCII_FALLBACK.format(
-        exe=sys.executable, missing=", ".join(missing),
-        launcher_win=spec["launcher_win"], launcher_unix=spec["launcher_unix"],
-        venv=venv_name, entry=spec["entry"])
+    in_venv = in_project_venv(base_dir, venv_name)
 
     if missing:
+        # 两种「缺依赖」要分开讲，否则会把人指错方向:
+        #   · 解释器就不是本项目 venv（没激活 / 激活了别人的）→ 换启动方式；
+        #   · 解释器就是本项目 venv，只是依赖没装完（装到一半断网/关窗口）
+        #     → 换启动方式没用，得让分发脚本把它补齐。报错文案必须说清这点。
+        if in_venv:
+            headline = "启动环境不完整: 项目自带 venv 里缺少依赖"
+            headline_en = "INCOMPLETE ENVIRONMENT (deps missing in bundled venv)"
+            why = f""" 解释器是对的（项目自带 {venv_name}），但里面缺依赖。
+ 多半是上一次依赖安装没装完（断网 / 关窗口 / 被杀软打断）。
+
+ 重新运行下面任一脚本即可补齐（会自动修复，约 1-10 分钟）:"""
+        else:
+            headline = "启动环境不对: 当前用的 Python 不是本项目的运行环境"
+            headline_en = "WRONG PYTHON INTERPRETER"
+            why = f""" 请改用下面任一方式启动（任选其一）:"""
+
+        fallback = _ASCII_FALLBACK.format(
+            headline_en=headline_en, exe=sys.executable,
+            missing=", ".join(missing), launcher_win=spec["launcher_win"],
+            launcher_unix=spec["launcher_unix"], venv=venv_name,
+            entry=spec["entry"])
         indented = "\n".join(f" {line}" for line in fallback.splitlines())
         _print(f"""
 ============================================================
- 启动环境不对: 当前用的 Python 不是本项目的运行环境
+ {headline}
 ============================================================
  解释器: {sys.executable}
  缺少依赖: {", ".join(missing)}
 
- 请改用下面任一方式启动（任选其一）:
+{why}
    · Windows:  双击 {spec["launcher_win"]}
    · Linux:    {spec["launcher_unix"]}
    · 或用项目自带 venv 的解释器直接跑:
@@ -138,7 +156,7 @@ def enforce(base_dir: str, app: str) -> None:
 """, indented)
         sys.exit(2)
 
-    if not in_project_venv(base_dir, venv_name):
+    if not in_venv:
         print(f"[提示] 未使用项目自带 {venv_name}（当前: {sys.prefix}）"
               f" —— 仅开发调试时这样运行；交付/客户环境请用 "
               f"{spec['launcher_win']} / {spec['launcher_unix']}")

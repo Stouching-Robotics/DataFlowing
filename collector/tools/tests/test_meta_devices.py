@@ -18,6 +18,7 @@ stats/tasks、旧单值标定路径、S80M 静态标定注入、手套列名绑�
   5. 旧单值路径（无 devices）→ info.json calibration head_stereo 行为不变
   6. S80M 静态标定文件可解析为非零内参（注入链路源）
   7. assign_glove_sensor_role: MAC 绑定 + 空余名分配 + 重连保持
+     + 无空余名时**拒绝**（返回空串）而不是静默猜 left_glove
 """
 import os
 import sys
@@ -252,8 +253,17 @@ def main():
         check(r1 == "right_glove" and r2 == "left_glove",
               f"空余名顺序分配: {r1}, {r2}")
         check(r1b == r1, f"重连保持原列名: {r1b}")
+        # 第 3 只手套：**必须拒绝**，不能兜底猜一个已被占用的列名。
+        # 旧版这里 return SENSOR_NAMES[-1]（= left_glove）⇒ 第 3 只与真左手
+        # 同列，两个 write_sensor 互相覆盖，而且猜测不落盘 ⇒ 每次连接都
+        # 重复同一个错答案（2026-09-21 实机：新右手套被判成左手）。
+        before = settings.load_device_names()
         r3 = settings.assign_glove_sensor_role("ble:CC:33:44:55:66:77")
-        check(r3 in settings.SENSOR_NAMES, f"无空余名兜底: {r3}")
+        check(r3 == "", f"无空余名拒绝分配（不再猜列名）: {r3!r}")
+        check(settings.load_device_names() == before,
+              "拒绝时一行都不落盘（旧版也不落盘，所以错的答案会永远重复）")
+        check(r3 != r2 and settings.SENSOR_NAMES.count(r3) == 0,
+              f"拒绝值不得是任何真实列名（不得与 {r2} 同列）")
     finally:
         settings.DEVICE_NAMES_FILE = _orig
         try:

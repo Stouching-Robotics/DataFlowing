@@ -33,7 +33,8 @@ from ui.camera_widget import ZoomableVideoWidget
 from ui.camera_grid import CameraGrid, SPLITTER_HANDLE_WIDTH, SPLITTER_HANDLE_QSS
 from core.render_engine import (
     render_heatmap, render_trace, render_grid, render_hand, render_deform_mesh,
-    DeformMeshState, clear_trace_canvas,
+    render_tactile_grid, tactile_canvas_for, glove_side_of, DeformMeshState,
+    clear_trace_canvas,
 )
 from core.session_timeline import SensorTimeline
 from core.session_catalog import get_effective_fps, load_session_meta, list_sessions
@@ -126,7 +127,7 @@ class _SeekSlider(QSlider):
 
 
 class PlaybackSensorWidget(QFrame):
-    """单路传感器回放格：标题 + 模式选择 + 画面（默认仿生手掌）+ TS 标签。
+    """单路传感器回放格：标题 + 模式选择 + 画面（默认触觉分区网格）+ TS 标签。
 
     与摄像机格同入 CameraGrid：顶部标题行即拖拽手柄（事件过滤器拦截
     <32px 区域）；mode_combo / ts_label 标记 _no_drag，按下直接放行
@@ -157,10 +158,10 @@ class PlaybackSensorWidget(QFrame):
         self.mode_combo.addItems([
             tr("🔥 热力图 (Heatmap)"), tr("📝 轨迹 (Trace)"),
             tr("📊 网格 (Grid)"), tr("🦾 仿生手掌 (Hand)"),
-            tr("🕸 形变网格 (Deform)"),
+            tr("🕸 形变网格 (Deform)"), tr("🧬 触觉矩阵 (Tactile)"),
         ])
-        # 默认仿生手掌（连接信号前设置，无需 blockSignals）
-        self.mode_combo.setCurrentIndex(3)
+        # 默认触觉分区网格（连接信号前设置，无需 blockSignals）
+        self.mode_combo.setCurrentIndex(5)
         self.mode_combo.setFixedHeight(24)
         self.mode_combo._no_drag = True   # 网格拖拽过滤器放行点击
         head.addWidget(self.mode_combo)
@@ -340,6 +341,8 @@ class PlaybackDialog(QDialog):
         self._sensor_ts_labels = []   # TS 标签列表
         self._sensor_hand_configs = []  # 每个传感器的仿生手掌配置
         self._sensor_cells = []       # PlaybackSensorWidget 列表
+        self._tactile_baselines = {}  # 传感器列名 → 16x16 中位基线（惰性算）
+        self._tactile_use_baseline = True  # 触觉网格是否扣基线（底部勾选框）
 
         self._sensor_config = {
             "rows": list(range(16)), "cols": list(range(16)), "axis_order": "row_col",
@@ -400,6 +403,14 @@ class PlaybackDialog(QDialog):
         self._hand_overlay_cb.toggled.connect(self._toggle_hand_overlay)
         ctrl.addWidget(self._hand_overlay_cb)
 
+        # ── 触觉基线校正开关（只作用于"触觉矩阵"模式） ──
+        self._tactile_baseline_cb = QCheckBox(tr("🧬 触觉基线校正"))
+        self._tactile_baseline_cb.setChecked(True)
+        self._tactile_baseline_cb.setToolTip(
+            tr("矩阵显示 值-整段中位基线（与查看器同口径）"))
+        self._tactile_baseline_cb.toggled.connect(self._toggle_tactile_baseline)
+        ctrl.addWidget(self._tactile_baseline_cb)
+
         # ── 追踪模式选择 ──────────────────────────────
         self._hand_mode_combo = QComboBox()
         self._hand_mode_combo.addItems([tr("🧤 手套追踪"), tr("🖐 裸手追踪")])
@@ -427,7 +438,7 @@ class PlaybackDialog(QDialog):
         后传感器格（slot_id = "sensor:{name}"，与主窗口手套格约定一致）。
 
         摄像机格复用 CameraWidget（信息条含命名与帧号），传感器格用
-        PlaybackSensorWidget（默认仿生手掌）。网格拖拽调位 / 分割条
+        PlaybackSensorWidget（默认触觉分区网格）。网格拖拽调位 / 分割条
         调大小由 CameraGrid 统一提供。
         """
         self.grid.clear()   # 逐格 remove → _end_drag() 复位拖拽状态
@@ -456,6 +467,7 @@ class PlaybackDialog(QDialog):
         self._sensor_ts_labels = []
         self._sensor_hand_configs = []
         self._sensor_cells = []
+        self._tactile_baselines = {}   # 换会话 → 中位基线重算
         for idx, sensor_name in enumerate(self._sensor_names):
             cell = PlaybackSensorWidget(
                 sensor_name, self._sensor_titles.get(sensor_name))
@@ -465,7 +477,7 @@ class PlaybackDialog(QDialog):
             self._sensor_cells.append(cell)
             self._sensor_widgets.append(cell.video_widget)
             self._sensor_ts_labels.append(cell.ts_label)
-            self._sensor_modes.append("hand")
+            self._sensor_modes.append("tactile")
             self._sensor_vmax_list.append(5000.0)
             self._sensor_mesh_states.append(DeformMeshState())
             self._sensor_hand_configs.append(
@@ -1051,9 +1063,32 @@ class PlaybackDialog(QDialog):
             import traceback
             traceback.print_exc()
 
+    def _tactile_baseline(self, sensor_name: str):
+        """该传感器整段的 16x16 中位基线（惰性算一次，换会话清空）。
+
+        与查看器（tools/demos/pooled_viewer_demo）同一口径：逐格取整段
+        中位数，等同厂商 Glove-test 工具的基线校正。按传感器列自己的
+        行数取中位（多帧率会话里传感器行数少于摄像机帧数）；无数据返回
+        None —— 扣减被跳过，配色仍走校正档（移植实现里这两件事分别看
+        "baseline 是否为空"和"use_baseline"，见 render_engine）。
+        """
+        cache = self._tactile_baselines
+        if sensor_name not in cache:
+            mat = None
+            if self._timeline is not None:
+                mat = self._timeline.obs.get(f"observation.{sensor_name}")
+            if (mat is None or getattr(mat, "ndim", 0) != 2
+                    or mat.shape[0] == 0):
+                cache[sensor_name] = None
+            else:
+                cache[sensor_name] = np.median(
+                    np.asarray(mat, np.float32).reshape(mat.shape[0], 16, 16),
+                    axis=0).astype(np.float32)
+        return cache[sensor_name]
+
     def _on_sensor_mode_changed(self, sensor_idx: int, mode_idx: int):
         """切换指定传感器的可视化模式。"""
-        modes = ["heatmap", "trace", "grid", "hand", "deform"]
+        modes = ["heatmap", "trace", "grid", "hand", "deform", "tactile"]
         self._sensor_modes[sensor_idx] = modes[mode_idx]
         self._sensor_widgets[sensor_idx].setVisible(True)
         self._sensor_widgets[sensor_idx].reset_view()
@@ -1139,6 +1174,23 @@ class PlaybackDialog(QDialog):
                         mat, max_signal, self._sensor_config, size,
                         vmax, fps_val, mesh_state,
                     )
+                elif mode == "tactile":
+                    # 分区网格按固定色带画（无 vmax 自适应），vmax 原样回写。
+                    # 画布尺寸跟随**显示区**（同宽高比、格子不小于 28px）：数值
+                    # 文字是固定字号，固定 640x400 时四位数铺满整格被裁掉（糊成
+                    # 一团），而传感器格是宽扁的 —— 按显示区反推画布，缩放后比例
+                    # 与查看器一致、数字也不再被裁。
+                    # _sensor_widgets[idx] 就是画面控件本身（ZoomableVideoWidget）
+                    vid = self._sensor_widgets[idx]
+                    cw, ch = tactile_canvas_for(vid.width(), vid.height())
+                    # 返回的是共享面板画布本身（同尺寸复用 + 逐格脏重画），
+                    # 拷一份再交给显示层，别让下游改动落到缓存画布上。
+                    frame = render_tactile_grid(
+                        mat, side=glove_side_of(sensor_name),
+                        baseline=self._tactile_baseline(sensor_name),
+                        use_baseline=self._tactile_use_baseline,
+                        w=cw, h=ch,
+                    ).copy()
                 else:
                     continue
 
@@ -1169,6 +1221,11 @@ class PlaybackDialog(QDialog):
     def _toggle_hand_overlay(self, checked: bool):
         """切换手部关键点叠加显示。"""
         self._show_hand_kpts = checked
+        self._seek(self._play_idx)  # 刷新当前帧
+
+    def _toggle_tactile_baseline(self, checked: bool):
+        """切换触觉矩阵的基线校正（与查看器同名勾选同口径）。"""
+        self._tactile_use_baseline = checked
         self._seek(self._play_idx)  # 刷新当前帧
 
     def _process_current_kpts(self):

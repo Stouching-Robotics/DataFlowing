@@ -1,12 +1,61 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "left": {
-    "usb_serial": "2067376F3032"
+    "usb_vid": 1155,
+    "usb_pid": 22336,
+    "hardware_id": "stm32-glove-left",
+    "usb_serials": [
+      "2067376F3032",
+      "2090376E3032",
+      "364933593535"
+    ],
+    "channel_to_hand": [
+      0,
+      13,
+      14,
+      15,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      10,
+      11,
+      12,
+      7,
+      8,
+      9
+    ],
+    "mapping_status": "user_specified_finger_reversal_requires_3d_validation"
   },
   "right": {
-    "usb_serial": "2095376E3032"
-  },
-  "extra_usb_serials": {
-    "2096376E3032": "right_glove"
+    "usb_vid": 1155,
+    "usb_pid": 22336,
+    "hardware_id": "stm32-glove-right",
+    "usb_serials": [
+      "2095376E3032",
+      "2096376E3032",
+      "364133593535"
+    ],
+    "channel_to_hand": [
+      0,
+      13,
+      14,
+      15,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      10,
+      11,
+      12,
+      7,
+      8,
+      9
+    ],
+    "mapping_status": "validated"
   }
 }

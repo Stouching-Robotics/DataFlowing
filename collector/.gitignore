@@ -36,9 +36,22 @@ exports/
 # 本地取回的录制素材与上色产物（双目原视频等，体积大且属外部数据）
 rec001(1)/
 tools/weights/
-# scripts/pack_wheels.py 生成的离线部署包（不入库，拷给客户用）
+# scripts/pack_wheels.py 生成的离线部署包（*.whl 与 Python 安装包不入库，拷给客户用）
 # 注意: 行尾不能写 # 注释 —— gitignore 只认行首的 #，行尾的会被当成模式正文
-wheels/
+#
+# ⚠️ 例外: wheels/toolkit/glove_sdk.zip **要入库**（走内网 GitLab 分发到部署机，
+#    start 脚本 [4/7] 会自动展开到 tools/）。这份 SDK 里 sdk/ glove_io/ gui/ common/
+#    是**明文源**（只有 algorithm/ 走 PyArmor），属于厂商的保护范围 ——
+#    **绝对不要推到 GitHub / HF 这类公开远端**，只推 origin 内网 GitLab。仓库里
+#    core/gripper/sightac_sdk/ 入库的是 PyArmor 加密版，是正面例子。
+#
+# git 不会进入被排除的目录，所以不能写成 wheels/（那样 !wheels/... 无效，
+# 与本文件里 orb_slam_src/dist/ 那段同一个坑）：必须先用 wheels/* 排掉，
+# 再逐级把工具包这一条捞回来。
+wheels/*
+!wheels/toolkit/
+wheels/toolkit/*
+!wheels/toolkit/glove_sdk.zip
 imgui.ini
 .polyscope.ini
 tools/stereo_s80m/offline_slam_output/
@@ -60,6 +73,13 @@ pipeline.db
 
 # 手套工具包（第三方 SDK 本地参考，永远不上传）
 stouch_glove_toolkit-Stouch_Glove_Toolkit-beta/
+
+# 数采手套厂商 SDK v2.1.0（2026-09-21 起是唯一入口，取代上面的旧工具包）。
+# 18MB/156 文件，含厂商**明文源**（sdk/ glove_io/ gui/ common/）+ PyArmor 加密的
+# algorithm/ —— 与 native/ 同策略：**目录不入库、本机必备**，分发走
+# wheels/toolkit/glove_sdk.zip（内网 GitLab 通道，见上面那条例外）。
+# ⚠️ 绝不能进 GitHub / HF：一旦 push 出去，厂商算法源码永久留在公开历史里。
+glove_sdk/
 
 # 夹爪上位机程序及原生资源（同手套工具包策略，整个目录不上传）
 online/

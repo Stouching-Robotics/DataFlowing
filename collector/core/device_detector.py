@@ -477,9 +477,9 @@ def detect_devices(max_index: int = settings.DEVICE_SCAN_MAX_INDEX) -> List[Devi
 
 
 # ── USB (Type-C) 手套 ──────────────────────────────────
+# VID/PID 过滤已移交 SDK（裸 0483:5740，蓝牙 dongle 0483:2013 由 glove_registry
+# 按 link_kind 收窄回有线）—— 别再在这里加过滤常量：改了不会有任何效果。
 
-_GLOVE_USB_VID = 0x0483
-_GLOVE_USB_PID = 0x5740
 _GLOVE_SIDE_NAMES = {"left_glove": "USB 手套·左手",
                      "right_glove": "USB 手套·右手"}
 _glove_side_cache: Optional[dict] = None
@@ -487,49 +487,20 @@ _glove_side_cache_time = 0.0
 
 
 def _glove_side_by_serial() -> dict:
-    """读工具包 glove_devices.json → {usb_serial小写: "left_glove"/"right_glove"}。
+    """读项目根 glove_devices.json → {序列号小写: "left_glove"/"right_glove"}。
 
-    优先项目根下同级的 stouch_glove_toolkit* 目录，其次项目根自身；
+    读取口径（含 v2 复数数组 / v1 单数 / extra_usb_serials 三档回退）全在
+    `core/glove_registry.py`，这里只保留 10s 缓存 —— 避免 2s 轮询反复读盘。
     文件缺失/解析失败返回 {}（左右手仍可经首连分配后持久化）。
-    除 left/right 的 usb_serial 外，还合并可选的 extra_usb_serials
-    映射（{序列号: "left_glove"/"right_glove"}）——支持同一手侧多只
-    手套（换机/固件序列号变更后旧号仍能认出来）。
-    结果缓存 10s，避免 2s 轮询反复读盘。
     """
     global _glove_side_cache, _glove_side_cache_time
     now = time.monotonic()
     if _glove_side_cache is not None and now - _glove_side_cache_time < 10.0:
         return _glove_side_cache
-    result: dict = {}
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    candidates = [os.path.join(root, "glove_devices.json")]
-    try:
-        candidates += sorted(
-            os.path.join(root, name, "glove_devices.json")
-            for name in os.listdir(root)
-            if name.lower().startswith("stouch_glove_toolkit")
-        )
-    except OSError:
-        pass
-    import json
-    for path in candidates:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            continue
-        for side, role in (("left", "left_glove"), ("right", "right_glove")):
-            serial = (data.get(side) or {}).get("usb_serial", "")
-            if serial:
-                result[str(serial).strip().lower()] = role
-        for serial, role in (data.get("extra_usb_serials") or {}).items():
-            if role in ("left_glove", "right_glove") and serial:
-                result.setdefault(str(serial).strip().lower(), role)
-        if result:
-            break
-    _glove_side_cache = result
+    from core.glove_registry import side_by_serial
+    _glove_side_cache = side_by_serial()
     _glove_side_cache_time = now
-    return result
+    return _glove_side_cache
 
 
 def usb_glove_prefer_side(serial: str) -> str:
@@ -538,25 +509,25 @@ def usb_glove_prefer_side(serial: str) -> str:
 
 
 def _list_usb_glove_devices() -> List[DeviceInfo]:
-    """枚举 STM32 USB CDC 手套（0483:5740，串口工具按 VID/PID 过滤）。"""
-    try:
-        import serial.tools.list_ports
-    except ImportError:
-        return []
+    """枚举有线 STM32 USB CDC 手套（走 SDK 的 DeviceManager，注册表在项目根）。
+
+    枚举与左右手绑定都交给 `core/glove_registry`（它兜住 SDK 那条路的裸
+    `ValueError`，见该模块 docstring）；这里只把结果翻译成面板用的
+    `DeviceInfo`。`key` 必须仍是 `usbglove:{序列号}` —— `data/device_names.json`
+    与 `config/settings.py` 的 `key.startswith("usbglove:")` 都按它索引。
+    """
+    from core.glove_registry import device_key, list_devices
     side_map = _glove_side_by_serial()
     infos: List[DeviceInfo] = []
-    for port in serial.tools.list_ports.comports():
-        if port.vid != _GLOVE_USB_VID or port.pid != _GLOVE_USB_PID:
-            continue
-        serial = (port.serial_number or "").strip()
-        key = f"usbglove:{serial}" if serial else f"usbglove:{port.device}"
-        side = side_map.get(serial.lower(), "")
+    for dev in list_devices():
+        serial = (dev.get("serial") or "").strip()
+        side = dev.get("side") or side_map.get(serial.lower(), "")
         infos.append(DeviceInfo(
-            key=key,
+            key=device_key(dev),
             kind="usb_glove",
             display_name=_GLOVE_SIDE_NAMES.get(side, "USB 手套"),
             serial=serial,
-            address=port.device,
+            address=dev.get("device", ""),
         ))
     return infos
 

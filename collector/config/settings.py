@@ -380,32 +380,50 @@ def assign_glove_sensor_role(key: str, prefer: str = "") -> str:
 
     按 MAC 绑定（重连保持）；prefer 为期望列名（广播名 'L' → left_glove、
     'R' → right_glove），空闲则优先占用，否则按 SENSOR_NAMES 顺序取
-    下一个空余名。无空余名时兜底取最后一个。
+    下一个空余名。
 
-    USB (Type-C) 手套例外：prefer 来自工具包注册表（按序列号权威），
-    直接占用该列，并释放其它设备在该列上的陈旧绑定（避免右手套被
-    历史 BLE 绑定挤到 left_glove）。
+    **无空余名时返回空串**，由调用方拒绝连接并报错（`ui/main_window.py`
+    的 `_open_glove`/`_open_usb_glove` 都是「拿到空串就记日志 + 返回 False」）。
+    这里曾经是 `return SENSOR_NAMES[-1]`（兜底取最后一个），是个静默坏：
+    第 3 只手套会被判成 `left_glove` —— 与真正那只左手**同列**，两个
+    `write_sensor` 往同一个 `observation.left_glove` 里互相覆盖；而且这个
+    猜测**不落盘**，所以每次连接都重复同一个错答案、永不自我纠正。
+    2026-09-21 实机踩到（新右手套 `364133593535` 被判成左手）。
+
+    USB (Type-C) 手套例外：prefer 来自注册表 `glove_devices.json`（按序列号
+    权威）—— 它**压过该键的历史绑定**、也压过别人的陈旧声明：直接占用该列，
+    并释放其它设备在该列上的绑定（避免右手套被历史绑定挤到 left_glove）。
+    历史绑定必须让位：全程序**没有任何 UI** 能改一只手套的列名绑定，改注册表
+    是唯一的修法，若历史绑定优先，用户改完注册表会发现"改了也没用"。
+    ⇒ **未注册的 USB 手套只能靠「空闲列」分配，顺序即左右手，所以换手套
+    必须先把序列号写进注册表**。
     """
     role = device_sensor_role(key)
-    if role:
-        return role
     if prefer and key.startswith("usbglove:"):
-        # 硬件权威侧别：抢占对应列，清掉其它键的旧绑定
+        # 硬件权威侧别：**压过历史绑定**。
+        # 必须排在「持久绑定直接返回」之前 —— 用户把序列号挪到另一侧后，
+        # 重连就得跟着挪；否则改了注册表还是老样子，而改注册表是唯一的
+        # 官方修法（没有任何 UI 能改手套的列名绑定），等于把修法堵死。
+        # 每次连接都重跑一遍驱逐（不因"已经绑对了"就跳过）：若历史上另一个
+        # 键也声明着同一列，反复连接会收敛到只剩一个声明者，而不是一起静默
+        # 往同一列写。代价是每次连接一次 ~1KB 写盘。
         current = load_device_names()
         for k, entry in list(current.items()):
             if k != key and isinstance(entry, dict) \
                     and entry.get("sensor") == prefer:
-                entry["sensor"] = ""
+                entry["sensor"] = ""     # 抢占对应列，清掉其它键的旧绑定
         _write_device_names(current)
         save_device_name(key, device_name(key), sensor=prefer)
         return prefer
+    if role:
+        return role
     used = {device_sensor_role(k) for k in load_device_names()}
     candidates = [n for n in ([prefer] + SENSOR_NAMES) if n]
     for name in dict.fromkeys(candidates):   # 去重保持顺序
         if name not in used:
             save_device_name(key, device_name(key), sensor=name)
             return name
-    return SENSOR_NAMES[-1] if SENSOR_NAMES else ""
+    return ""
 
 def remove_device_name(key: str):
     """删除设备命名条目。"""
@@ -496,6 +514,21 @@ UPLOAD_LOG_THROTTLE_S = 10.0                   # 主窗口上传进度日志节�
 TASK_POLL_INTERVAL_MS = 30000                  # 任务轮询间隔（毫秒）
 TASK_API_URL = SERVER_URL                      # 任务 API 地址（复用服务器地址）
 DEVICE_NAME = "EGO_001"                        # 设备认领名（后端任务分配依据）
+
+# ── 数采手套串口后端（迁移期回退开关，验收后随 fork 一起删）──────
+# 2026-09-21 起手套链路换用厂商 SDK v2.1.0（tools/glove_sdk/，见
+# core/glove_sdk_boot.py）。旧的 core/glove_usb/ 是当年 fork 自老工具包的
+# 那份，先原地留着当回退档：
+#   "sdk"  — 默认。走 glove_io.streams.RawImuStream
+#   "fork" — 回退。走 core/glove_usb/streams.py（含 R1/R2/R3 三处传输修复）
+# 两侧构造签名与帧类型都兼容（计划 §2.3），所以按「层」再拆开关没有可组合
+# 性收益，就这一个轴。用环境变量可临时覆盖，便于在客户机上不改文件回退：
+#   GLOVE_USB_BACKEND=fork ./start.sh
+GLOVE_USB_BACKEND = os.environ.get("GLOVE_USB_BACKEND", "sdk")
+# SDK 的解算核心按 3.10 ABI 加密（pyarmor_runtime.so 引用 3.11 起移除的
+# _PyFloat_Pack8），别的版本下 import 即失败 —— 不是"骨架不能用"，是整个
+# SDK 不可用。start.sh / start.bat 与 venv 都按这条走。
+GLOVE_PYTHON_REQUIRED = (3, 10)
 
 # ── 手部关键点追踪配置 ──────────────────────────────────
 HAND_TRACK_ENABLED = False                       # 是否启用录制后手部关键点处理（需 ultralytics）

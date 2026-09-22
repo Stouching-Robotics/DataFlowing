@@ -8,17 +8,17 @@
     "thumb_joint": {
         "name": "大拇指-关节",
         "rows": [
-            15,
-            14,
-            13
+            1,
+            3,
+            2,
+            0
         ],
         "cols": [
             14,
-            12,
             13,
-            15
+            12
         ],
-        "axis_order": "col_row"
+        "axis_order": "row_col"
     },
     "thumb_base": {
         "name": "大拇指-指根",
@@ -35,17 +35,17 @@
     "index_joint": {
         "name": "食指-关节",
         "rows": [
-            12,
-            11,
-            10
+            1,
+            3,
+            2,
+            0
         ],
         "cols": [
-            14,
-            12,
-            13,
-            15
+            11,
+            10,
+            9
         ],
-        "axis_order": "col_row"
+        "axis_order": "row_col"
     },
     "index_base": {
         "name": "食指-指根",
@@ -62,17 +62,17 @@
     "middle_joint": {
         "name": "中指-关节",
         "rows": [
-            9,
-            8,
-            7
+            1,
+            3,
+            2,
+            0
         ],
         "cols": [
-            14,
-            12,
-            13,
-            15
+            8,
+            7,
+            6
         ],
-        "axis_order": "col_row"
+        "axis_order": "row_col"
     },
     "middle_base": {
         "name": "中指-指根",
@@ -89,17 +89,17 @@
     "ring_joint": {
         "name": "无名指-关节",
         "rows": [
-            6,
-            5,
-            4
+            1,
+            3,
+            2,
+            0
         ],
         "cols": [
-            14,
-            12,
-            13,
-            15
+            5,
+            4,
+            3
         ],
-        "axis_order": "col_row"
+        "axis_order": "row_col"
     },
     "ring_base": {
         "name": "无名指-指根",
@@ -116,17 +116,17 @@
     "pinky_joint": {
         "name": "小拇指-关节",
         "rows": [
+            1,
             3,
             2,
-            1
+            0
         ],
         "cols": [
-            14,
-            12,
-            13,
-            15
+            2,
+            1,
+            0
         ],
-        "axis_order": "col_row"
+        "axis_order": "row_col"
     },
     "pinky_base": {
         "name": "小拇指-指根",
@@ -137,7 +137,13 @@
     "palm": {
         "name": "手掌心",
         "rows": [
-            15,
+            5,
+            6,
+            7,
+            9,
+            11
+        ],
+        "cols": [
             14,
             13,
             12,
@@ -151,14 +157,9 @@
             4,
             3,
             2,
-            1
+            1,
+            0
         ],
-        "cols": [
-            10,
-            9,
-            8,
-            6
-        ],
-        "axis_order": "col_row"
+        "axis_order": "row_col"
     }
 }

@@ -461,7 +461,12 @@ def collect(out_dir: str, with_wheels: bool, force: bool,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode != 0:
         print("[失败] 目标目录内 import main_lite 自检未通过：")
-        print(proc.stderr.decode("utf-8", "replace"))
+        # 入口守卫（core/startup_guard.py）是往 **stdout** 打印指引再退出的，
+        # 只看 stderr 会把「缺哪个依赖」整个吞掉，只留一句无信息的失败。
+        # 自检必须用装了依赖的解释器跑（venv/bin/python），否则必然失败。
+        print(proc.stderr.decode("utf-8", "replace")
+              or proc.stdout.decode("utf-8", "replace")
+              or f"（无输出，退出码 {proc.returncode}）")
         sys.exit(1)
     _verify_payload(out_dir, target)
 

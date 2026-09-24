@@ -10,10 +10,30 @@ import subprocess
 import sys
 import time
 
-PROJECT = Path(__file__).resolve().parents[4]
-sys.path.insert(0, str(PROJECT / 'gripper_version1'))
-from runtime.cpu_policy import detect_cpu_policy
-from fays_runtime import build_fays_runtime_env, ORB_LIBRARY, ORB_VOCABULARY
+def _find_repo_root(start):
+    """向上探测 collector 根（含 ``core/gripper/fays_runtime.py`` 的那一层）。
+
+    这里原来写死 ``parents[4] / 'gripper_version1'`` —— 那是本树还活在
+    ``online/`` 布局下的路径。搬进 ``core/gripper/orb_slam_src/`` 之后它
+    **静默失效**：sys.path 指向一个不存在的目录，紧接着的 import 直接
+    ImportError，本套件整套跑不起来。病根是硬编码深度，所以改成向上探测，
+    并留一个环境变量覆盖口（沿用 ``KSQ_GRIPPER_NATIVE_ROOT`` 那套做法）。
+    """
+    override = os.environ.get('KSQ_COLLECTOR_ROOT')
+    if override:
+        return Path(override).resolve()
+    for candidate in (start, *start.parents):
+        if (candidate / 'core' / 'gripper' / 'fays_runtime.py').is_file():
+            return candidate
+    raise SystemExit(
+        '找不到 collector 根（含 core/gripper/fays_runtime.py）；'
+        '可用 KSQ_COLLECTOR_ROOT 显式指定')
+
+
+REPO_ROOT = _find_repo_root(Path(__file__).resolve().parent)
+sys.path.insert(0, str(REPO_ROOT))
+from core.gripper.runtime.cpu_policy import detect_cpu_policy
+from core.gripper.fays_runtime import build_fays_runtime_env, ORB_LIBRARY, ORB_VOCABULARY
 
 CASES = {
     'normal_1': ('normal', 0., 0.),

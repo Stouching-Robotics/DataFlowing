@@ -88,6 +88,11 @@ online/
 # 触觉 Sightac SDK 例外：core/gripper/sightac_sdk/ 已 pyarmor 加密，随包入库
 core/gripper/native/
 
+# （2026-09-23 已删除）SLAM SDK 厂商交付包 tools/SLAM_SDK_upload/ 与入库的
+# core/gripper/orb_slam_src/slam_sdk/ 源码树：SDK 接入已整体回退，见
+# core/gripper/orb_slam_src/tests/baselines/README.md「SLAM SDK 接入已回退」那节。
+# 留档 ~/SLAM_SDK_upload_20260923.tgz（已排除与 native/ORBvoc.txt 相同的词典）。
+
 # ORB-SLAM 核心源码树（core/gripper/orb_slam_src/）：**源码入库，产物不入库**。
 # 它必须排在 dist/ 那条全局规则（第 5 行）后面：那条规则会把整棵 dist 排掉，
 # 而 dist/fays_opencv48/ 里放的是桥接的 CMakeLists 与 7 份出厂标定，是源码。
@@ -116,6 +121,12 @@ core/gripper/orb_slam_src/FaysSense_VI_Kit_Release/config
 # scripts/pack_lite.py 收集时复制进去的产物，同样不入库——原先的 !负向规则
 # 已随之删除，否则每次重打包都会留下未跟踪副本。
 lite_package/*
+
+# 换包时的就地备份（如 2026-09-23 sightac 的 PyArmor runtime 3.12→3.10 那份）。
+# 里面是**厂商加密件**，与 native/、glove_sdk/ 同策略：绝不入库、绝不推公开仓。
+# 仓库跟踪的那些回退点走 git 自己（`git checkout HEAD -- <路径>`），这里放的是
+# 「git 里那份也已经被覆盖掉」时的兜底。
+backups/
 
 # 对外接口文档等 Word 产物：随包发送，不入代码库
 *.docx

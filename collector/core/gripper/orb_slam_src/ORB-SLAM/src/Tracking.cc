@@ -2818,7 +2818,12 @@ void Tracking::CreateInitialMapMonocular()
         pKFini->mNextKF = pKFcur;
         pKFcur->mpImuPreintegrated = mpImuPreintegratedFromLastKF;
 
-        mpImuPreintegratedFromLastKF = new IMU::Preintegrated(pKFcur->mpImuPreintegrated->GetUpdatedBias(),pKFcur->mImuCalib);
+        // mpImuPreintegratedFromLastKF is nullable -- PreintegrateIMU() and
+        // ResetActiveMap() both test it before use -- so the seed above can be
+        // NULL. Re-seeding from its bias would then dereference NULL; leaving
+        // it unset is safe because every other reader already tests it.
+        if(pKFcur->mpImuPreintegrated)
+            mpImuPreintegratedFromLastKF = new IMU::Preintegrated(pKFcur->mpImuPreintegrated->GetUpdatedBias(),pKFcur->mImuCalib);
     }
 
 

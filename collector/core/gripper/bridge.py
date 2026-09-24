@@ -543,7 +543,21 @@ class GripperBridge(QObject):
                 self._teardown()
                 return
             self._opened = True
-            self._log("[Gripper] 相机 + 触觉 + SLAM 链路就绪")
+            # 上面那句 wait_ready 只在**两路都失败**时返回 False；只灭一路
+            # 仍然放行（半边触觉也比没有强）。所以这里的文案得自己把话说准：
+            # 半边坏了就别讲「触觉就绪」，否则这条日志会掩护着一块空白的
+            # 触觉面板——2026-09-23 那次两路全灭还报就绪就是栽在这上面。
+            tactile_snapshot = self._tactile.snapshot()
+            broken = [
+                side for side in ("left", "right")
+                if getattr(tactile_snapshot, side).error
+            ]
+            if broken:
+                self._log(
+                    "[Gripper] 相机 + SLAM 链路就绪；触觉未就绪（{}）"
+                    .format("、".join(broken)))
+            else:
+                self._log("[Gripper] 相机 + 触觉 + SLAM 链路就绪")
             self._post("opened")
         except Exception as exc:
             if self._stop.is_set():

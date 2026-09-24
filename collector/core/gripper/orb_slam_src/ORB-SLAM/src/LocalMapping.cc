@@ -700,8 +700,13 @@ void LocalMapping::PeriodicTimeWindowCleanup()
                         if(keyFrame->isBad())
                         {
                             ++deletedKeyFrames;
-                            runDiscardedMeasurements +=
-                                keyFrame->mpImuPreintegrated->DiscardMeasurements();
+                            // Nullable by design: a keyframe built during an
+                            // IMU gap keeps mpImuPreintegrated==NULL. There is
+                            // then nothing to discard, so contribute 0 rather
+                            // than dereference NULL.
+                            if(keyFrame->mpImuPreintegrated)
+                                runDiscardedMeasurements +=
+                                    keyFrame->mpImuPreintegrated->DiscardMeasurements();
                         }
                         else
                         {

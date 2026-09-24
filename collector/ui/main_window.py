@@ -22,7 +22,7 @@ from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QDockWidget, QTextEdit,
     QTableWidget, QTableWidgetItem, QMessageBox, QLabel,
     QAbstractItemView, QToolBar, QAction, QStackedWidget, QComboBox,
-    QApplication, QDesktopWidget,
+    QApplication, QDesktopWidget, QInputDialog,
 )
 
 from config import settings
@@ -143,6 +143,13 @@ class MainWindow(QMainWindow):
     # 重读夹爪出厂标定完成（标定线程 → 主线程）：(dev_key, label, 错误文案)
     # 错误文案空串 = 成功。用 str 而非 Exception：跨线程只传可显示文本。
     _gripper_recalibration_done = pyqtSignal(str, str, str)
+    # 配对绑定：探板结果 (dev_key, label, 错误文案, 探板结果 dict)
+    _gripper_binding_probe_done = pyqtSignal(str, str, str, object)
+    # 配对绑定：写入结果 (dev_key, label, 错误文案, 写入结果 dict)
+    # dict 必须声明 object:PyQt5 的 str 信号不认 dict 载荷
+    _gripper_binding_write_done = pyqtSignal(str, str, str, object)
+    # 串口诊断结果 (dev_key, label, 错误文案, 诊断报告 dict)
+    _gripper_diagnostics_done = pyqtSignal(str, str, str, object)
 
     def __init__(self):
         super().__init__()
@@ -166,7 +173,9 @@ class MainWindow(QMainWindow):
         # 引用同一 dict，离线测试注入假条目沿用同一形状）
         self._device_manager = DeviceManager()
         self._workers = self._device_manager.entries
-        # 重读标定前这台夹爪是否开着（标定独占设备，完了要开回原来的状态）
+        # 离线操作（重读标定 / 改写绑定序列号 / 串口诊断）前这台夹爪是否
+        # 开着：三件事都要独占设备，先把主程序手里的串口让出来，完了按原样
+        # 开回去。集合里是 device key。
         self._gripper_recalib_reopen = set()
         # ── 面板开关分派表（kind → 具体开启/关闭动作；路由口径在
         #    core.device_manager.dispatch_toggle）──
@@ -358,6 +367,16 @@ class MainWindow(QMainWindow):
             self._on_gripper_recalibration)
         self._gripper_recalibration_done.connect(
             self._on_gripper_recalibration_done)
+        self._device_panel.gripper_binding_requested.connect(
+            self._on_gripper_binding)
+        self._gripper_binding_probe_done.connect(
+            self._on_gripper_binding_probe_done)
+        self._gripper_binding_write_done.connect(
+            self._on_gripper_binding_write_done)
+        self._device_panel.gripper_diagnostics_requested.connect(
+            self._on_gripper_diagnostics)
+        self._gripper_diagnostics_done.connect(
+            self._on_gripper_diagnostics_done)
         self._device_dock = QDockWidget(tr("📷 设备检测"), self)
         self._device_dock.setWidget(self._device_panel)
         self._device_dock.setFeatures(
@@ -1945,12 +1964,117 @@ class MainWindow(QMainWindow):
     def _on_gripper_error(self, dev_key: str, msg: str):
         """桥接启动失败：弹窗 + 回收槽位 + 面板回退勾选。"""
         self._log(tr("[夹爪] 启动失败: {}", msg))
-        QMessageBox.critical(self, tr("夹爪启动失败"), msg)
+        QMessageBox.critical(self, tr("夹爪启动失败"),
+                             msg + self._gripper_serial_stuck_hint(msg))
         self._close_gripper(dev_key)
         self._active_device_keys.discard(dev_key)
         self._device_panel.set_checked(dev_key, False)
         self._device_panel.set_active_keys(self._active_device_keys)
         self._update_status()
+
+    # ── 夹爪离线操作共用骨架 ────────────────────────────
+    # 重读标定 / 改写绑定序列号 / 串口诊断三件事都要**独占这只夹爪的串口**，
+    # 门槛与善后完全一样：设备必须已登记 ESP32 序列号（没有序列号就定位不到
+    # 控制板），录制中一律不给入口，执行前先把已经开着的夹爪关掉、完了按原
+    # 样开回来。差异只在弹窗文案与后台线程体，所以共用下面这套骨架。
+
+    # 板子「节点在、但握手不上」时追加的现场处置梯子。串口层对这件事有两
+    # 种报法，都表明**板子没在服务自己的 USB 串口**：
+    #   `Write timeout` —— 主机写不进去（pyserial 的 SerialTimeoutException）
+    #   `serial handshake timeout after N attempts` —— 写得进去、板子不回话
+    # 打开失败的种类不在此列：被别的进程占（Errno 16）、没权限（Errno 13）、
+    # 节点不在，都是主机侧/部署侧原因，各有各的处置，混进同一段提示反倒
+    # 误导（它们也都被包在 `serial open/handshake failed: ...` 这句里，
+    # 所以判据只能取原因、不能取前缀）。
+    _SERIAL_STUCK_MARKS = ("Write timeout",
+                           "serial handshake timeout after")
+
+    def _gripper_serial_stuck_hint(self, reason: str,
+                                   board_silent=None) -> str:
+        """``reason`` 属于「板子没在服务 USB 串口」时给出的下一步，否则空串。
+
+        ``board_silent`` 只在做过只读诊断的路径上传：True＝只读期间一行都
+        没收到，False＝收到了行（板子在说话、只是不收主机写入）。两种归因
+        不同，梯子相同，所以只换首句。``None``＝没测过，按写不进去表述。
+
+        梯子按代价从低到高：先断板子自身的电（这一条对「固件没跑」与
+        「USB 外设被复位打死」两种解释都成立，也最便宜），再证明主机能不能
+        连上板子（工具包「测试连接」＝ esptool read_mac，走的是和刷写同一条
+        下载通路），最后才重烧。最后一句是 `--erase` 的后果：整片擦除会连
+        NVS 里的 Fays 绑定一起清掉。
+        """
+        text = str(reason or "")
+        if not any(mark in text for mark in self._SERIAL_STUCK_MARKS):
+            return ""
+        if board_silent is False:
+            lead = tr("节点在、但握手不上：板子在输出、却不接收主机写入，"
+                      "通常是板上程序的状态出了问题。")
+        else:
+            lead = tr("节点在、但握手不上：板子没在服务自己的 USB 串口，"
+                      "不是权限问题，也不是被别的程序占着。")
+        return "\n\n" + lead + "\n" + tr(
+            "先把控制板断电 5 秒再上电（有独立供电的连同电源一起断）后重试；"
+            "仍不行就关掉主程序，用 STOUCH_Gripper_Tools 的「测试连接」读一次 "
+            "MAC —— 读得到说明板子通信正常、问题在板上固件，用 flash_esp32.sh "
+            "重烧；读不到先换线换口，别反复重烧。\n"
+            "重烧若用过 --erase，NVS 里的 Fays 绑定会被一并擦掉，"
+            "烧完必须重新写入序列号。")
+
+    def _gripper_offline_guard(self, dev, action_text: str) -> bool:
+        """离线操作前置检查：通过返回 True，否则已弹窗说明原因。
+
+        ``action_text`` 是接在「录制中不可…」里的动作短语（如「重读标定」）。
+        """
+        if not dev.serial:
+            QMessageBox.warning(
+                self, tr("夹爪无序列号"),
+                tr("未读取到夹爪 ESP32 序列号，无法定位控制板。"))
+            return False
+        if self._pipeline.is_recording:
+            QMessageBox.warning(
+                self, tr("录制中"),
+                tr("录制中不可{}，请先停止录制。", action_text))
+            return False
+        return True
+
+    def _gripper_offline_take_over(self, dev, label: str, action_text: str):
+        """把夹爪从主程序手里让出来：关掉已开的链路，记下待开回。
+
+        本来就没开则什么都不记 —— 善后时不会擅自替用户打开设备。
+        """
+        if dev.key not in self._workers:
+            return
+        self._gripper_recalib_reopen.add(dev.key)
+        self._close_gripper(dev.key)
+        self._active_device_keys.discard(dev.key)
+        self._device_panel.set_checked(dev.key, False)
+        self._device_panel.set_active_keys(self._active_device_keys)
+        self._update_status()
+        self._log(tr("[夹爪] {} 已暂时关闭以{}", label, action_text))
+
+    def _gripper_reopen_forget(self, dev_key: str) -> bool:
+        """取出「完了要开回」的标记（取出即消费，回调重入不会开两次）。"""
+        if dev_key not in self._gripper_recalib_reopen:
+            return False
+        self._gripper_recalib_reopen.discard(dev_key)
+        return True
+
+    def _reopen_after_offline(self, dev_key: str, reopen: bool) -> bool:
+        """离线操作善后：原先开着的才开回来，返回是否真的开了。
+
+        只在**没有改动板子就收场**的路径上调用（只读诊断、用户取消、没找到
+        可写入的目标）；探板/写入失败不开回 —— 板子状态未知，交回用户决定，
+        与重读标定的口径一致（弹窗里都会说明夹爪仍在设备列表中）。
+        """
+        if not reopen:
+            return False
+        dev = self._device_panel.device_for_key(dev_key)
+        if dev is None:
+            return False        # 期间设备拔了/列表重建过，不自动开
+        # 自动开回来 = 用户点开关那条路，勾选状态与 _active_device_keys 一致
+        self._device_panel.set_checked(dev_key, True)
+        self._on_device_toggled(dev, True)
+        return True
 
     def _on_gripper_recalibration(self, dev):
         """右键夹爪 → 重新读取这只夹爪的厂商出厂标定。
@@ -1960,15 +2084,7 @@ class MainWindow(QMainWindow):
         独占设备，因此先关掉这台夹爪（若已开），完成后再自动开回来。
         """
         label = self._device_label(dev)
-        if not dev.serial:
-            QMessageBox.warning(
-                self, tr("夹爪无序列号"),
-                tr("未读取到夹爪 ESP32 序列号，无法定位控制板。"))
-            return
-        if self._pipeline.is_recording:
-            QMessageBox.warning(
-                self, tr("录制中"),
-                tr("录制中不可重读标定，请先停止录制。"))
+        if not self._gripper_offline_guard(dev, tr("重读标定")):
             return
         answer = QMessageBox.question(
             self, tr("重新读取出厂标定"),
@@ -1979,23 +2095,11 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.Yes:
             return
 
-        was_open = dev.key in self._workers
-        if was_open:
-            self._gripper_recalib_reopen.add(dev.key)
-            self._close_gripper(dev.key)
-            self._active_device_keys.discard(dev.key)
-            self._device_panel.set_checked(dev.key, False)
-            self._device_panel.set_active_keys(self._active_device_keys)
-            self._update_status()
+        self._gripper_offline_take_over(dev, label, tr("重读标定"))
         self._log(tr("[夹爪] {} 正在重新读取厂商出厂标定…", label))
-
-        thread = threading.Thread(
-            target=self._gripper_recalibration_worker,
-            args=(dev, label),
-            name="gripper-recalibration",
-            daemon=True,
-        )
-        thread.start()
+        self._start_gripper_worker(
+            self._gripper_recalibration_worker, dev, label,
+            "gripper-recalibration")
 
     def _gripper_recalibration_worker(self, dev, label: str):
         """标定线程：读设备 → 写 YAML。结果经信号回主线程弹窗。"""
@@ -2011,24 +2115,312 @@ class MainWindow(QMainWindow):
     def _on_gripper_recalibration_done(self, dev_key: str, label: str,
                                        reason: str):
         """标定结果回主线程：失败弹窗，成功把原先开着的夹爪开回来。"""
-        reopen = dev_key in self._gripper_recalib_reopen
-        self._gripper_recalib_reopen.discard(dev_key)
+        reopen = self._gripper_reopen_forget(dev_key)
         if reason:
             self._log(tr("[夹爪] {} 重读标定失败: {}", label, reason))
             QMessageBox.critical(
                 self, tr("重读标定失败"),
                 tr("「{}」的出厂标定未能重新读取。\n\n{}\n\n"
-                   "夹爪仍在设备列表中，可重新勾选开启。", label, reason))
+                   "夹爪仍在设备列表中，可重新勾选开启。", label, reason)
+                + self._gripper_serial_stuck_hint(reason))
             return
         self._log(tr("[夹爪] {} 出厂标定已更新", label))
-        if not reopen:
-            return                    # 本来就没开，不擅自打开
+        self._reopen_after_offline(dev_key, reopen)
+
+    # ── 夹爪配对：读写 ESP32 NVS 里绑定的 Fays 序列号 ─────────
+    # 配对链是「按 USB 序列号唯一确定控制板 → 读板子 NVS 里记的 Fays 产品
+    # 序列号 → 和 SDK 枚举到的 Fays 设备对上」。换新夹爪时新板子的 NVS 还是
+    # 空的（固件回 ERR FAYS_SERIAL_NOT_SET），主程序因此认不出来 —— 这一步
+    # 就是让用户在主程序里把新板子指到眼前这台 Fays 上，不必去开厂商工具包。
+    # 分两段：先探板（读现状 + 列出在线 Fays），再由用户挑目标写入。
+
+    def _on_gripper_binding(self, dev):
+        """右键夹爪 → 读取/改写 ESP32 绑定的 Fays 序列号（第一步：探板）。"""
+        label = self._device_label(dev)
+        if not self._gripper_offline_guard(dev, tr("改写绑定序列号")):
+            return
+        self._gripper_offline_take_over(dev, label, tr("改写绑定序列号"))
+        self._log(tr("[夹爪] {} 正在读取 ESP32 绑定信息…", label))
+        self._start_gripper_worker(
+            self._gripper_binding_probe_worker, dev, label,
+            "gripper-binding-probe")
+
+    def _gripper_binding_probe_worker(self, dev, label: str):
+        """探板线程：读绑定现状 + 列出在线 Fays 序列号 → 回主线程挑目标。"""
+        reason = ""
+        info = {}
+        try:
+            from core.gripper.fays_single import SingleFaysLease
+            lease = SingleFaysLease(logger=self._log)
+            info = dict(lease.esp_binding_status(dev.serial) or {})
+            if info.get("reason"):
+                # 板子没读通就别再枚举 Fays 了：先解决连不上的问题
+                reason = str(info["reason"])
+            else:
+                try:
+                    by_serial, skipped = lease.online_fays_serials()
+                    info["online"] = sorted(str(s) for s in by_serial)
+                    info["skipped"] = [str(s) for s in skipped]
+                except Exception as exc:
+                    # 枚举失败不算探板失败：板子现状已经读到了，照样报给用户
+                    info["online"] = []
+                    info["online_error"] = str(exc)
+        except Exception as exc:       # 定位不到 ESP32 等前置失败
+            reason = str(exc)
+        self._gripper_binding_probe_done.emit(dev.key, label, reason, info)
+
+    def _on_gripper_binding_probe_done(self, dev_key: str, label: str,
+                                       reason: str, info):
+        """探板结果回主线程：如实汇报现状 → 挑目标 → 起写入线程。"""
+        reopen = self._gripper_reopen_forget(dev_key)
+        if reason:
+            self._log(tr("[夹爪] {} 读取绑定信息失败: {}", label, reason))
+            QMessageBox.critical(
+                self, tr("读取绑定信息失败"),
+                tr("「{}」的 ESP32 绑定信息未能读出。\n\n{}\n\n"
+                   "夹爪仍在设备列表中，可重新勾选开启。\n"
+                   "想先看板上到底在输出什么，用右键菜单的「ESP32 串口诊断」。",
+                   label, reason)
+                + self._gripper_serial_stuck_hint(reason))
+            return                    # 板子状态未知，不开回（与重读标定同口径）
         dev = self._device_panel.device_for_key(dev_key)
         if dev is None:
-            return                    # 标定期间设备拔了/列表重建过，不自动开
-        # 自动开回来 = 用户点开关那条路，勾选状态与 _active_device_keys 一致
-        self._device_panel.set_checked(dev_key, True)
-        self._on_device_toggled(dev, True)
+            self._log(tr("[夹爪] {} 已从设备列表消失，中止绑定", label))
+            return
+        bound = str(info.get("bound") or "")
+        board = str(info.get("esp_serial") or "")
+        online = [str(s) for s in (info.get("online") or [])]
+        online_error = str(info.get("online_error") or "")
+        self._log(tr("[夹爪] {} ESP32 {} 当前绑定: {}；在线 Fays: {}",
+                     label, board, bound or tr("<未绑定>"),
+                     ", ".join(online) if online else tr("无")))
+        for skipped in (info.get("skipped") or []):
+            self._log(tr("[夹爪] {} 跳过被占用的 Fays: {}", label, skipped))
+        if online_error or not online:
+            QMessageBox.warning(
+                self, tr("未找到在线 Fays"),
+                tr("ESP32 {} 读通了（当前绑定：{}），但本机没有可用于配对的"
+                   "在线 Fays S80M。\n\n{}\n\n"
+                   "请把 Fays 的 stereo 与 IMU 两根线都插好再重试；被其他程序"
+                   "占用的那一台也不能当目标。",
+                   board, bound or tr("<未绑定>"),
+                   online_error or tr("未枚举到任何 Fays 产品序列号。")))
+            self._reopen_after_offline(dev_key, reopen)
+            return
+        chosen = self._ask_target_fays_serial(info, label)
+        if not chosen:
+            self._log(tr("[夹爪] {} 已取消绑定序列号改写", label))
+            self._reopen_after_offline(dev_key, reopen)
+            return
+        self._log(tr("[夹爪] {} 正在把 {} 写入 ESP32 {}…",
+                     label, chosen, board))
+        self._start_gripper_worker(
+            self._gripper_binding_write_worker, dev, label,
+            "gripper-binding-write", extra=(chosen,))
+
+    def _ask_target_fays_serial(self, info, label: str):
+        """让用户在**当前在线的** Fays 序列号里挑一个写进板子。放弃返回 None。
+
+        只给选不给手输：写错序列号会让这只夹爪静默指向别的 Fays —— 配对是
+        唯一匹配，写错了症状就是「连不上」，比现在更难排查。
+        """
+        online = sorted(str(s) for s in (info.get("online") or []))
+        if not online:
+            return None
+        current = str(info.get("bound") or "")
+        index = online.index(current) if current in online else 0
+        chosen, ok = QInputDialog.getItem(
+            self, tr("绑定 Fays 序列号"),
+            tr("把哪一台 Fays 的序列号写进「{}」的 ESP32 {}？\n\n"
+               "当前绑定：{}", label, info.get("esp_serial") or "",
+               current or tr("<未绑定>")),
+            online, index, False)
+        if not ok or not chosen:
+            return None
+        answer = QMessageBox.question(
+            self, tr("绑定 Fays 序列号"),
+            tr("将把序列号「{}」写入 ESP32 {} 的 NVS 并持久化（覆盖原值 "
+               "{}）。\n\n写完这只夹爪就固定配对这一台 Fays。\n\n继续？",
+               chosen, info.get("esp_serial") or "",
+               current or tr("<未绑定>")),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return None
+        return chosen
+
+    def _gripper_binding_write_worker(self, dev, label: str,
+                                      fays_serial: str):
+        """写入线程：``WF:`` 写 NVS → 立刻 ``QF`` 回读 → 回主线程报结果。"""
+        reason = ""
+        result = {}
+        try:
+            from core.gripper.fays_single import SingleFaysLease
+            lease = SingleFaysLease(logger=self._log)
+            readback = lease.write_bound_serial(dev.serial, fays_serial)
+            result = {"written": fays_serial, "readback": readback or ""}
+        except Exception as exc:       # 校验失败/写失败/读不回都走这里
+            reason = str(exc)
+        self._gripper_binding_write_done.emit(dev.key, label, reason, result)
+
+    def _on_gripper_binding_write_done(self, dev_key: str, label: str,
+                                       reason: str, result):
+        """写入结果回主线程：回读值对不上就明说不算成功（不猜）。"""
+        reopen = self._gripper_reopen_forget(dev_key)
+        if reason:
+            self._log(tr("[夹爪] {} 写入绑定序列号失败: {}", label, reason))
+            QMessageBox.critical(
+                self, tr("写入绑定序列号失败"),
+                tr("「{}」的 ESP32 未能写入绑定序列号。\n\n{}\n\n"
+                   "夹爪仍在设备列表中，可重新勾选开启；"
+                   "想确认板上读到了什么，用右键菜单的「ESP32 串口诊断」。",
+                   label, reason)
+                + self._gripper_serial_stuck_hint(reason))
+            return
+        written = str((result or {}).get("written") or "")
+        readback = str((result or {}).get("readback") or "")
+        self._log(tr("[夹爪] {} 绑定序列号已写入 {}，回读 {}",
+                     label, written, readback or tr("<空>")))
+        if readback != written:
+            QMessageBox.warning(
+                self, tr("回读不一致"),
+                tr("已向「{}」的 ESP32 写入 {}，但立刻回读得到的是 {}。\n\n"
+                   "板上可能没保存成功，请重试；"
+                   "想确认板上到底记了什么，用右键菜单的「ESP32 串口诊断」。",
+                   label, written, readback or tr("<空>")))
+        else:
+            QMessageBox.information(
+                self, tr("绑定完成"),
+                tr("「{}」已绑定 Fays 序列号 {}。\n\n"
+                   "现在可关掉再勾选开启这只夹爪，主程序会按新绑定配对。",
+                   label, readback))
+        self._reopen_after_offline(dev_key, reopen)
+
+    # ── 夹爪 ESP32 串口诊断（只读）─────────────────────────
+    # 夹爪连不上时最需要回答的问题是「板子到底在不在说话」。串口节点是 USB
+    # 外设枚举出来的（303a:1001 是芯片自带的 USB-Serial-JTAG，与固件是否在跑
+    # 无关），所以「节点在」不能当「板子在服务串口」。诊断因此先握手，握不上
+    # 再**只读**开着口收一段：写阻塞时读这条路仍然通，收到行＝板子在说话只是
+    # 不收主机写入，一行都没有＝板上没有程序在写这个口。
+
+    def _on_gripper_diagnostics(self, dev):
+        """右键夹爪 → 只读串口诊断：把这台 ESP32 的原样输出打出来。"""
+        label = self._device_label(dev)
+        if not self._gripper_offline_guard(dev, tr("做串口诊断")):
+            return
+        self._gripper_offline_take_over(dev, label, tr("做串口诊断"))
+        self._log(tr("[夹爪] {} 正在做 ESP32 串口诊断"
+                     "（只读，握手失败会再只读复检，最长约 6 秒）…",
+                     label))
+        self._start_gripper_worker(
+            self._gripper_diagnostics_worker, dev, label, "gripper-diagnostics")
+
+    def _gripper_diagnostics_worker(self, dev, label: str):
+        """诊断线程：开串口收板上原样输出 → 回主线程打日志 + 弹摘要。"""
+        reason = ""
+        report = {}
+        try:
+            from core.gripper.fays_single import SingleFaysLease
+            lease = SingleFaysLease(logger=self._log)
+            report = dict(lease.esp_console_report(dev.serial) or {})
+        except Exception as exc:
+            reason = str(exc)
+        self._gripper_diagnostics_done.emit(dev.key, label, reason, report)
+
+    def _on_gripper_diagnostics_done(self, dev_key: str, label: str,
+                                     reason: str, report):
+        """诊断结果回主线程：原文进日志，摘要弹窗。诊断只读，一律开回。"""
+        reopen = self._gripper_reopen_forget(dev_key)
+        if reason:
+            self._log(tr("[夹爪] {} 串口诊断未能进行: {}", label, reason))
+            QMessageBox.critical(
+                self, tr("ESP32 串口诊断"),
+                tr("「{}」的串口诊断没能进行。\n\n{}\n\n"
+                   "夹爪仍在设备列表中，可重新勾选开启。", label, reason))
+            self._reopen_after_offline(dev_key, reopen)
+            return
+        report = report or {}
+        board = str(report.get("esp_serial") or dev_key)
+        device = str(report.get("device") or "")
+        path = str(report.get("physical_usb_path") or "")
+        lines = [str(line) for line in (report.get("lines") or [])]
+        self._log(tr("[夹爪] {} 诊断: ESP32 {} 串口节点 {} 物理口 {}",
+                     label, board, device or tr("<无>"),
+                     path or tr("<未知>")))
+        if not report.get("connected"):
+            err = str(report.get("last_error") or "")
+            read_lines = [str(line)
+                          for line in (report.get("read_only_lines") or [])]
+            read_error = str(report.get("read_only_error") or "")
+            self._log(tr("[夹爪] {} 未握手: {}", label, err or tr("<无错误文本>")))
+            # 只读复检的结果单独记一行：这是「板子哑了」与「板子会说话但
+            # 不收写入」的分界，也是下次回查时最先要看的东西。
+            if read_error:
+                self._log(tr("[夹爪] {} 只读复检也打不开: {}",
+                             label, read_error))
+            else:
+                self._log(tr("[夹爪] {} 只读复检 {} 秒收到 {} 行",
+                             label, report.get("seconds"), len(read_lines)))
+            for line in read_lines:
+                self._log(f"[夹爪串口] {line}")
+            shown = read_lines[:20]
+            body = "\n".join(f"  {line}" for line in shown)
+            if not shown:
+                body = tr("  （一行都没有：板上没有程序在写这个口）")
+            elif len(read_lines) > len(shown):
+                body += "\n" + tr("  …（共 {} 行，完整输出见日志）",
+                                  len(read_lines))
+            QMessageBox.critical(
+                self, tr("ESP32 串口诊断"),
+                tr("「{}」的 ESP32 没能在串口上握手。\n\n"
+                   "串口层原文：\n{}\n\n"
+                   "串口节点：{}\n\n"
+                   "不写任何字节、只读 {} 秒，收到 {} 行：\n{}",
+                   label, err or tr("<无>"), device or tr("<无>"),
+                   report.get("seconds"), len(read_lines), body)
+                + self._gripper_serial_stuck_hint(
+                    err,
+                    # 只读复检自己都没打开（被抢口/权限）＝没测到静默，
+                    # 不按「板子哑了」表述
+                    board_silent=(None if read_error else not read_lines)))
+            self._reopen_after_offline(dev_key, reopen)
+            return
+        state = str(report.get("state") or "")
+        bound = str(report.get("bound") or "")
+        self._log(tr("[夹爪] {} 握手响应: {}；绑定: {}",
+                     label, state or tr("<无>"), bound or tr("<未绑定>")))
+        for line in lines:
+            self._log(f"[夹爪串口] {line}")
+        shown = lines[:20]
+        body = [
+            tr("ESP32 序列号: {}", board),
+            tr("串口节点: {}", device or tr("<无>")),
+            tr("物理口: {}", path or tr("<未知>")),
+            tr("握手响应: {}", state or tr("<无>")),
+            tr("绑定序列号: {}", bound or tr("<未绑定>")),
+            "",
+            tr("{} 秒内板上主动输出 {} 行：",
+               report.get("seconds"), len(lines)),
+        ]
+        body += [f"  {line}" for line in shown] or [tr("  （一行都没有）")]
+        if len(lines) > len(shown):
+            body.append(tr("  …（共 {} 行，完整输出见日志）", len(lines)))
+        QMessageBox.information(
+            self, tr("ESP32 串口诊断"), "\n".join(body))
+        self._reopen_after_offline(dev_key, reopen)
+
+    def _start_gripper_worker(self, worker, dev, label: str, name: str,
+                              extra: tuple = ()):
+        """起一个夹爪后台线程（``dev``/``label`` 固定为前两个参数）。
+
+        四件离线操作的线程体签名一致（dev, label[, 额外参数]），线程名写进
+        ps/top 便于现场排查哪只夹爪在占用串口。
+        """
+        threading.Thread(
+            target=worker,
+            args=(dev, label) + tuple(extra),
+            name=name,
+            daemon=True,
+        ).start()
 
     def _on_device_toggled(self, dev, on: bool):
         """面板开关 → 打开/关闭设备（多路并发：只动自己，不互拆）。

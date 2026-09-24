@@ -201,9 +201,10 @@ _TRANSLATIONS = {
     "双击设备可重命名":            {"en": "Double-click a device to rename", "zh": "双击设备可重命名"},
     # 夹爪 UI 其余文案走中文回落（与既有夹爪弹窗一致）；这一句是**追加**在
     # 上面那条已翻译提示后面的，不译就会在英文界面里中英混排，故单独收录。
-    "；右键夹爪可重读取出厂标定":   {
-        "en": "; right-click a gripper to re-read its factory calibration",
-        "zh": "；右键夹爪可重读取出厂标定"},
+    "；右键夹爪可重读标定 / 配对序列号 / 串口诊断": {
+        "en": "; right-click a gripper to re-read its calibration, "
+              "pair its Fays serial, or diagnose the ESP32 port",
+        "zh": "；右键夹爪可重读标定 / 配对序列号 / 串口诊断"},
     "重命名设备":                 {"en": "Rename Device",                  "zh": "重命名设备"},
     "设备名称:":                  {"en": "Device name:",                   "zh": "设备名称:"},
     "录制中不可更改设备":          {"en": "Devices cannot be changed while recording", "zh": "录制中不可更改设备"},

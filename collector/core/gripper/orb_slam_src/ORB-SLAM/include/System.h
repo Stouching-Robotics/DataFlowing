@@ -192,6 +192,51 @@ public:
 
     float GetImageScale();
 
+    // ------------------------------------------------------------------
+    // slam_sdk 只读地图适配接口（新增）
+    //
+    // 2026-09-23：SDK 接入已整体回退（见 tests/baselines/README.md 同名那节），
+    // 调用方已删除；这些接口**保留**，因为现役核心库 libORB_SLAM3.so（f3446320）
+    // 就是编自这份源码 —— 删它们要重编核心库，而回退只需换桥接。
+    //
+    // 背景：slam_sdk 需要对外提供「地图快照」和「地图保存/加载」能力，但不能
+    // 把 Map / KeyFrame / MapPoint 的内部指针或引用暴露给调用方。
+    //
+    // 约束：以下接口只做值语义搬运，输出全部由调用方拥有；不改变跟踪算法、
+    // 线程模型或地图所有权。读取活动地图时依赖 Atlas 内部互斥量
+    // （Atlas::GetAllKeyFrames / GetAllMapPoints 自带锁），因此可在跟踪线程
+    // 之外调用；单个 KeyFrame 的位姿读取沿用其自身互斥量。
+    //
+    // 验证：slam_sdk 的 tests/map_test.cpp 覆盖「空地图 / 跟踪后快照 /
+    // 保存-加载往返」；算法侧无行为变化，不需要新的数据集基线。
+    // ------------------------------------------------------------------
+    struct ReadOnlyKeyFrame {
+        unsigned long int id = 0;         // 上游 KeyFrame::mnId
+        double timestamp_seconds = 0.0;   // 关键帧时间戳（秒）
+        Sophus::SE3f T_wc;                // T_world_camera，平移单位为米
+    };
+
+    struct ReadOnlyMapPoint {
+        unsigned long int id = 0;         // 上游 MapPoint::mnId
+        Eigen::Vector3f position_w;       // 世界坐标系位置（米）
+    };
+
+    // 活动地图的只读快照（深拷贝，返回后与内部对象解耦）。
+    std::vector<ReadOnlyKeyFrame> GetReadOnlyKeyFrames();
+    std::vector<ReadOnlyMapPoint> GetReadOnlyMapPoints();
+    // 活动地图的规模（内部加锁，代价与地图大小无关）。
+    unsigned long int GetReadOnlyKeyFrameCount();
+    unsigned long int GetReadOnlyMapPointCount();
+
+    // 显式路径的 Atlas 持久化（二进制格式）。与 Settings 中的
+    // System.SaveAtlasToFile / System.LoadAtlasFromFile 共用同一实现：
+    //   - Save 把当前 Atlas（含活动地图与备份地图）写入 filename；
+    //   - Load 读取 filename 并替换当前 Atlas，必须在任何跟踪调用之前执行，
+    //     否则会替换掉跟踪线程正在使用的 Atlas。
+    // 返回 false 表示文件不可写/不可读或词典校验和不匹配。
+    bool SaveAtlasToFile(const string &filename, int type = BINARY_FILE);
+    bool LoadAtlasFromFile(const string &filename, int type = BINARY_FILE);
+
 #ifdef REGISTER_TIMES
     void InsertRectTime(double& time);
     void InsertResizeTime(double& time);

@@ -1,0 +1,43 @@
+
+Dynamic section at offset 0x2e5f8 contains 40 entries:
+  标记        类型                         名称/值
+ 0x0000000000000001 (NEEDED)             共享库：[libfays_vikit.so]
+ 0x0000000000000001 (NEEDED)             共享库：[libopencv_calib3d.so.408]
+ 0x0000000000000001 (NEEDED)             共享库：[libORB_SLAM3.so]
+ 0x0000000000000001 (NEEDED)             共享库：[libopencv_imgcodecs.so.408]
+ 0x0000000000000001 (NEEDED)             共享库：[libopencv_imgproc.so.408]
+ 0x0000000000000001 (NEEDED)             共享库：[libopencv_core.so.408]
+ 0x0000000000000001 (NEEDED)             共享库：[libpango_display.so.0]
+ 0x0000000000000001 (NEEDED)             共享库：[libpango_opengl.so.0]
+ 0x0000000000000001 (NEEDED)             共享库：[libepoxy.so.0]
+ 0x0000000000000001 (NEEDED)             共享库：[libstdc++.so.6]
+ 0x0000000000000001 (NEEDED)             共享库：[libm.so.6]
+ 0x0000000000000001 (NEEDED)             共享库：[libgcc_s.so.1]
+ 0x0000000000000001 (NEEDED)             共享库：[libc.so.6]
+ 0x000000000000000f (RPATH)              Library rpath: [/usr/local/lib:$ORIGIN/../../../FaysSense_VI_Kit_Release/lib/fays_atrak/x86_64/Release:$ORIGIN/../../../FaysSense_VI_Kit_Release/thirdparty/ft602-linux-x86_64:/home/stouch/collector/core/gripper/native/dist/orb_mark_only/lib:$ORIGIN/../../../ORB-SLAM/Thirdparty/DBoW2/lib:$ORIGIN/../../../ORB-SLAM/Thirdparty/g2o/lib]
+ 0x000000000000000c (INIT)               0x8000
+ 0x000000000000000d (FINI)               0x27d74
+ 0x0000000000000019 (INIT_ARRAY)         0x2efc8
+ 0x000000000000001b (INIT_ARRAYSZ)       16 (bytes)
+ 0x000000000000001a (FINI_ARRAY)         0x2efd8
+ 0x000000000000001c (FINI_ARRAYSZ)       8 (bytes)
+ 0x000000006ffffef5 (GNU_HASH)           0x3e8
+ 0x0000000000000005 (STRTAB)             0x2390
+ 0x0000000000000006 (SYMTAB)             0x668
+ 0x000000000000000a (STRSZ)              11308 (bytes)
+ 0x000000000000000b (SYMENT)             24 (bytes)
+ 0x0000000000000015 (DEBUG)              0x0
+ 0x0000000000000003 (PLTGOT)             0x2f8b8
+ 0x0000000000000002 (PLTRELSZ)           5256 (bytes)
+ 0x0000000000000014 (PLTREL)             RELA
+ 0x0000000000000017 (JMPREL)             0x5cf0
+ 0x0000000000000007 (RELA)               0x5420
+ 0x0000000000000008 (RELASZ)             2256 (bytes)
+ 0x0000000000000009 (RELAENT)            24 (bytes)
+ 0x0000000000000018 (BIND_NOW)           
+ 0x000000006ffffffb (FLAGS_1)            标志： NOW PIE
+ 0x000000006ffffffe (VERNEED)            0x5230
+ 0x000000006fffffff (VERNEEDNUM)         4
+ 0x000000006ffffff0 (VERSYM)             0x4fbc
+ 0x000000006ffffff9 (RELACOUNT)          36
+ 0x0000000000000000 (NULL)               0x0

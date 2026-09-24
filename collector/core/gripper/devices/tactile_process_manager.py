@@ -2330,7 +2330,23 @@ class TactileProcessManager:
             self._notify()
 
     def wait_ready(self, timeout: Optional[float] = None):
-        """等待左右两路各自 ready 或独立失败。"""
+        """等待左右两路各自 ready 或独立失败。
+
+        返回 False 覆盖两种「没就绪」：等超时了，或**两路都失败**了。
+
+        为什么必须判后者：`_initialize_all_input()` 的失败路径上也调
+        `ready_event.set()`——那是为了让调用方不必干等满超时。于是
+        「事件全置位」**不等于**「触觉可用」。这个区别在 2026-09-23 咬过
+        一次：sightac 的 PyArmor runtime 是按 3.12 编的、而 venv 是 3.10，
+        输入子进程一 spawn 就 `undefined symbol: _PyCode_Validate`，两路
+        全灭，wait_ready 却照样返回 True ⇒ 主程序打「相机 + 触觉 + SLAM
+        链路就绪」、触觉面板空白，日志里那两条 `[Tactile:*] ERROR:` 没人
+        看得到，整整两天。真机取证见 logs/main.log 2026-09-21 16:22（最后
+        一次正常）与 09-23 11:50（两路全灭却报就绪）。
+
+        只失败一路时仍算就绪：半边触觉也比没有强，调用方按 snapshot()
+        里的 error 自行决定怎么说。
+        """
         timeout = (
             self.PROCESS_READY_TIMEOUT
             if timeout is None
@@ -2346,7 +2362,11 @@ class TactileProcessManager:
             remaining = max(0.0, deadline - self.clock())
             if not event.wait(timeout=remaining):
                 return False
-        return True
+        with self.state.lock:
+            return not all(
+                self.state.sides[side].error is not None
+                for side in ("left", "right")
+            )
 
     def calibrate(
         self, timeout: float = TACTILE_CALIBRATION_TIMEOUT,

@@ -699,18 +699,27 @@ class UvcCameraServiceManager:
         bus, port = self._discovery_scope(assignment, live_esp)
         groups = self._run_discovery(usb_bus=bus, port_prefix=port)
         matches = []
-        for group in groups:
+        rejections = []
+        for index, group in enumerate(groups):
             try:
                 matches.append(self._associate_group(
                     group, assignment, live_esp))
-            except UvcCameraServiceError:
+            except UvcCameraServiceError as exc:
+                # 逐组记下拒绝原因：这里吞掉的往往才是真因（触觉相机
+                # mode 探测失败、Flash 身份缺失…），只报 matches/groups
+                # 计数会让人去猜拓扑，等于把现场丢掉一次。
+                label = group.get("physical_usb_path") or "group#{}".format(index)
+                rejections.append("{}: {}".format(label, exc))
                 continue
         if len(matches) != 1:
             esp_serial, fays_serial = self._assignment_identity(assignment)
+            detail = ""
+            if rejections:
+                detail = "；逐组拒绝原因: [{}]".format("; ".join(rejections))
             raise UvcCameraServiceError(
                 "当前设备清单身份与动态 UVC 拓扑无法唯一配对: "
                 f"esp32={esp_serial} fays={fays_serial} "
-                f"matches={len(matches)} groups={len(groups)}"
+                f"matches={len(matches)} groups={len(groups)}{detail}"
             )
         return matches[0]
 

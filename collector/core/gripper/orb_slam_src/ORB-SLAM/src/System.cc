@@ -50,6 +50,11 @@ std::mutex gRuntimeMapDiagnosticsMutex;
 RuntimeMapDiagnostics gRuntimeMapDiagnostics;
 std::chrono::steady_clock::time_point gLastRuntimeMapDiagnostics;
 std::atomic<unsigned long long> gRuntimeLocalKf{0};
+
+// System::MapChanged() 的读数镜像，见 RuntimeMapDiagnostics.h 的说明。
+// 刻意放在 UpdateRuntimeMapDiagnostics 的 1 秒节流**之前**刷新：地图大改动
+// 会让世界坐标系跳变，晚发现 1 秒就赶不上当次位姿重锚了。
+std::atomic<int> gRuntimeMapChangeIndex{0};
 std::atomic<unsigned long long> gRuntimeLocalMp{0};
 
 enum KsqOrbStageIndex
@@ -172,6 +177,10 @@ void ReportKsqOrbStages(KsqOrbStageValues sample,
 void UpdateRuntimeMapDiagnostics(
         Tracking* tracker, Atlas* atlas, LocalMapping* localMapper)
 {
+    // 必须在节流之前：这一项是逐帧语义，其余字段是趋势观测。
+    gRuntimeMapChangeIndex.store(
+        atlas->GetLastBigChangeIdx(), std::memory_order_relaxed);
+
     const auto now = std::chrono::steady_clock::now();
     if(gLastRuntimeMapDiagnostics.time_since_epoch().count() != 0 &&
        now - gLastRuntimeMapDiagnostics < std::chrono::seconds(1))
@@ -209,6 +218,11 @@ RuntimeMapDiagnostics GetRuntimeMapDiagnostics()
 {
     std::lock_guard<std::mutex> lock(gRuntimeMapDiagnosticsMutex);
     return gRuntimeMapDiagnostics;
+}
+
+int GetRuntimeMapChangeIndex()
+{
+    return gRuntimeMapChangeIndex.load(std::memory_order_relaxed);
 }
 
 System::System(const string &strVocFile, const string &strSettingsFile, const eSensor sensor,
@@ -1621,86 +1635,109 @@ void System::InsertTrackTime(double& time)
 #endif
 
 void System::SaveAtlas(int type){
-    if(!mStrSaveAtlasToFile.empty())
+    // 兼容原有行为：Settings 里给了 SaveAtlasToFile 才写，写的是
+    // "./<名字>.osa"；显式路径版本见 SaveAtlasToFile()。
+    if(mStrSaveAtlasToFile.empty())
+        return;
+
+    SaveAtlasToFile("./" + mStrSaveAtlasToFile + ".osa", type);
+}
+
+bool System::SaveAtlasToFile(const string &filename, int type)
+{
+    if(filename.empty())
+        return false;
+
+    // Save the current session
+    mpAtlas->PreSave();
+
+    string strVocabularyChecksum = CalculateCheckSum(mStrVocabularyFilePath,TEXT_FILE);
+    std::size_t found = mStrVocabularyFilePath.find_last_of("/\\");
+    string strVocabularyName = mStrVocabularyFilePath.substr(found+1);
+
+    std::remove(filename.c_str());
+    std::ofstream ofs(filename, std::ios::binary);
+    if(!ofs.good())
     {
-        //clock_t start = clock();
-
-        // Save the current session
-        mpAtlas->PreSave();
-
-        string pathSaveFileName = "./";
-        pathSaveFileName = pathSaveFileName.append(mStrSaveAtlasToFile);
-        pathSaveFileName = pathSaveFileName.append(".osa");
-
-        string strVocabularyChecksum = CalculateCheckSum(mStrVocabularyFilePath,TEXT_FILE);
-        std::size_t found = mStrVocabularyFilePath.find_last_of("/\\");
-        string strVocabularyName = mStrVocabularyFilePath.substr(found+1);
-
-        if(type == TEXT_FILE) // File text
-        {
-            cout << "Starting to write the save text file " << endl;
-            std::remove(pathSaveFileName.c_str());
-            std::ofstream ofs(pathSaveFileName, std::ios::binary);
-            boost::archive::text_oarchive oa(ofs);
-
-            oa << strVocabularyName;
-            oa << strVocabularyChecksum;
-            oa << mpAtlas;
-            cout << "End to write the save text file" << endl;
-        }
-        else if(type == BINARY_FILE) // File binary
-        {
-            cout << "Starting to write the save binary file" << endl;
-            std::remove(pathSaveFileName.c_str());
-            std::ofstream ofs(pathSaveFileName, std::ios::binary);
-            boost::archive::binary_oarchive oa(ofs);
-            oa << strVocabularyName;
-            oa << strVocabularyChecksum;
-            oa << mpAtlas;
-            cout << "End to write save binary file" << endl;
-        }
+        cerr << "无法写入地图文件：" << filename << endl;
+        return false;
     }
+
+    if(type == TEXT_FILE) // File text
+    {
+        cout << "开始写出文本格式地图文件" << endl;
+        boost::archive::text_oarchive oa(ofs);
+
+        oa << strVocabularyName;
+        oa << strVocabularyChecksum;
+        oa << mpAtlas;
+        cout << "文本格式地图文件写出完成" << endl;
+    }
+    else if(type == BINARY_FILE) // File binary
+    {
+        cout << "开始写出二进制地图文件" << endl;
+        boost::archive::binary_oarchive oa(ofs);
+        oa << strVocabularyName;
+        oa << strVocabularyChecksum;
+        oa << mpAtlas;
+        cout << "二进制地图文件写出完成" << endl;
+    }
+    else
+    {
+        return false;
+    }
+
+    return ofs.good();
 }
 
 bool System::LoadAtlas(int type)
 {
+    // 兼容原有行为：Settings 里给了 LoadAtlasFromFile 才读，
+    // 读的是 "./<名字>.osa"；显式路径版本见 LoadAtlasFromFile()。
+    if(mStrLoadAtlasFromFile.empty())
+        return false;
+
+    return LoadAtlasFromFile("./" + mStrLoadAtlasFromFile + ".osa", type);
+}
+
+bool System::LoadAtlasFromFile(const string &filename, int type)
+{
     string strFileVoc, strVocChecksum;
     bool isRead = false;
 
-    string pathLoadFileName = "./";
-    pathLoadFileName = pathLoadFileName.append(mStrLoadAtlasFromFile);
-    pathLoadFileName = pathLoadFileName.append(".osa");
+    if(filename.empty())
+        return false;
 
     if(type == TEXT_FILE) // File text
     {
-        cout << "Starting to read the save text file " << endl;
-        std::ifstream ifs(pathLoadFileName, std::ios::binary);
+        cout << "开始读取文本格式地图文件" << endl;
+        std::ifstream ifs(filename, std::ios::binary);
         if(!ifs.good())
         {
-            cout << "Load file not found" << endl;
+            cout << "地图文件不存在或不可读" << endl;
             return false;
         }
         boost::archive::text_iarchive ia(ifs);
         ia >> strFileVoc;
         ia >> strVocChecksum;
         ia >> mpAtlas;
-        cout << "End to load the save text file " << endl;
+        cout << "文本格式地图文件读取完成" << endl;
         isRead = true;
     }
     else if(type == BINARY_FILE) // File binary
     {
-        cout << "Starting to read the save binary file"  << endl;
-        std::ifstream ifs(pathLoadFileName, std::ios::binary);
+        cout << "开始读取二进制地图文件" << endl;
+        std::ifstream ifs(filename, std::ios::binary);
         if(!ifs.good())
         {
-            cout << "Load file not found" << endl;
+            cout << "地图文件不存在或不可读" << endl;
             return false;
         }
         boost::archive::binary_iarchive ia(ifs);
         ia >> strFileVoc;
         ia >> strVocChecksum;
         ia >> mpAtlas;
-        cout << "End to load the save binary file" << endl;
+        cout << "二进制地图文件读取完成" << endl;
         isRead = true;
     }
 
@@ -1711,8 +1748,8 @@ bool System::LoadAtlas(int type)
 
         if(strInputVocabularyChecksum.compare(strVocChecksum) != 0)
         {
-            cout << "The vocabulary load isn't the same which the load session was created " << endl;
-            cout << "-Vocabulary name: " << strFileVoc << endl;
+            cout << "地图文件与当前词典不匹配：地图创建时使用的词典与当前词典不同" << endl;
+            cout << "-地图记录的词典名：" << strFileVoc << endl;
             return false; // Both are differents
         }
 
@@ -1723,6 +1760,60 @@ bool System::LoadAtlas(int type)
         return true;
     }
     return false;
+}
+
+std::vector<System::ReadOnlyKeyFrame> System::GetReadOnlyKeyFrames()
+{
+    std::vector<ReadOnlyKeyFrame> output;
+
+    // Atlas::GetAllKeyFrames() 内部持有 Atlas 互斥量，返回的是活动地图指针
+    // 的一份副本；这里立刻转换成本 map 拥有的值语义结构，调用方拿不到内部指针。
+    const std::vector<KeyFrame*> keyframes = mpAtlas->GetAllKeyFrames();
+    output.reserve(keyframes.size());
+    for(KeyFrame* pKF : keyframes)
+    {
+        if(!pKF)
+            continue;
+
+        ReadOnlyKeyFrame entry;
+        entry.id = pKF->mnId;
+        entry.timestamp_seconds = pKF->mTimeStamp;
+        entry.T_wc = pKF->GetPoseInverse();
+        output.push_back(entry);
+    }
+
+    return output;
+}
+
+std::vector<System::ReadOnlyMapPoint> System::GetReadOnlyMapPoints()
+{
+    std::vector<ReadOnlyMapPoint> output;
+
+    // 与 GetReadOnlyKeyFrames() 同理：加锁取指针副本，再深拷贝成值语义。
+    const std::vector<MapPoint*> map_points = mpAtlas->GetAllMapPoints();
+    output.reserve(map_points.size());
+    for(MapPoint* pMP : map_points)
+    {
+        if(!pMP)
+            continue;
+
+        ReadOnlyMapPoint entry;
+        entry.id = pMP->mnId;
+        entry.position_w = pMP->GetWorldPos();
+        output.push_back(entry);
+    }
+
+    return output;
+}
+
+unsigned long int System::GetReadOnlyKeyFrameCount()
+{
+    return mpAtlas->KeyFramesInMap();
+}
+
+unsigned long int System::GetReadOnlyMapPointCount()
+{
+    return mpAtlas->MapPointsInMap();
 }
 
 string System::CalculateCheckSum(string filename, int type)

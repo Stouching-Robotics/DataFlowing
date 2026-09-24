@@ -116,8 +116,12 @@ def probe_product_serial(
             # the same vendor SDK at the same time.  This is synchronization
             # only: identity still comes exclusively from the live SDK result
             # and the device_setup manifest below.
+            # 设备锁这里必须带上 timeout：不传就是默认 0.0，而读出厂标定
+            # （calibration.py）会在同一把锁上停留十几秒 —— 2026-09-24 现场
+            # 日志里「启动的身份探测被自己进程正在跑的标定挡掉」就是这条
+            # 缺省值造成的。带上 timeout 变成排队等，而不是立刻失败。
             with device_access_guard(FAYS_SDK_INITIALIZATION_LOCK, timeout=timeout), \
-                    fays_device_guard(ports["stereo_dev_port"]):
+                    fays_device_guard(ports["stereo_dev_port"], timeout=timeout):
                 command = [executable]
                 if serial_only_fast:
                     command.append("--serial-only-fast")

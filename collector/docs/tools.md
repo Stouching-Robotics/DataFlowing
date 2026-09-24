@@ -422,7 +422,7 @@ venv/bin/python tools/audit_frame_gaps.py [任务目录] [选项]   # 默认 dat
 
 ## tests/ 测试
 
-测试脚本见 `tools/tests/`（当前 56 份；离线测试加 `QT_QPA_PLATFORM=offscreen` 无需任何硬件，真机测试需对应设备在线）。完整运行命令见 `README.md` 测试节；下表是早期 16 份，末尾补上帧空洞相关的 5 份。
+测试脚本见 `tools/tests/`（当前 71 份；离线测试加 `QT_QPA_PLATFORM=offscreen` 无需任何硬件，真机测试需对应设备在线）。完整运行命令见 `README.md` 测试节。**下表只列了一部分**（早期 16 份 + 帧空洞相关的 5 份 + 夹爪配对/离线入口），其余按需现查文件名。
 
 | 文件 | 类型 | 一句话 |
 | --- | --- | --- |
@@ -447,3 +447,5 @@ venv/bin/python tools/audit_frame_gaps.py [任务目录] [选项]   # 默认 dat
 | `test_ext_frame_gap.py` | 离线 | 落盘侧空洞端到端（含 parquet `*_gap_*` 注入） |
 | `test_camera_log_archive.py` | 离线 | camera-service 日志留档 + 告警摘录（健康会话零命中） |
 | `test_audit_frame_gaps.py` | 离线 | 审计脚本三层判据/四桶/退出码（全合成 fixture） |
+| `test_gripper_fays_pairing.py` | 离线 | 夹爪配对链失败关闭（QF/WF、按 USB serial 唯一匹配、不猜端口） |
+| `test_gripper_esp_binding.py` | 离线 | 夹爪离线入口：串口诊断只读收集（含写阻塞时仍走通的只读复检、以及卡在第几笔写的留痕日志）、绑定读写与回读、界面三条链路的善后口径、「板子没在服务串口」提示的挂载范围 |

@@ -487,7 +487,11 @@ void Optimizer::FullInertialBA(Map *pMap, int its, const bool bFixLocal, const l
         {
             if(pKFi->isBad() || pKFi->mPrevKF->mnId>maxKFid)
                 continue;
-            if(pKFi->bImu && pKFi->mPrevKF->bImu)
+            // bImu records that the keyframe HAS inertial samples, not that a
+            // preintegration was built: a keyframe can carry bImu and still
+            // hold mpImuPreintegrated==NULL. Same condition as LocalInertialBA
+            // and MergeInertialBA, which already test it.
+            if(pKFi->bImu && pKFi->mPrevKF->bImu && pKFi->mpImuPreintegrated)
             {
                 pKFi->mpImuPreintegrated->SetNewBias(pKFi->mPrevKF->GetImuBias());
                 g2o::HyperGraph::Vertex* VP1 = optimizer.vertex(pKFi->mPrevKF->mnId);
@@ -3169,8 +3173,16 @@ void Optimizer::InertialOptimization(Map *pMap, Eigen::Matrix3d &Rwg, double &sc
         {
             if(pKFi->isBad() || pKFi->mPrevKF->mnId>maxKFid)
                 continue;
+            // An empty preintegration is a designed state, not a corruption:
+            // Tracking.cc seeds keyframes with mpImuPreintegrated=NULL when the
+            // IMU window is too short, and that keyframe simply has no inertial
+            // edge to contribute. Print and SKIP the whole keyframe -- printing
+            // without skipping dereferences NULL at SetNewBias below.
             if(!pKFi->mpImuPreintegrated)
+            {
                 std::cout << "Not preintegrated measurement" << std::endl;
+                continue;
+            }
 
             pKFi->mpImuPreintegrated->SetNewBias(pKFi->mPrevKF->GetImuBias());
             g2o::HyperGraph::Vertex* VP1 = optimizer.vertex(pKFi->mPrevKF->mnId);
@@ -3342,6 +3354,16 @@ void Optimizer::InertialOptimization(Map *pMap, Eigen::Vector3d &bg, Eigen::Vect
         {
             if(pKFi->isBad() || pKFi->mPrevKF->mnId>maxKFid)
                 continue;
+
+            // Same designed-state guard as the 11-argument overload above: a
+            // keyframe without preintegration contributes no inertial edge.
+            // This overload had no guard at all, so it crashed silently -- no
+            // message, just SIGSEGV at SetNewBias.
+            if(!pKFi->mpImuPreintegrated)
+            {
+                std::cout << "Not preintegrated measurement" << std::endl;
+                continue;
+            }
 
             pKFi->mpImuPreintegrated->SetNewBias(pKFi->mPrevKF->GetImuBias());
             g2o::HyperGraph::Vertex* VP1 = optimizer.vertex(pKFi->mPrevKF->mnId);

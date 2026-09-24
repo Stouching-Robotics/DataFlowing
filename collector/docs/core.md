@@ -1030,6 +1030,64 @@ import；回归 `tools/tests/test_frame_gap.py`。背景见
 | `core/gripper/devices/` | ESP32 串口/控制板、Sightac 与 DECXIN 相机服务、USB 拓扑关联 |
 | `core/gripper/control/` | 夹爪板状态、百分比与双路 Fz 锁存 |
 
+### core/gripper/fays_single.py（配对链与离线入口）
+
+**作用**：单夹爪场景的 Fays 租约。配对链是「UVC 组 → 唯一 ESP32（bus +
+outer_path）→ 读板子 NVS 里记的 Fays 序列号（串口 `QF`）→ 按官方 SDK 读到的
+产品序列号唯一匹配在线 Fays」，每一步都**失败关闭**（不按端口号或枚举顺序
+猜）；绑定序列号写错的症状就是「连不上」，所以宁可当场报错。
+
+**关键接口（离线入口，v1.3.12）**：都不取租约、不建 IPC 目录，供 GUI 直接调。
+
+| 方法 | 签名 | 作用 |
+|---|---|---|
+| `esp_binding_status` | `(esp_serial)` | 连接与绑定现状：`{"esp_serial","device","bound","response","reason"}`。`reason==""` 且 `bound==""` ＝**读通了但没绑定**（新板子的正常状态，界面可直接进写入步骤）；`reason` 非空则带上串口层原文（如 `串口连接失败: serial open/handshake failed: Write timeout`），由界面如实显示、不猜 |
+| `online_fays_serials` | `()` | 枚举在线 Fays 产品序列号 → `(by_serial, skipped)`；探测口径与 `acquire()` 完全一致（超速预检 + `--serial-only-fast`），所以列出来的就是配对会认的；`skipped` 是被别的会话独占的那些。无完整设备组抛 `GripperFaysError` |
+| `write_bound_serial` | `(esp_serial, fays_serial)` | `WF:<serial>` 写 NVS → 立刻 `QF` **回读**并返回值。回读为空串就是空串，**不谎报成功**；缺节点/连不上/板上 `ERR` 都带原因抛出 |
+| `esp_console_report` | `(esp_serial, seconds=3.0)` | 只读诊断：`{"esp_serial","device","physical_usb_path","connected","last_error","state","bound","lines","read_only_lines","read_only_error","seconds"}`。除握手 `?` 外不发命令、不改板子状态；`lines` 是随后板上主动吐出的整行。**握手失败不是「没有证据」**：此时会再 `open_readonly()` 一次（一个字节都不写）收 `seconds` 秒进 `read_only_lines` —— 写阻塞时读这条路仍然通，于是能分清「板子哑了」（0 行）与「板子在说话、只是不收主机写入」（有行），两者归因与处置都不同 |
+
+**公开行为（v1.3.12）**：三件事都在主程序夹爪右键菜单里（见 `docs/ui.md`）——
+串口诊断打印板上原样输出，配对序列号走「探板 → 在**在线** Fays 里挑一台 →
+确认 → 写入 → 回读」。只给选**不给手输**：写错序列号会让这只夹爪静默指向
+别的 Fays，比现状更难排查。三条链路共用主窗口的 `_gripper_offline_guard`
+（序列号 + 录制检查）、`_gripper_offline_take_over`（先关掉已开的夹爪让出
+串口）、`_reopen_after_offline`（善后）：**只读诊断一律开回**，探板/写入失败
+不开回（板子状态未知，交回用户决定），用户取消/没找到在线 Fays 则开回。
+
+**ESP32 串口（`core/gripper/devices/gripper_serial.py`）**：`GripperSerial` 是
+唯一资源所有者。`connect()` 以 `exclusive=True` 独占打开，并在
+`CONNECT_BOOT_TIMEOUT` 内反复发 `?` 要一行以 `STATE` 开头的响应；`send()` 只
+接受**该命令自己的响应前缀**，免得固件周期性的 `STATE` 顶替真响应（`QF` 是
+两字符命令，前缀表按完整命令查，只查首字符会让它永远命中不到）；`WF:` 的三
+种终态都算本条命令的响应。`read_lines(duration, *, limit=200)`（v1.3.12）是
+只读诊断用的收集器：不发任何命令，超时那次 `readline` 返回空串就继续等到时
+间上限。v1.3.12 起 `connect()` = `open_readonly()` + `handshake()` 两半，两半
+可以单独调：**只读打开再收一段**这条路在「写不进去」的板子上依然走得通，是
+诊断拿得到 TX 侧证据的唯一途径。
+
+**关键数据**：`connect()` 报的 `serial open/handshake failed: Write timeout` 与
+`serial handshake timeout after N attempts` 是两件事 —— 前者是写阻塞（3 字节
+的 `?` 都送不进设备），后者是**写得进去、板子不回话**。两种都表明**板子没在
+服务自己的 USB 串口**，但归因不能说死成「固件没烧」：ESP32-S3 的
+USB-Serial-JTAG（`303a:1001`）节点由芯片自带的 USB 外设枚举，与固件是否在跑
+无关，所以「节点在」不能当「板子在服务串口」；而官方 issue（espressif/esp-idf
+#18996）记录了另一种情形——固件完好，USB 外设被 DTR/RTS 触发的复位打死，
+设备仍留在总线上、两个方向皆死寂，只有**物理断电/EN 复位**能恢复。写超时的
+宿主侧机制也不是「FIFO 被灌满」：设备端只是不再「受理」新的 OUT 包
+（TRM 33.3.3：缓冲要有空位才收，空位只在固件读走数据后恢复），一个挂起的写
+URB 就让 cdc-acm 的 `chars_in_buffer`（1 个 wb 即 `writesize = maxp*20 ≥ 256`）
+压过 `WAKEUP_CHARS`，`n_tty_poll` 于是不再报 POLLOUT —— pyserial 的写后
+`select` 超时，抛 `SerialTimeoutException('Write timeout')`。权限/占用不在这条
+路上：被占是 `[Errno 16] Device or resource busy`（或 `Errno 13`），不是写超时。
+写阻塞时第一笔 `?` 就可能卡住，日志里一条 `[Serial] connect attempt n/8` 都不会
+出现，事后看会误判成没试过握手 —— 所以 v1.3.12 起异常路径额外打一行
+`[Serial] 握手中断于第 N 次写（最后一次读回 ...）: <异常>`，把「卡在第几笔」
+和「卡之前读到过什么」一起留痕。
+
+**调用关系**：`acquire()` 走完整配对（主程序连接夹爪时）；GUI 三入口走上面四
+个离线方法；离线回归见 `tools/tests/test_gripper_fays_pairing.py`（配对链
+失败关闭）与 `tools/tests/test_gripper_esp_binding.py`（离线入口 + 界面流程）。
+
 ### core/gripper/calibration.py
 
 **作用**：**新夹爪接入即自动就位**（v1.3.4）。Fays 的运行标定是**逐设备出厂

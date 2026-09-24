@@ -3,7 +3,7 @@
 版本号集中定义于此：settings.APP_VERSION 及其他模块均从这里取值。
 """
 
-__version__ = "1.3.11"
+__version__ = "1.3.12"
 
 # v1.3.11 —— 手套链路整体换厂商 SDK v2.1.0（`tools/glove_sdk/`，取代 fork 的
 #   `core/glove_usb`），全栈因此锁到 **Python 3.10**：SDK 的 `algorithm/` 是

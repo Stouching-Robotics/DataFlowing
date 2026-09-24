@@ -46,7 +46,11 @@ from core.gripper.fays_runtime import (
     validate_fays_superspeed,
 )
 from core.gripper.fays_serial_probe import probe_product_serial
-from core.gripper.runtime.device_access import fays_device_guard
+from core.gripper.runtime.device_access import (
+    device_guard_held_by_process,
+    fays_device_guard,
+    fays_device_guard_path,
+)
 
 _INSTANCE_IPC_FILES = (
     "orb_pose.json.tmp", "orb_pose.json", "orb_meta.json",
@@ -166,6 +170,23 @@ class SingleFaysLease:
             )
         return matches[0]
 
+    def _send_qf(self, bridge):
+        """在已打开的串口上问一次 ``QF``，返回板上响应原文。
+
+        固件周期性状态行会插在命令响应前面：拿不到 ``FAYS_SERIAL:`` /
+        ``ERR FAYS_SERIAL`` 就重试两次，别把串口收发竞态误判成「没有绑定」。
+        """
+        response = ""
+        for attempt in range(3):
+            response = bridge.send("QF")
+            if response.startswith(("FAYS_SERIAL:", "ERR FAYS_SERIAL")):
+                break
+            if response.startswith("STATE") and attempt < 2:
+                time.sleep(0.05)
+                continue
+            break
+        return response
+
     def _query_esp_bound_fays_serial(self, esp):
         """读 ESP32 NVS 里绑定的 Fays 产品序列号（串口命令 ``QF``）。
 
@@ -184,17 +205,7 @@ class SingleFaysLease:
                 "ESP32 {} 串口连接失败，无法查询绑定的 Fays 序列号: {}".format(
                     esp_serial, bridge.last_error or "unknown error"))
         try:
-            response = ""
-            for attempt in range(3):
-                response = bridge.send("QF")
-                if response.startswith(("FAYS_SERIAL:", "ERR FAYS_SERIAL")):
-                    break
-                if response.startswith("STATE") and attempt < 2:
-                    # 固件周期性状态行插在命令响应前面：重试，别把串口
-                    # 收发竞态误判成「没有绑定」。
-                    time.sleep(0.05)
-                    continue
-                break
+            response = self._send_qf(bridge)
         finally:
             bridge.disconnect()
         prefix = "FAYS_SERIAL:"
@@ -212,14 +223,21 @@ class SingleFaysLease:
 
     @staticmethod
     def _device_in_use(group):
-        """这台 Fays 是否已被运行中的会话独占（另一套 rig 的 SLAM）。
+        """这台 Fays 是否已被**别的**会话独占（另一套 rig 的 SLAM）。
 
         双夹爪时另一套 rig 的 SLAM 会把本设备锁一直持有到会话结束，
         它按定义不可能是本次要打开的夹爪，但探测不了就得如实记下来。
+
+        必须先查进程内登记表：flock 绑在 open file description 上，本进程
+        自己正持有（例如正在读出厂标定时）时，这里再开一次 fd 也一样
+        EWOULDBLOCK。只看「加锁失败」会把本机唯一那台 Fays 判成别人占用，
+        于是跳过它、报出「在线 serial=[<无>]」并拒绝配对——自己挡自己。
         """
         port = str((group.get("ports") or {}).get("stereo_dev_port") or "")
         if re.fullmatch(r"/dev/video[0-9]+", port) is None:
             return False        # 节点无效留给后面的 SDK 预检去报错
+        if device_guard_held_by_process(fays_device_guard_path(port)):
+            return False        # 本进程自己持有，不是别的会话
         try:
             with fays_device_guard(port, timeout=0.0):
                 return False
@@ -391,6 +409,150 @@ class SingleFaysLease:
                 f"[Gripper-Fays] {serial} 出厂标定已重新生成"
             )
             return result
+
+    # ── 配对（读/写 ESP32 NVS 里绑定的 Fays 序列号）：GUI 入口 ──────
+    # 这四个都**不建租约、不占 IPC 目录**，与 refresh_calibration 同一口径：
+    # 串口与 Fays SDK 都是独占资源，调用方负责先确认这台夹爪没在用。
+
+    def esp_binding_status(self, esp_serial):
+        """这只 ESP32 的连接与绑定现状（「未绑定」不算失败）。
+
+        返回 ``{"esp_serial", "device", "bound", "response", "reason"}``：
+        ``reason`` 为空＝读通了，此时 ``bound`` 为空串表示板上没写绑定 ——
+        新板的正常状态，界面可以直接往下走写入；``reason`` 非空＝读不通，
+        带上底层原文（例如 ``串口连接失败: serial open/handshake failed:
+        Write timeout``），由界面如实显示，不猜。除握手那条 ``?`` 与一条
+        ``QF`` 外不发任何命令。
+        """
+        with self._lock:
+            esp = self._match_esp(esp_serial)
+            status = {
+                "esp_serial": str(esp.get("serial") or ""),
+                "device": str(esp.get("device") or ""),
+                "bound": "",
+                "response": "",
+                "reason": "",
+            }
+            device = status["device"]
+            if not device:
+                status["reason"] = "缺少串口节点，无法查询绑定序列号"
+                return status
+            bridge = GripperSerial(logger=self._logger)
+            if not bridge.connect(device):
+                status["reason"] = "串口连接失败: {}".format(
+                    bridge.last_error or "unknown error")
+                return status
+            try:
+                response = self._send_qf(bridge)
+            finally:
+                bridge.disconnect()
+            status["response"] = response
+            prefix = "FAYS_SERIAL:"
+            if response.startswith(prefix):
+                status["bound"] = response[len(prefix):].strip()
+            elif not response.startswith("ERR FAYS_SERIAL_NOT_SET"):
+                # 未绑定是正常状态；其它一律当读不通（含固件不认识 QF 的 ERR）
+                status["reason"] = "查询绑定序列号失败: {}".format(
+                    response or "<empty>")
+            return status
+
+    def online_fays_serials(self):
+        """枚举当前在线的 Fays 产品序列号 → ``(by_serial, skipped)``。
+
+        ``by_serial`` 是 ``{产品序列号: 设备组}``，``skipped`` 是被其他会话
+        独占而跳过的组（不能当写入目标）。探测口径与 ``acquire`` 完全一致
+        （超速预检 + ``--serial-only-fast``），所以列出来的就是配对会认的。
+        """
+        with self._lock:
+            groups = tuple(discover_fays_device_groups())
+            if not groups:
+                raise GripperFaysError(
+                    "未发现完整的 Fays S80M"
+                    "（stereo + IMU 两个节点必须同时在线）")
+            return self._probe_fays_groups_by_serial(groups)
+
+    def write_bound_serial(self, esp_serial, fays_serial):
+        """把 Fays 产品序列号写进这只 ESP32 的 NVS（``WF:``），返回回读值。
+
+        校验与板上回执判定都交给 :meth:`GripperSerial.set_fays_serial`（它
+        拥有字符集规则与三种终态）；写完立刻 ``QF`` 回读确认，回读为空串
+        表示板子没把新值读回来 —— 不猜成功，由调用方如实显示。
+        """
+        with self._lock:
+            esp = self._match_esp(esp_serial)
+            device = str(esp.get("device") or "").strip()
+            board = str(esp.get("serial") or "<unknown>").strip()
+            if not device:
+                raise GripperFaysError(
+                    "ESP32 {} 缺少串口节点，无法写入 Fays 序列号".format(
+                        board))
+            bridge = GripperSerial(logger=self._logger)
+            if not bridge.connect(device):
+                raise GripperFaysError(
+                    "ESP32 {} 串口连接失败，无法写入 Fays 序列号: {}".format(
+                        board, bridge.last_error or "unknown error"))
+            try:
+                bridge.set_fays_serial(fays_serial)
+                return bridge.query_fays_serial()
+            finally:
+                bridge.disconnect()
+
+    def esp_console_report(self, esp_serial, seconds: float = 3.0):
+        """只读诊断：定位这只夹爪的 ESP32，把板上原样输出带回给界面。
+
+        除握手那一条 ``?`` 外不发任何命令，也不改板子状态。返回字典：
+        ``esp_serial``/``device``/``physical_usb_path`` 是身份，``connected``
+        为假时 ``last_error`` 就是串口层原文（例如
+        ``serial open/handshake failed: Write timeout``），``state`` 与
+        ``bound`` 是 ``?`` 与 ``QF`` 的响应，``lines`` 是随后 ``seconds``
+        秒内板上主动吐出的整行。
+
+        握手失败不是「没有证据」：此时会再**只读**打开一次（一个字节都
+        不写），把 ``seconds`` 秒内板子 TX 侧的原样输出收进
+        ``read_only_lines``。写阻塞时这条只读路径依然走得通，于是能分清
+        两件处置完全不同的事 —— 一行都没有＝板上没有程序在写这个口，
+        有输出＝板子在说话、只是不收主机写入。
+        """
+        with self._lock:
+            esp = self._match_esp(esp_serial)
+            report = {
+                "esp_serial": str(esp.get("serial") or ""),
+                "device": str(esp.get("device") or ""),
+                "physical_usb_path": str(
+                    esp.get("physical_usb_path") or ""),
+                "connected": False,
+                "last_error": "",
+                "state": "",
+                "bound": "",
+                "lines": [],
+                "read_only_lines": [],
+                "read_only_error": "",
+                "seconds": float(seconds),
+            }
+            device = report["device"]
+            if not device:
+                report["last_error"] = "缺少串口节点，无法打开"
+                return report
+            bridge = GripperSerial(logger=self._logger)
+            try:
+                if not bridge.connect(device):
+                    report["last_error"] = (
+                        bridge.last_error or "unknown error")
+                    # 握手失败时 connect 已经把口关掉了，重新只读打开：
+                    # 写不进去的板子照样可能在说话，这一条不能省。
+                    if bridge.open_readonly(device):
+                        report["read_only_lines"] = bridge.read_lines(seconds)
+                    else:
+                        report["read_only_error"] = (
+                            bridge.last_error or "unknown error")
+                    return report
+                report["connected"] = True
+                report["state"] = bridge.send("?")
+                report["bound"] = bridge.send("QF")
+                report["lines"] = bridge.read_lines(seconds)
+            finally:
+                bridge.disconnect()
+            return report
 
     def acquire(self, esp_serial):
         """锁定并返回 selected 字典；重复调用返回当前租约快照。"""

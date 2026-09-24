@@ -1,0 +1,56 @@
+{
+  "error_classified": {
+    "2026-09-20 11:40:42.617 [ ERROR] StereoOnlineCapture(): get img failed": 1,
+    "2026-09-20 11:40:42.649 [ ERROR] ImuOnlineCapture(): DQBUF error: Invalid argumentIMU FPS: 997.640204": 1,
+    "ERROR building inertial edge": 1106,
+    "Failed to dequeue buffer": 1,
+    "Δq(ERROR building inertial edge10f):": 1
+  },
+  "error_re_raw": {
+    "2026-09-20 11:40:42.617 [ ERROR] StereoOnlineCapture(): get img failed": 1,
+    "2026-09-20 11:40:42.649 [ ERROR] ImuOnlineCapture(): DQBUF error: Invalid argumentIMU FPS: 997.640204": 1,
+    "ERROR building inertial edge": 1106,
+    "Failed to dequeue buffer": 1,
+    "[FAYS-CALIB] WARN SetStereoFPS(50) failed": 19,
+    "Δq(ERROR building inertial edge10f):": 1
+  },
+  "file_count": 20,
+  "kinds": {
+    "affinity": 5379,
+    "error": 1110,
+    "fays_rates": 5326,
+    "log": 44161,
+    "mp_cleanup": 5255,
+    "orb_diagnostic": 5361,
+    "orb_stage": 5401,
+    "origin": 17,
+    "pose": 154828,
+    "ready": 17,
+    "status": 716,
+    "time_drop": 75
+  },
+  "log_dir": "/home/stouch/collector/logs/slam_native",
+  "parsed_lines_total": 227646,
+  "per_file_parsed": {
+    "20260918_170654_3500000262300098_slam_stdout.log": 577,
+    "20260918_171611_3500000262300098_slam_stdout.log": 21894,
+    "20260918_172033_3500000262300098_slam_stdout.log": 4062,
+    "20260918_172832_3500000262300098_slam_stdout.log": 18572,
+    "20260918_174843_3500000262300098_slam_stdout.log": 49206,
+    "20260920_102832_3500000262300098_slam_stdout.log": 17496,
+    "20260920_104215_3500000262300098_slam_stdout.log": 28522,
+    "20260920_104605_3500000262300098_slam_stdout.log": 4638,
+    "20260920_104815_3500000262300098_slam_stdout.log": 3371,
+    "20260920_111212_3500000262300098_slam_stdout.log": 15994,
+    "20260920_113632_3500000262300098_slam_stdout.log": 3311,
+    "20260920_113830_3500000262300098_slam_stdout.log": 3869,
+    "20260920_114045_3500000262300098_slam_stdout.log": 281,
+    "20260920_140606_3500000262300098_slam_stdout.log": 5202,
+    "20260921_111153_3500000262300098_slam_stdout.log": 4111,
+    "20260921_112000_3500000262300098_slam_stdout.log": 19645,
+    "20260921_112804_3500000262300098_slam_stdout.log": 18018,
+    "20260921_115938_3500000262300098_slam_stdout.log": 85,
+    "20260921_162111_3500000262300098_slam_stdout.log": 4,
+    "20260921_162558_3500000262300098_slam_stdout.log": 8788
+  }
+}

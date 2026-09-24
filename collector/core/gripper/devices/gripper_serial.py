@@ -68,52 +68,121 @@ class GripperSerial:
             return self._last_error
 
     def connect(self, port: str, baud: int = CONNECT_BAUD) -> bool:
-        """独占打开串口，在有限窗口内用 ``?`` 握手确认主控在线。"""
+        """独占打开串口，在有限窗口内用 ``?`` 握手确认主控在线。
+
+        等于 :meth:`open_readonly` + :meth:`handshake`（打开后先丢弃陈旧
+        输入再握手）。诊断路径要在「握手不上」时仍然拿到板子 TX 侧的
+        证据，所以两半可以分开单独调。
+        """
         with self._io_lock:
-            self._disconnect_locked()
-            self._last_error = None
-            try:
-                # 独占模式：串口被其他进程占用时立刻失败，而不是两个进程
-                # 各自读走半条响应，把「被占用」伪装成「握手超时」。
-                opened = self._serial_factory(
-                    port,
-                    baud,
-                    timeout=self.CONNECT_TIMEOUT,
-                    write_timeout=self.CONNECT_WRITE_TIMEOUT,
-                    exclusive=True,
-                )
-                self._serial = opened
-                opened.reset_input_buffer()
-                deadline = self._clock() + self.CONNECT_BOOT_TIMEOUT
-                attempts_made = 0
-                for attempt in range(self.CONNECT_ATTEMPTS):
-                    if attempt and self._clock() >= deadline:
-                        break
-                    attempts_made = attempt + 1
-                    opened.write(b"?\r\n")
-                    line = opened.readline().decode(
-                        errors="ignore").strip()
-                    self._logger(
-                        f"[Serial] connect attempt {attempt + 1}/"
-                        f"{self.CONNECT_ATTEMPTS}: [{line[:60]}]"
-                    )
-                    if line.startswith("STATE"):
-                        return True
-                    if self._clock() < deadline:
-                        self._sleep(self.CONNECT_RETRY_DELAY)
-            except Exception as exc:
-                self._last_error = (
-                    f"serial open/handshake failed: {exc}"
-                )
-                self._disconnect_locked()
+            if not self._open_locked(port, baud):
                 return False
-            # 报实际尝试次数，不报上限：被抢占/占用时上限是误导
+            return self._handshake_locked()
+
+    def open_readonly(self, port: str, baud: int = CONNECT_BAUD) -> bool:
+        """只打开串口、一个字节都不写（只读诊断的第一步）。
+
+        打开参数与 :meth:`connect` 完全一致（独占、同样的读/写超时），
+        区别是不发握手 ``?``：板子收 FIFO 满导致写阻塞时，**写**这条路
+        走不通，**打开+读**这条路仍然走得通 —— 这是把「板子哑了」与
+        「板子会说话但不收主机写入」分开的唯一手段。
+        """
+        with self._io_lock:
+            return self._open_locked(port, baud)
+
+    def handshake(self) -> bool:
+        """在已打开的串口上补做握手（:meth:`connect` 的后半段）。"""
+        with self._io_lock:
+            return self._handshake_locked()
+
+    def _open_locked(self, port: str, baud: int) -> bool:
+        self._disconnect_locked()
+        self._last_error = None
+        try:
+            # 独占模式：串口被其他进程占用时立刻失败，而不是两个进程
+            # 各自读走半条响应，把「被占用」伪装成「握手超时」。
+            opened = self._serial_factory(
+                port,
+                baud,
+                timeout=self.CONNECT_TIMEOUT,
+                write_timeout=self.CONNECT_WRITE_TIMEOUT,
+                exclusive=True,
+            )
+            self._serial = opened
+            opened.reset_input_buffer()
+        except Exception as exc:
+            self._last_error = f"serial open/handshake failed: {exc}"
+            self._disconnect_locked()
+            return False
+        return True
+
+    def _handshake_locked(self) -> bool:
+        opened = self._serial
+        if opened is None or not getattr(opened, "is_open", False):
+            self._last_error = "serial handshake skipped: port not open"
+            return False
+        attempts_made = 0
+        last_line = ""
+        try:
+            deadline = self._clock() + self.CONNECT_BOOT_TIMEOUT
+            for attempt in range(self.CONNECT_ATTEMPTS):
+                if attempt and self._clock() >= deadline:
+                    break
+                attempts_made = attempt + 1
+                opened.write(b"?\r\n")
+                last_line = opened.readline().decode(
+                    errors="ignore").strip()
+                self._logger(
+                    f"[Serial] connect attempt {attempt + 1}/"
+                    f"{self.CONNECT_ATTEMPTS}: [{last_line[:60]}]"
+                )
+                if last_line.startswith("STATE"):
+                    return True
+                if self._clock() < deadline:
+                    self._sleep(self.CONNECT_RETRY_DELAY)
+        except Exception as exc:
+            # 中断在哪一次写、最后一次读回什么，都要留痕：板子收 FIFO 没人
+            # 排空时第一笔写就阻塞，日志里一条 `connect attempt` 都不会有，
+            # 光看上面那行会以为「没试过」。这一行把两者区分开。
+            self._logger(
+                f"[Serial] 握手中断于第 {attempts_made} 次写"
+                f"（最后一次读回 {last_line!r}）: {exc}")
             self._last_error = (
-                "serial handshake timeout after "
-                f"{attempts_made} attempts"
+                f"serial open/handshake failed: {exc}"
             )
             self._disconnect_locked()
             return False
+        # 报实际尝试次数，不报上限：被抢占/占用时上限是误导
+        self._last_error = (
+            "serial handshake timeout after "
+            f"{attempts_made} attempts"
+        )
+        self._disconnect_locked()
+        return False
+
+    def read_lines(self, duration: float, *, limit: int = 200):
+        """在 ``duration`` 秒内收集板上主动到达的整行（只读诊断）。
+
+        不发任何命令：健康的 ESP32 空闲时也会周期性输出 ``STATE ...``，
+        一行都收不到就说明没有程序在写这个口。超时那次 ``readline`` 返回
+        空串，继续等到达时间上限；串口没打开时返回空列表。
+        """
+        with self._io_lock:
+            opened = self._serial
+            if opened is None or not getattr(opened, "is_open", False):
+                return []
+            lines = []
+            deadline = self._clock() + max(0.0, float(duration))
+            while len(lines) < limit and self._clock() < deadline:
+                try:
+                    line = opened.readline().decode(
+                        errors="ignore").strip()
+                except Exception:
+                    # 板子掉线/句柄失效：已收到的行仍然有效，如实返回
+                    break
+                if line:
+                    lines.append(line)
+            return lines
 
     def disconnect(self) -> None:
         """幂等关闭串口；即使底层已关闭也清除 owner 引用。"""

@@ -36,8 +36,11 @@ class DevicePanel(QWidget):
 
     device_toggled = pyqtSignal(object, bool)   # (DeviceInfo, checked)
     device_renamed = pyqtSignal(object, str)    # (DeviceInfo, new_name)
-    # 右键菜单：重新读取这只夹爪的厂商出厂标定（DeviceInfo）
+    # 夹爪右键菜单（都只带被点的那台 DeviceInfo；三件都要独占设备）：
+    # 重新读取厂商出厂标定 / 读写 ESP32 NVS 里绑定的 Fays 序列号 / 串口诊断
     gripper_recalibration_requested = pyqtSignal(object)
+    gripper_binding_requested = pyqtSignal(object)
+    gripper_diagnostics_requested = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -219,11 +222,11 @@ class DevicePanel(QWidget):
         """底部提示：夹爪在场时才提右键菜单（别的设备没有这个菜单）。"""
         text = tr("双击设备可重命名")
         if self._has_gripper:
-            text += tr("；右键夹爪可重读取出厂标定")
+            text += tr("；右键夹爪可重读标定 / 配对序列号 / 串口诊断")
         self._refresh_hint.setText(text)
 
     def _on_context_menu(self, pos):
-        """夹爪条目右键 → 「重新读取出厂标定」。"""
+        """夹爪条目右键 → 重读标定 / 读写绑定序列号 / ESP32 串口诊断。"""
         item = self._tree.itemAt(pos)
         if item is None:
             return
@@ -232,13 +235,25 @@ class DevicePanel(QWidget):
             return                       # 组标题 / 占位项
         if dev.group != "gripper":
             return
-        # 标定要独占设备，录制中不给入口（与 set_locked 的灰显口径一致）
+        # 三件都要独占设备，录制中不给入口（与 set_locked 的灰显口径一致）
         menu = QMenu(self)
-        action = menu.addAction(tr("重新读取出厂标定"))
-        action.setEnabled(not self._locked)
+        entries = (
+            (tr("重新读取出厂标定"), self.gripper_recalibration_requested),
+            (tr("读取/写入 Fays 绑定序列号"), self.gripper_binding_requested),
+            (tr("ESP32 串口诊断"), self.gripper_diagnostics_requested),
+        )
+        actions = []
+        for text, signal in entries:
+            action = menu.addAction(text)
+            action.setEnabled(not self._locked)
+            actions.append((action, signal))
         chosen = menu.exec_(self._tree.viewport().mapToGlobal(pos))
-        if chosen is action and not self._locked:
-            self.gripper_recalibration_requested.emit(dev)
+        if self._locked:
+            return
+        for action, signal in actions:
+            if chosen is action:
+                signal.emit(dev)
+                return
 
     def _row_text(self, dev) -> str:
         icon = _ICON.get(dev.kind, "📹")

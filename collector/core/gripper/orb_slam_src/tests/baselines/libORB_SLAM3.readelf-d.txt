@@ -1,0 +1,46 @@
+
+Dynamic section at offset 0x4282a0 contains 43 entries:
+  标记        类型                         名称/值
+ 0x0000000000000001 (NEEDED)             共享库：[libDBoW2.so]
+ 0x0000000000000001 (NEEDED)             共享库：[libg2o.so]
+ 0x0000000000000001 (NEEDED)             共享库：[libboost_serialization.so.1.83.0]
+ 0x0000000000000001 (NEEDED)             共享库：[libcrypto.so.3]
+ 0x0000000000000001 (NEEDED)             共享库：[libopencv_highgui.so.408]
+ 0x0000000000000001 (NEEDED)             共享库：[libopencv_calib3d.so.408]
+ 0x0000000000000001 (NEEDED)             共享库：[libopencv_features2d.so.408]
+ 0x0000000000000001 (NEEDED)             共享库：[libopencv_imgproc.so.408]
+ 0x0000000000000001 (NEEDED)             共享库：[libopencv_core.so.408]
+ 0x0000000000000001 (NEEDED)             共享库：[libpango_display.so.0]
+ 0x0000000000000001 (NEEDED)             共享库：[libpango_vars.so.0]
+ 0x0000000000000001 (NEEDED)             共享库：[libpango_opengl.so.0]
+ 0x0000000000000001 (NEEDED)             共享库：[libepoxy.so.0]
+ 0x0000000000000001 (NEEDED)             共享库：[libpango_core.so.0]
+ 0x0000000000000001 (NEEDED)             共享库：[libstdc++.so.6]
+ 0x0000000000000001 (NEEDED)             共享库：[libm.so.6]
+ 0x0000000000000001 (NEEDED)             共享库：[libgcc_s.so.1]
+ 0x0000000000000001 (NEEDED)             共享库：[libc.so.6]
+ 0x000000000000000e (SONAME)             Library soname: [libORB_SLAM3.so]
+ 0x000000000000001d (RUNPATH)            Library runpath: [/usr/local/lib:$ORIGIN/../../../ORB-SLAM/Thirdparty/DBoW2/lib:$ORIGIN/../../../ORB-SLAM/Thirdparty/g2o/lib:$ORIGIN]
+ 0x000000000000000c (INIT)               0x12b000
+ 0x000000000000000d (FINI)               0x3bcc34
+ 0x0000000000000019 (INIT_ARRAY)         0x41abd0
+ 0x000000000000001b (INIT_ARRAYSZ)       168 (bytes)
+ 0x000000000000001a (FINI_ARRAY)         0x41ac78
+ 0x000000000000001c (FINI_ARRAYSZ)       8 (bytes)
+ 0x000000006ffffef5 (GNU_HASH)           0x2f0
+ 0x0000000000000005 (STRTAB)             0x389c8
+ 0x0000000000000006 (SYMTAB)             0xcf70
+ 0x000000000000000a (STRSZ)              727576 (bytes)
+ 0x000000000000000b (SYMENT)             24 (bytes)
+ 0x0000000000000003 (PLTGOT)             0x42cfe8
+ 0x0000000000000002 (PLTRELSZ)           39672 (bytes)
+ 0x0000000000000014 (PLTREL)             RELA
+ 0x0000000000000017 (JMPREL)             0x120870
+ 0x0000000000000007 (RELA)               0xee068
+ 0x0000000000000008 (RELASZ)             206856 (bytes)
+ 0x0000000000000009 (RELAENT)            24 (bytes)
+ 0x000000006ffffffe (VERNEED)            0xede18
+ 0x000000006fffffff (VERNEEDNUM)         5
+ 0x000000006ffffff0 (VERSYM)             0xea3e0
+ 0x000000006ffffff9 (RELACOUNT)          43
+ 0x0000000000000000 (NULL)               0x0

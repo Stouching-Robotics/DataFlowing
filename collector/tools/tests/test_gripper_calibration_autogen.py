@@ -776,10 +776,13 @@ def test_device_panel_menu():
           "先决条件：DeviceInfo.group 按 kind 派生正确")
     panel.set_devices([gripper, camera])
 
-    check(hasattr(panel, "gripper_recalibration_requested"),
-          "面板暴露重标定信号")
+    for name in ("gripper_recalibration_requested",
+                 "gripper_binding_requested",
+                 "gripper_diagnostics_requested"):
+        check(hasattr(panel, name), f"面板暴露 {name} 信号")
     # 与实现同一口径取自翻译表，语言切换下都成立（英文界面断言中文会误判）
-    hint_with = tr("双击设备可重命名") + tr("；右键夹爪可重读取出厂标定")
+    hint_with = tr("双击设备可重命名") + tr(
+        "；右键夹爪可重读标定 / 配对序列号 / 串口诊断")
     hint_without = tr("双击设备可重命名")
     check(panel._refresh_hint.text() == hint_with,
           f"有夹爪时底部提示右键入口：{panel._refresh_hint.text()!r}")
@@ -788,7 +791,12 @@ def test_device_panel_menu():
           "没有夹爪时不提右键入口")
 
     emitted = []
-    panel.gripper_recalibration_requested.connect(emitted.append)
+    panel.gripper_recalibration_requested.connect(
+        lambda dev: emitted.append(("recalib", dev)))
+    panel.gripper_binding_requested.connect(
+        lambda dev: emitted.append(("binding", dev)))
+    panel.gripper_diagnostics_requested.connect(
+        lambda dev: emitted.append(("diagnostics", dev)))
 
     class _FakeAction:
         def __init__(self, text):
@@ -801,6 +809,7 @@ def test_device_panel_menu():
     class _FakeMenu:
         last = None
         accept = False       # True → exec_ 返回本次刚建的那一项（模拟用户点选）
+        pick = 0             # 点第几项
 
         def __init__(self, _parent):
             _FakeMenu.last = self
@@ -813,7 +822,14 @@ def test_device_panel_menu():
 
         def exec_(self, _pos):
             # 必须回传自己 addAction 造的那个对象（实现按 `chosen is action` 判等）
-            return self.actions[0] if _FakeMenu.accept and self.actions else None
+            if not _FakeMenu.accept or not self.actions:
+                return None
+            return self.actions[min(_FakeMenu.pick, len(self.actions) - 1)]
+
+    # 菜单项顺序是契约的一部分：重读标定必须留在第一项
+    menu_texts = [tr("重新读取出厂标定"), tr("读取/写入 Fays 绑定序列号"),
+                  tr("ESP32 串口诊断")]
+    menu_actions = ["recalib", "binding", "diagnostics"]
 
     panel.set_devices([gripper, camera])
     gpos = panel._tree.visualItemRect(panel._items[gripper.key]).center()
@@ -824,26 +840,33 @@ def test_device_panel_menu():
         _FakeMenu.last = None
         panel._on_context_menu(cpos)
         check(_FakeMenu.last is None, "相机行右键不弹夹爪菜单（无菜单对象）")
-        check(emitted == [], "相机行不发重标定信号")
+        check(emitted == [], "相机行不发夹爪信号")
 
         _FakeMenu.last = None
         panel._on_context_menu(gpos)
         menu = _FakeMenu.last
-        check(menu is not None and len(menu.actions) == 1,
-              "夹爪行右键弹出菜单，且只一项")
-        check(menu.actions[0].text == tr("重新读取出厂标定"),
-              f"菜单文案：{menu.actions[0].text!r}")
+        check(menu is not None and len(menu.actions) == len(menu_texts),
+              f"夹爪行右键弹出菜单，共 {len(menu_texts)} 项")
+        check([a.text for a in menu.actions] == menu_texts,
+              f"菜单文案与顺序：{[a.text for a in menu.actions]!r}")
         check(emitted == [], "只弹菜单不选 → 不发信号")
 
-        _FakeMenu.accept = True
-        panel._on_context_menu(gpos)
-        check(emitted and emitted[-1].key == gripper.key,
-              f"选中菜单项 → 发信号带该夹爪：{emitted[-1].key if emitted else '-'}")
+        # 每一项都要能选中，且发的是它自己那条信号
+        for index, (want, text) in enumerate(zip(menu_actions, menu_texts)):
+            emitted.clear()
+            _FakeMenu.accept = True
+            _FakeMenu.pick = index
+            panel._on_context_menu(gpos)
+            check(emitted and emitted[-1][0] == want
+                  and emitted[-1][1].key == gripper.key,
+                  f"选中「{text}」→ 发 {want} 信号带该夹爪：{emitted}")
 
         panel.set_locked(True)
         before = len(emitted)
-        panel._on_context_menu(gpos)
-        check(len(emitted) == before, "录制中不触发重标定（设备要独占）")
+        for index in range(len(menu_texts)):
+            _FakeMenu.pick = index
+            panel._on_context_menu(gpos)
+        check(len(emitted) == before, "录制中三项都不触发（设备要独占）")
         panel.set_locked(False)
 
     panel.deleteLater()

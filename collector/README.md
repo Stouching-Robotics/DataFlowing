@@ -1,6 +1,6 @@
 # collector — Multimodal Data Acquisition SDK · 多模态数据采集 SDK
 
-![Version](https://img.shields.io/badge/version-1.3.11-blue)
+![Version](https://img.shields.io/badge/version-1.3.12-blue)
 ![Python](https://img.shields.io/badge/python-3.10-blue)
 ![License](https://img.shields.io/badge/license-TBD-lightgrey)
 
@@ -336,6 +336,9 @@ venv/bin/python tools/tests/test_glove_registry.py
 venv/bin/python tools/tests/test_glove_backend_parity.py
 venv/bin/python tools/tests/test_glove_engine_sdk_guards.py
 venv/bin/python tools/tests/test_sdk_python_version.py
+# gripper pairing / ESP32 port diagnostics in the main GUI (v1.3.12)
+venv/bin/python tools/tests/test_gripper_fays_pairing.py
+venv/bin/python tools/tests/test_gripper_esp_binding.py
 # hardware tests require the corresponding device attached: d405_worker_test,
 # d435_e2e_test, d435_gui_smoke_test, mono_regression, d435_playback_test, etc.
 ```
@@ -397,6 +400,47 @@ are documented in [docs/index.md](docs/index.md#开发约定).
 
 ### Changelog
 
+- **v1.3.12** — pairing a new gripper no longer needs the vendor toolkit GUI.
+  When the app refused to connect a fresh gripper
+  (`串口连接失败，无法查询绑定的 Fays 序列号: serial open/handshake failed: Write
+  timeout`), nothing in the app answered the one question that matters: *is the
+  board talking at all?* The gripper context menu now has two more entries — an
+  **ESP32 serial diagnostics** pass (read-only: opens the port, prints the
+  board's raw output, and treats "not a single line in 3 s" as a first-class
+  verdict, since the USB node exists even when the firmware does not) and
+  **read/write the bound Fays serial**. The write path is probe → pick a target
+  → confirm → `WF:<serial>` → immediate `QF` read-back: the target list is the
+  *online* Fays serials only (no free-text entry — a wrong serial makes the
+  gripper silently point at another Fays, whose symptom is exactly "cannot
+  connect"), and a read-back that disagrees is reported as a warning rather than
+  a success. All three offline actions share one skeleton: refuse while
+  recording or without a board serial, hand the port over by closing the gripper
+  if it was open, and restore it afterwards — read-only diagnostics always,
+  failed probes/writes never (board state unknown, the user decides). The
+  diagnostics also fix a place that asked for evidence and never collected it:
+  `connect()` returned on a failed handshake, so "3 s, not a single line" — the
+  single most discriminating fact — was never actually measured. `connect()` is
+  now `open_readonly()` + `handshake()`, and a failed handshake re-opens the
+  port **read-only** (not one byte written) for 3 s: a board whose writes block
+  still reads, so "board is mute" (0 lines) separates cleanly from "board is
+  talking and just won't take writes" (lines shown). The four serial-failure
+  dialogs (open, recalibrate, read binding, write binding) — previously just
+  "still in the device list" or nothing at all — now all append the same
+  cheapest-first ladder: power-cycle the board's own supply for 5 s (the USB
+  node is enumerated by the chip's own USB peripheral, so unplugging USB is not
+  a chip power cycle), then use the toolkit's "test connection" to read the MAC
+  once (same download path as flashing, so it separates "host cannot reach the
+  board" from "the board's firmware is at fault"), and only then reflash — plus
+  a note that `--erase` wipes the whole chip including the Fays binding in NVS,
+  which must be written back afterwards. The ladder is attached only to the two
+  symptoms of "the board is not serving its USB port" (`Write timeout` and
+  `serial handshake timeout after N attempts`): a busy port (`Errno 16`) or a
+  permission error (`Errno 13`) also arrive wrapped in `serial open/handshake
+  failed:`, and matching on that prefix would point a host-side problem at a
+  reflash. One last blind spot: when the first `?` blocks, the log carries no
+  `connect attempt` line at all, so reading it later suggests the handshake was
+  never tried — the exception path now also logs which write attempt died and
+  what had been read back before it.
 - **v1.3.11** — the glove path moves to the vendor SDK v2.1.0 (`tools/glove_sdk/`,
   replacing the forked `core/glove_usb`), which pins the whole stack to **Python
   3.10**: the SDK's `algorithm/` is PyArmor-encrypted for the 3.10 ABI, so on
@@ -1159,6 +1203,9 @@ venv/bin/python tools/tests/test_glove_registry.py
 venv/bin/python tools/tests/test_glove_backend_parity.py
 venv/bin/python tools/tests/test_glove_engine_sdk_guards.py
 venv/bin/python tools/tests/test_sdk_python_version.py
+# 主程序内的夹爪配对与 ESP32 串口诊断（v1.3.12）
+venv/bin/python tools/tests/test_gripper_fays_pairing.py
+venv/bin/python tools/tests/test_gripper_esp_binding.py
 # 真机相关测试需连接对应设备：d405_worker_test、d435_e2e_test、
 # d435_gui_smoke_test、mono_regression、d435_playback_test 等
 ```
@@ -1210,6 +1257,32 @@ i18n 文案经 `tr()` 翻译、PyQt5 信号参数用 `object` 封送大整数、
 
 ### 更新记录
 
+- **v1.3.12** — 接新夹爪不再需要开厂商工具包 GUI。新板子连不上时报的那句
+  `串口连接失败，无法查询绑定的 Fays 序列号: serial open/handshake failed: Write
+  timeout` 里，最要紧的问题是「板子到底在不在说话」，而主程序原本答不了。夹爪
+  右键菜单因此多了两个入口：**ESP32 串口诊断**（只读：打开串口把板上原样输出打
+  出来 —— USB 节点是硬件枚举出来的，固件死了节点照样在）与**读取/写入 Fays
+  绑定序列号**。写入走「探板 → 挑目标 → 确认 → `WF:<serial>` → 立刻 `QF` 回读」：
+  候选只列**当前在线**的 Fays 序列号、不给手输（写错会让这只夹爪静默指向另一台，
+  症状恰好就是「连不上」），回读对不上一律报警告而不是成功。三条离线操作共用一套
+  骨架：录制中或缺板子序列号不给进，执行前先把开着的夹爪关掉让出串口，完成后按
+  原样开回 —— 只读诊断一律开回，探板/写入失败不开回（板子状态未知，交回用户决定）。
+  诊断本身修掉一处「要证据的地方恰恰没取证」：`connect()` 握不上手就直接返回，
+  于是「收 3 秒一行都没有」这条最有分辨力的证据**从来没被采集过**。现在
+  `connect()` 拆成 `open_readonly()` + `handshake()` 两半，握不上手时会**再只读
+  打开一次**（一个字节都不写）收 3 秒：写阻塞的板子读这条路仍然通，于是能分清
+  「板子哑了」（0 行）与「板子在说话、只是不收主机写入」（有行）。另外四条串口
+  失败弹窗（启动失败 / 重读标定 / 读绑定 / 写绑定）原本只有一句「夹爪仍在设备
+  列表中」或干脆没有，现在统一追加从低到高的处置梯子：先断控制板自身的电 5 秒
+  （USB 节点由芯片的 USB 外设枚举，拔插 USB ≠ 芯片断电），再用工具包「测试连接」
+  读一次 MAC 判断主机能不能连上板子（走的是和刷写同一条下载通路），最后才重烧
+  固件；并提醒 `--erase` 是整片擦除、会把 NVS 里的 Fays 绑定一并清掉、烧完必须
+  重新写入序列号。梯子只挂在「板子没在服务串口」的两种报法（`Write timeout` 与
+  `serial handshake timeout after N attempts`）上 —— 口被别的进程占（`Errno 16`）
+  或没权限（`Errno 13`）也都被包在 `serial open/handshake failed:` 这句里，按前缀
+  判定会把主机侧问题误引到重烧固件上去。还有一处盲点：第一笔 `?` 就阻塞时日志里
+  一条 `connect attempt` 都不会有，事后翻日志会读成「根本没试过握手」，所以异常
+  路径现在额外打一行「中断于第几次写、之前读回过什么」。
 - **v1.3.11** — 手套链路整体换厂商 SDK v2.1.0（`tools/glove_sdk/`，取代 fork 的
   `core/glove_usb`），全栈因此锁到 **Python 3.10**：SDK 的 `algorithm/` 是 PyArmor
   按 3.10 ABI 加密的，3.11+ 下 `import sdk.api` 直接失败 ⇒ 丢的是**整条手套链路**，

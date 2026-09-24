@@ -316,6 +316,15 @@ fi
 # 解析 DSO 传递依赖的搜索路径：**不进 RUNPATH、不进 NEEDED**（现役二进制的 NEEDED
 # 里没有 jasper，实测），运行时照旧由 orb48_env/lib 那份 libjasper.so.7 兜。两处
 # 取值照抄现役的构建缓存（/tmp/ksq-bridge-build/CMakeCache.txt）。
+#
+# -Wl,--allow-shlib-undefined 同样是**必需**的，而且是为了同一类「只记 NEEDED、
+# 不列 IMPORTED」的 DSO：orb48_env/lib/libtiff.so.6 自己带着四个未定义的
+# `jpeg12_*@LIBJPEG_8.0`（由同目录 libjpeg.so.8 提供，靠它自己的 RPATH $ORIGIN
+# 兜）。ld 在**产出可执行文件**时默认把 DSO 的未定义符号当错误报（产出 .so 时才
+# 默认放行），而 -ljpeg 从来不在我们的链接行上，于是 collect2 直接退出。
+# 这个旗标只关掉链接期那道检查：不改 NEEDED、不改 RPATH（现役二进制里没有
+# libjpeg，实测），运行时照旧由 orb48_env/lib 那份 libjpeg.so.8 解析。
+# 代价是以后真漏链符号这里也不报 —— 所以紧接着补了 ldd -r 的装载期判据。
 
 ORB48_ENV="$NATIVE/FaysSense_VI_Kit_Release/thirdparty/orb48_env"
 OPENCV_PKG_LIB="$(cd "$OPENCV_DIR_48/../.." && pwd)"     # <pkg>/lib/cmake/opencv4 → <pkg>/lib
@@ -332,7 +341,7 @@ cmake -S "$BRIDGE_SRC" -B "$BRIDGE_BUILD" \
     -DFAYS_BRIDGE_SOURCE="$ORB_SRC/Examples/fays/fayssense_orb_slam.cc" \
     -DKSQ_ORB_LIBRARY_PATH="$ORB_LIB_DEST/libORB_SLAM3.so" \
     -DKSQ_FAYS_BINARY_SUFFIX="$BRIDGE_SUFFIX" \
-    -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,$ORB48_ENV/lib -Wl,-rpath-link,$OPENCV_PKG_LIB"
+    -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,$ORB48_ENV/lib -Wl,-rpath-link,$OPENCV_PKG_LIB -Wl,--allow-shlib-undefined"
 mark_cache_local "$BRIDGE_BUILD"
 if [ "$ALL_TARGETS" = 1 ]; then
     cmake --build "$BRIDGE_BUILD" -j"$JOBS"
@@ -352,6 +361,23 @@ if command -v readelf >/dev/null 2>&1; then
      期望: $EXPECTED_BRIDGE_RPATH
      实得: $got"
     echo "RPATH 与现役一致 ✓"
+fi
+
+# 成败判据 2：装载期必须干净。--allow-shlib-undefined 放开了链接期那道检查，
+# 这里就得自己顶上 —— `ldd -r` 会把桥接与它的整棵依赖（含 libORB_SLAM3.so）
+# 的未定义符号都解析一遍，缺一个就说明进程里也解析不到。顺带看住核心库与
+# Pangolin 的代际配对：核心库那个 `pangolin::Handler3D` 构造函数只由本地单体
+# libpangolin.so 导出，换成 vendor 的 pango_display 拆分库这里立刻报出来。
+if command -v ldd >/dev/null 2>&1; then
+    BRIDGE_RUNTIME_LDPATH="$ORB48_ENV/lib:$ORB_LIB_DEST:$NATIVE/FaysSense_VI_Kit_Release/lib/fays_atrak/$ARCH/Release"
+    # `|| true` 不是保险：grep -c 数到 0 个时退出码是 1，配上 set -euo pipefail
+    # 会把整个脚本在「一切正常」的那一次静默带走（装不上，也不报错）。
+    not_found="$(LD_LIBRARY_PATH="$BRIDGE_RUNTIME_LDPATH" ldd "$BRIDGE_BIN" 2>&1 | grep -c 'not found' || true)"
+    unresolved="$(LD_LIBRARY_PATH="$BRIDGE_RUNTIME_LDPATH" ldd -r "$BRIDGE_BIN" 2>&1 | grep -c 'undefined symbol' || true)"
+    [ "$not_found" = 0 ] && [ "$unresolved" = 0 ] \
+        || die "$BRIDGE_TARGET$BRIDGE_SUFFIX 装载期不干净: not found=$not_found undefined=$unresolved
+     用 LD_LIBRARY_PATH=$BRIDGE_RUNTIME_LDPATH ldd -r $BRIDGE_BIN 看细节"
+    echo "装载期 ldd not found=0、ldd -r undefined=0 ✓"
 fi
 
 # ---------------------------------------------------------------- ctest

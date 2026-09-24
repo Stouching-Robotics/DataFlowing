@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""跑本目录的 11 个 Python 契约测试（只读 ORB/桥接源码，不需要硬件）。
+"""跑本目录的 12 个 Python 契约测试（只读 ORB/桥接源码，不需要硬件）。
 
-为什么需要这个加载器，而不是 `python test_x.py`：这 11 份里有 4 份
+为什么需要这个加载器，而不是 `python test_x.py`：这 12 份里有 4 份
 （test_connect_debug、test_fays_sdk_shutdown、test_orb_stereo_baseline、
 test_slam_offline_evaluation）**没有 `unittest.main()` 入口** —— 直接执行等于
 只 import 一遍就退出，**rc=0、零输出**，看起来全绿。本加载器按模块加载，
@@ -12,7 +12,7 @@ test_slam_offline_evaluation）**没有 `unittest.main()` 入口** —— 直接
     python tests/run_contract_tests.py            # 从本树任意位置
     python core/gripper/orb_slam_src/tests/run_contract_tests.py
 
-退出码：0 = 全部加载成功（含已知的 4 个 RED —— 陈旧契约，见 README）；
+退出码：0 = 全部加载成功（含已知的 2 个 RED —— 陈旧契约，见 README）；
         1 = 有模块 import 失败（那才是环境问题）。
 """
 import importlib.util
@@ -31,6 +31,7 @@ TESTS = [
     "test_fays_sdk_shutdown",
     "test_orb_frame_lastkf_contract",
     "test_orb_mp_cleanup_contract",
+    "test_orb_preintegration_guard_contract",
     "test_orb_stereo_baseline",
     "test_slam_offline_evaluation",
 ]
@@ -61,11 +62,14 @@ def verdict(path: Path) -> tuple[str, bool]:
 def main() -> int:
     here = Path(__file__).resolve().parent
     broken = False
+    red = 0
     for stem in TESTS:
         text, failed = verdict(here / f"{stem}.py")
         broken = broken or failed
+        red += text.startswith("RED")
         print(f"  {stem:44s} {text}")
-    print(f"\n  共 {len(TESTS)} 个模块；RED 的 4 个是**本来就红**的陈旧契约"
+    # 红模块数**数出来**，不写字面量：加一个模块就手改一次数字，早晚改成假的
+    print(f"\n  共 {len(TESTS)} 个模块；RED 的 {red} 个是**本来就红**的陈旧契约"
           f"（见 README「Python 契约测试」）。")
     return 1 if broken else 0
 

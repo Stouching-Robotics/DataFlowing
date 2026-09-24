@@ -1,10 +1,12 @@
-import { memo, useState, type KeyboardEvent, type FocusEvent } from 'react';
+import { memo, useMemo, useState, type KeyboardEvent, type FocusEvent } from 'react';
 import { Handle, Position, type NodeProps } from '@xyflow/react';
 import { IconifyIcon } from '../IconifyIcon';
-import { useWorkflowStore } from '../../../store/workflowStore';
+import { DYNAMIC_INPUT_TYPES, dynamicInputKey, useWorkflowStore } from '../../../store/workflowStore';
+import { nodeLabel, portLabel, useLang, useT } from '../../../i18n';
 import { useUiStore } from '../../../store/uiStore';
 import { getNodeType } from './registry';
 import { NodeSettingsModal } from '../NodeSettingsModal';
+import { DeviceQualityModal } from '../DeviceQualityModal';
 import type { ConfigField, DeviceInputSource, WorkflowNodeData } from '../../../types/workflow';
 
 const CAMERA_TYPES = [
@@ -40,8 +42,55 @@ function cameraCategoryLabel(data: WorkflowNodeData): string {
   return DEVICE_CATEGORY_LABELS.mono_rgb;
 }
 
+/** 一条边的上游端口名 —— 取不到就回落到 sourceHandle 本身。 */
+function upstreamPortLabelOf(
+  source: { data?: { nodeType?: string; outputs?: { key: string; label: string }[] } },
+  sourceHandle: string | null | undefined,
+  lang: 'en' | 'zh',
+): string {
+  const outputs = source.data?.outputs || [];
+  const handle = String(sourceHandle ?? '');
+  const port = outputs.find((o) => o.key === handle)
+    || (outputs.length === 1 ? outputs[0] : null);
+  const raw = port?.label || handle;
+  // 用**上游**的类型翻译 —— data 这个 key 在不同卡上叫法不同
+  return portLabel(String(source.data?.nodeType ?? ''), port?.key || handle, raw, lang);
+}
+
+/**
+ * Data Quality 的输入端口是**按入边生成**的：每接一个设备就多一个口，口名就是
+ * 上游那个端口的名字。在此之前所有线都挤在同一个 ``data`` 口上，口名只能把几个
+ * 上游的名字拼起来（"Glove Sensor Data, RGB Video"），越长越读不出来。
+ *
+ * 端口 key 用 ``dynamicInputKey(源节点, 源端口)``——稳定且可重复，同一个上游
+ * 重连仍是同一个口。老图的边在 ``normalizeWorkflowGraphForEditor`` 里已经迁移过。
+ *
+ * 返回**字符串**（JSON）而不是数组：zustand 按 Object.is 比较，每次返回新数组会
+ * 让整块画布每个节点在任意 store 变动时都重渲染。
+ */
+function useDynamicInputs(nodeId: string, enabled: boolean, lang: 'en' | 'zh'): [string, string][] {
+  const encoded = useWorkflowStore((s) => {
+    if (!enabled) return '';
+    const incoming = s.edges.filter((e) => e.target === nodeId);
+    if (!incoming.length) return '';
+    return JSON.stringify(incoming.map((edge) => {
+      const source = s.nodes.find((n) => n.id === edge.source);
+      const key = dynamicInputKey(String(edge.source), edge.sourceHandle);
+      return [key, source ? upstreamPortLabelOf(source, edge.sourceHandle, lang) : key];
+    }));
+  });
+  return useMemo(
+    () => (encoded ? (JSON.parse(encoded) as [string, string][]) : []),
+    [encoded],
+  );
+}
+
 export const WorkflowNodeComponent = memo(function WorkflowNodeComponent({ data, selected, id }: NodeProps) {
   const d = data as unknown as WorkflowNodeData;
+  const isDynamicInputs = DYNAMIC_INPUT_TYPES.has(String(d.nodeType));
+  const t = useT();
+  const lang = useLang();
+  const dynamicInputs = useDynamicInputs(id, isDynamicInputs, lang);
   const hdrColor = d.color || '#475569';
   const isCamera = DEVICE_INPUT_TYPES.includes(d.nodeType);
   // 画布节点悬停说明:与侧边栏一致(功能 + 可连接性)
@@ -72,7 +121,8 @@ export const WorkflowNodeComponent = memo(function WorkflowNodeComponent({ data,
   // The node title is a fixed physical-device category (for example RGB-D
   // Camera). The editable field is kept independent and shows the concrete
   // source name/key; changing it must not rename the category.
-  const nodeTitle = isCamera ? cameraCategoryLabel(d) : d.label;
+  const nodeTitle = nodeLabel(String(d.nodeType),
+    isCamera ? cameraCategoryLabel(d) : d.label, lang);
   const deviceInputValue = isCamera && inputContextReady
     ? getDeviceInputValue(shownValue, availableInputs, d.nodeType, d.device_type)
     : '';
@@ -83,6 +133,23 @@ export const WorkflowNodeComponent = memo(function WorkflowNodeComponent({ data,
   const configuredDepth = String(d.config?.depth_camera || '');
   const selectedDepth = depthOptions.includes(configuredDepth) ? configuredDepth : '';
   const controlValue = isCamera ? deviceInputValue : shownValue;
+
+  // 输入端口 = 声明的口 + 动态口（Data Quality 专有，一条入边一个）。
+  //
+  // **有动态口时不再渲染那个空的声明口** —— 它只是个连接落点，跟动态口并排
+  // 就是多一行噪音（"Data" 下面跟着 "Glove Sensor Data"）。
+  // 再加一个设备怎么办：往**任意已有的口**上拖即可，onConnect 会把 targetHandle
+  // 重写成新上游自己的 key，于是长出一个新口。
+  const inputPorts = useMemo(() => [
+    ...(dynamicInputs.length ? [] : (d.inputs || []).map((inp) => ({
+      key: inp.key,
+      originalLabel: inp.label,
+      label: portLabel(String(d.nodeType), inp.key, inp.label, lang),
+    }))),
+    ...dynamicInputs.map(([key, label]) => ({
+      key, originalLabel: label, label,
+    })),
+  ], [d.inputs, dynamicInputs, d.nodeType, lang]);
 
   const resolveCameraSource = (value: string): DeviceInputSource | null => {
     const normalized = value.trim().toLowerCase();
@@ -119,7 +186,7 @@ export const WorkflowNodeComponent = memo(function WorkflowNodeComponent({ data,
     if (value === boundValue) return;  // 未改动 → 不弹窗
     const ok = await useUiStore.getState().confirm(
       `"${topField.label}" is overridden for this project ("${boundValue}"). Save "${value}" for this project only?`,
-      { title: 'Project override', confirmLabel: 'Save for this project' },
+      { title: t('node.projectOverride'), confirmLabel: t('node.saveForProject') },
     );
     if (!ok) return;
     useWorkflowStore.getState().setProjectBinding(id, value || null)
@@ -139,6 +206,11 @@ export const WorkflowNodeComponent = memo(function WorkflowNodeComponent({ data,
   // AI Annotation 卡片统一显示 ⚙,无论 local/api 都从同一设置弹窗配置
   const [showApiModal, setShowApiModal] = useState(false);
   const isAiAnnotation = d.nodeType === 'ai_annotation';
+
+  // Data Quality 走自己的设置弹窗 —— 按设备卡片分 tab,通用的 config_schema
+  // 那套平铺字段表达不了嵌套结构(见 DeviceQualityModal 的注释)。
+  const [showQualityModal, setShowQualityModal] = useState(false);
+  const isDataQuality = d.nodeType === 'data_quality';
 
   const updateTopConfig = (value: unknown, selectedSource: DeviceInputSource | null = null) => {
     if (!topField) return;
@@ -165,18 +237,28 @@ export const WorkflowNodeComponent = memo(function WorkflowNodeComponent({ data,
     if (!isBound) return;
     const ok = await useUiStore.getState().confirm(
       'Clear this project override? The workflow default will be used again.',
-      { title: 'Clear project override', confirmLabel: 'Clear' },
+      { title: t('node.clearOverride'), confirmLabel: t('node.clear') },
     );
     if (!ok) return;
     useWorkflowStore.getState().setProjectBinding(id, null)
       .catch((e) => useUiStore.getState().pushToast(`Failed to clear binding: ${e?.message || e}`, 'error'));
   };
 
+  // 卡片高度按**这张卡自己的端口数**算。
+  //
+  // 之前高度是画布统一算的（取所有模块声明端口数的最大值），对**运行时**才长出来的
+  // 动态口无能为力：Data Quality 接第 5 个设备时它根本没变，卡片被撑破。
+  // 改成每张卡按自己实际的口数算，设在自己身上（CSS 自定义属性会继承，
+  // 设在本节点上只影响本节点）。
+  const portRows = inputPorts.length + (d.outputs || []).length;
+  const cardHeight = Math.max(2, portRows) * 22 + 42;   // 22px/行 + 头部与内边距
+
   return (
     <div className="workflow-node" title={desc} style={{
       borderColor: selected ? '#3b82f6' : d.color || '#334155',
       boxShadow: selected ? `0 0 0 2px ${d.color}33` : undefined,
-    }}>
+      '--node-card-height': `${cardHeight}px`,
+    } as React.CSSProperties}>
       <div className="node-header" style={{ backgroundColor: `${hdrColor}22`, borderBottom: `1px solid ${hdrColor}44` }}>
         <div className="node-title-row">
           <IconifyIcon icon={d.icon} className="text-[18px]" />
@@ -191,8 +273,16 @@ export const WorkflowNodeComponent = memo(function WorkflowNodeComponent({ data,
           )}
           {isAiAnnotation && (
             <button
-              title="AI annotation settings"
+              title={t('node.aiSettings')}
               onClick={(e) => { e.stopPropagation(); setShowApiModal(true); }}
+              className="ml-1 text-[11px] text-cyan-400 border border-cyan-900 rounded px-1 cursor-pointer hover:bg-cyan-900/40 select-none">
+              ⚙
+            </button>
+          )}
+          {isDataQuality && (
+            <button
+              title="质检设置(按设备配置检查项)"
+              onClick={(e) => { e.stopPropagation(); setShowQualityModal(true); }}
               className="ml-1 text-[11px] text-cyan-400 border border-cyan-900 rounded px-1 cursor-pointer hover:bg-cyan-900/40 select-none">
               ⚙
             </button>
@@ -200,7 +290,7 @@ export const WorkflowNodeComponent = memo(function WorkflowNodeComponent({ data,
           {isBound && (
             <span
               onClick={clearBinding}
-              title="Project override — click to clear"
+              title={t('node.clearOverrideHint')}
               className="ml-1 text-[9px] text-blue-400 border border-blue-800 rounded px-1 cursor-pointer hover:bg-blue-900/40 align-middle select-none">
               P
             </span>
@@ -209,22 +299,31 @@ export const WorkflowNodeComponent = memo(function WorkflowNodeComponent({ data,
       </div>
       <div className="node-body">
         {/* Input ports: handle on left edge, label next to it (left-aligned) */}
-        {(d.inputs || []).map((inp) => (
+        {inputPorts.map((inp) => (
           <div key={inp.key} className="node-port" style={{ justifyContent: 'flex-start', paddingLeft: 0 }}>
             <Handle type="target" position={Position.Left} id={inp.key} style={{ position: 'relative', left: -6, transform: 'none', flexShrink: 0 }} />
-            <span>{inp.label}</span>
+            {/* 泛化端口显示上游端口名；原文案留作 hover 提示。
+                动态端口每个口只对应一条边，标签就是那条边的上游端口名。 */}
+            <span title={inp.originalLabel}>{inp.label}</span>
           </div>
         ))}
         {/* Output ports: label next to handle, handle on right edge (right-aligned) */}
         {(d.outputs || []).map((out) => (
           <div key={out.key} className="node-port" style={{ justifyContent: 'flex-end', paddingRight: 0 }}>
-            <span>{out.label}</span>
+            {/* 输出端口**保持原文案** —— 之前让透传节点的输出也跟着显示数据种类，
+                结果同一张卡上下两行是同一串文字（如 Data Quality 左右各一行
+                "tactile, device_status, imu"），看着很乱。端口文字只有输入侧需要
+                反映实际流经的数据；输出是本节点产出的什么，用声明文案更清楚。 */}
+            <span>{portLabel(String(d.nodeType), out.key, out.label, lang)}</span>
             <Handle type="source" position={Position.Right} id={out.key} style={{ position: 'relative', right: -6, transform: 'none', flexShrink: 0 }} />
           </div>
         ))}
       </div>
       {showApiModal && (
         <NodeSettingsModal nodeId={id} onClose={() => setShowApiModal(false)} />
+      )}
+      {showQualityModal && (
+        <DeviceQualityModal nodeId={id} onClose={() => setShowQualityModal(false)} />
       )}
     </div>
   );
@@ -356,6 +455,15 @@ function getTopConfigField(data: WorkflowNodeData): ConfigField | null {
     return schema.find((field) => field.name === 'vlm_provider') || {
       name: 'vlm_provider', type: 'select', label: 'VLM provider',
       default: 'local', options: ['local', 'api'],
+    };
+  }
+  if (data.nodeType === 'data_cleaning') {
+    // 异常处理方式,直接放头部 —— 检查哪些类型、阈值多少在 configSchema 里,
+    // 由后端 catalog 提供(与 mediapipe_hand 的 device 同款:优先读后端 schema,
+    // 读不到才用这里的兜底),避免前端硬编码与后端不一致。
+    return schema.find((field) => field.name === 'on_failure') || {
+      name: 'on_failure', type: 'select', label: 'On failure', default: 'review',
+      options: ['review', 'warn', 'block'],
     };
   }
   return null;

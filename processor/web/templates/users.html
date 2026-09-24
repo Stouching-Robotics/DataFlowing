@@ -5,12 +5,12 @@
 <div class="flex-1 overflow-y-auto hide-scrollbar p-6">
     <div class="flex items-center justify-between mb-6">
         <div>
-            <h2 class="text-lg font-semibold text-gray-200">User management</h2>
-            <p class="text-xs text-gray-500 mt-1">Manage accounts, roles and account lifecycle.</p>
+            <h2 class="text-lg font-semibold text-gray-200"><span data-i18n="users_title">User management</span></h2>
+            <p class="text-xs text-gray-500 mt-1"><span data-i18n="users_subtitle">Manage accounts, roles and account lifecycle.</span></p>
         </div>
         <button onclick="openUserModal()" class="bg-blue-600 hover:bg-blue-500 text-white text-xs px-3 py-1.5 rounded font-medium flex items-center gap-1.5">
             <iconify-icon icon="ant-design:plus-outlined" class="icon-sm"></iconify-icon>
-            New user
+            <span data-i18n="users_new">New user</span>
         </button>
     </div>
 
@@ -18,15 +18,15 @@
 
     <div class="grid grid-cols-3 gap-4 mb-6">
         <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
-            <div class="text-xs text-gray-500">Total users</div>
+            <div class="text-xs text-gray-500"><span data-i18n="users_total">Total users</span></div>
             <div id="count-total" class="text-2xl font-bold text-white mt-1">—</div>
         </div>
         <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
-            <div class="text-xs text-gray-500">Active users</div>
+            <div class="text-xs text-gray-500"><span data-i18n="users_active">Active users</span></div>
             <div id="count-active" class="text-2xl font-bold text-green-400 mt-1">—</div>
         </div>
         <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
-            <div class="text-xs text-gray-500">Disabled / expired</div>
+            <div class="text-xs text-gray-500"><span data-i18n="users_disabled_expired">Disabled / expired</span></div>
             <div id="count-inactive" class="text-2xl font-bold text-yellow-400 mt-1">—</div>
         </div>
     </div>
@@ -36,15 +36,15 @@
             <input id="user-search" oninput="renderUsers()" placeholder="Search username or email..."
                    class="bg-gray-800 text-sm rounded px-3 py-1.5 border border-gray-700 w-64 focus:border-blue-500 focus:outline-none">
             <select id="user-role-filter" onchange="loadUsers()" class="bg-gray-800 text-sm rounded px-3 py-1.5 border border-gray-700 focus:border-blue-500 focus:outline-none">
-                <option value="">All roles</option>
-                <option value="admin">Admin</option>
-                <option value="engineer">Engineer</option>
-                <option value="reviewer">Reviewer</option>
+                <option value="" data-i18n="users_all_roles">All roles</option>
+                <option value="admin" data-i18n="role_admin">Admin</option>
+                <option value="engineer" data-i18n="role_engineer">Engineer</option>
+                <option value="reviewer" data-i18n="role_reviewer">Reviewer</option>
             </select>
             <select id="user-status-filter" onchange="loadUsers()" class="bg-gray-800 text-sm rounded px-3 py-1.5 border border-gray-700 focus:border-blue-500 focus:outline-none">
-                <option value="">All status</option>
-                <option value="active">Active</option>
-                <option value="disabled">Disabled</option>
+                <option value="" data-i18n="users_all_status">All status</option>
+                <option value="active" data-i18n="status_active">Active</option>
+                <option value="disabled" data-i18n="status_disabled">Disabled</option>
             </select>
             <span id="user-list-count" class="text-xs text-gray-600 ml-auto"></span>
         </div>
@@ -52,32 +52,32 @@
             <table class="w-full text-sm" style="min-width: 900px">
                 <thead class="text-xs text-gray-500 bg-gray-950/40">
                     <tr>
-                        <th class="text-left font-medium px-4 py-3">User</th>
-                        <th class="text-left font-medium px-4 py-3">Role</th>
-                        <th class="text-left font-medium px-4 py-3">Status</th>
-                        <th class="text-left font-medium px-4 py-3">Last login</th>
-                        <th class="text-left font-medium px-4 py-3">Expires</th>
-                        <th class="text-right font-medium px-4 py-3">Actions</th>
+                        <th class="text-left font-medium px-4 py-3"><span data-i18n="col_user">User</span></th>
+                        <th class="text-left font-medium px-4 py-3"><span data-i18n="col_role">Role</span></th>
+                        <th class="text-left font-medium px-4 py-3"><span data-i18n="col_status">Status</span></th>
+                        <th class="text-left font-medium px-4 py-3"><span data-i18n="col_last_login">Last login</span></th>
+                        <th class="text-left font-medium px-4 py-3"><span data-i18n="col_expires">Expires</span></th>
+                        <th class="text-right font-medium px-4 py-3"><span data-i18n="col_actions">Actions</span></th>
                     </tr>
                 </thead>
                 <tbody id="users-body">
-                    <tr><td colspan="6" class="px-4 py-10 text-center text-gray-600">Loading...</td></tr>
+                    <tr><td colspan="6" class="px-4 py-10 text-center text-gray-600" data-i18n="loading">Loading...</td></tr>
                 </tbody>
             </table>
         </div>
     </div>
 
     <div class="mt-3 text-xs text-gray-600">
-        <span class="text-yellow-500">Disable</span> blocks login temporarily and keeps the account/data; it can be enabled later.
-        <span class="ml-3 text-red-400">Delete</span> permanently removes the account.
+        <span class="text-yellow-500" data-i18n="users_disable">Disable</span> <span data-i18n="users_disable_warning">blocks login temporarily and keeps the account/data; it can be enabled later.</span>
+        <span class="ml-3 text-red-400" data-i18n="users_delete">Delete</span> <span data-i18n="users_delete_warning">permanently removes the account.</span>
     </div>
 
     <div class="mt-6 bg-gray-900 rounded-lg border border-gray-800 p-4">
-        <h3 class="text-sm font-semibold text-gray-300 mb-3">Role permissions</h3>
+        <h3 class="text-sm font-semibold text-gray-300 mb-3"><span data-i18n="users_role_perms">Role permissions</span></h3>
         <div class="grid grid-cols-3 gap-4 text-xs">
-            <div><div class="text-blue-400 font-medium mb-1">Admin</div><div class="text-gray-500">Users, projects, workflows, processing, review and system settings</div></div>
-            <div><div class="text-purple-400 font-medium mb-1">Engineer</div><div class="text-gray-500">Projects, workflows, processing and review</div></div>
-            <div><div class="text-green-400 font-medium mb-1">Reviewer</div><div class="text-gray-500">View data, video review and annotation review</div></div>
+            <div><div class="text-blue-400 font-medium mb-1">Admin</div><div class="text-gray-500"><span data-i18n="users_perm_admin">Users, projects, workflows, processing, review and system settings</span></div></div>
+            <div><div class="text-purple-400 font-medium mb-1">Engineer</div><div class="text-gray-500"><span data-i18n="users_perm_engineer">Projects, workflows, processing and review</span></div></div>
+            <div><div class="text-green-400 font-medium mb-1">Reviewer</div><div class="text-gray-500"><span data-i18n="users_perm_reviewer">View data, video review and annotation review</span></div></div>
         </div>
     </div>
 </div>
@@ -85,7 +85,7 @@
 <div id="user-modal" class="hidden fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4">
     <div class="w-full max-w-lg bg-gray-900 border border-gray-700 rounded-lg shadow-2xl">
         <div class="flex items-center justify-between px-5 py-4 border-b border-gray-800">
-            <h3 id="user-modal-title" class="text-sm font-semibold text-gray-200">New user</h3>
+            <h3 id="user-modal-title" class="text-sm font-semibold text-gray-200"><span data-i18n="users_new">New user</span></h3>
             <button onclick="closeUserModal()" class="text-gray-500 hover:text-gray-200"><iconify-icon icon="ant-design:close-outlined"></iconify-icon></button>
         </div>
         <form id="user-form" onsubmit="saveUser(event)" class="p-5 space-y-4 text-xs">
@@ -105,7 +105,7 @@
             <label class="block text-gray-500">Email
                 <input id="user-email" type="email" maxlength="128" class="mt-1 w-full bg-gray-800 text-sm rounded px-3 py-2 border border-gray-700 focus:border-blue-500 focus:outline-none">
             </label>
-            <label class="block text-gray-500">Password <span id="password-hint" class="text-gray-600">(at least 6 characters)</span>
+            <label class="block text-gray-500"><span data-i18n="field_password">Password</span> <span id="password-hint" class="text-gray-600">(at least 6 characters)</span>
                 <input id="user-password" type="password" minlength="6" maxlength="128" class="mt-1 w-full bg-gray-800 text-sm rounded px-3 py-2 border border-gray-700 focus:border-blue-500 focus:outline-none">
             </label>
             <div class="grid grid-cols-2 gap-3">
@@ -115,13 +115,13 @@
                         <option value="disabled">Disabled</option>
                     </select>
                 </label>
-                <label class="block text-gray-500">Expires at <span class="text-gray-600">(optional)</span>
+                <label class="block text-gray-500"><span data-i18n="field_expires_at">Expires at</span> <span class="text-gray-600" data-i18n="users_optional">(optional)</span>
                     <input id="user-expires" type="datetime-local" class="mt-1 w-full bg-gray-800 text-sm rounded px-3 py-2 border border-gray-700 focus:border-blue-500 focus:outline-none">
                 </label>
             </div>
             <div class="flex justify-end gap-2 pt-2">
-                <button type="button" onclick="closeUserModal()" class="bg-gray-800 hover:bg-gray-700 text-gray-300 text-xs px-4 py-2 rounded">Cancel</button>
-                <button id="user-save-btn" type="submit" class="bg-blue-600 hover:bg-blue-500 text-white text-xs px-4 py-2 rounded font-medium">Create user</button>
+                <button type="button" onclick="closeUserModal()" class="bg-gray-800 hover:bg-gray-700 text-gray-300 text-xs px-4 py-2 rounded"><span data-i18n="cancel">Cancel</span></button>
+                <button id="user-save-btn" type="submit" class="bg-blue-600 hover:bg-blue-500 text-white text-xs px-4 py-2 rounded font-medium"><span data-i18n="users_create">Create user</span></button>
             </div>
         </form>
     </div>

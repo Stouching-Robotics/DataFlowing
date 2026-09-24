@@ -18,6 +18,11 @@ LEGACY_TO_CANONICAL: dict[str, str] = {
     "black_hand_rgb_3d": "rgb_to_2d_black_glove",
     "stereo_triangulate": "rgbd_to_3d_bare_hand",
     "black_glove_hand": "rgbd_to_3d_black_glove",
+    # 质量门禁两个卡片的合并：ai_quality_review（视频检查 + AI 标注覆盖率）
+    # 与 data_cleaning（按数据类型清洗）功能重叠，合并为 data_quality。
+    # 端口 key 刻意不变（data / reviewed），旧工作流的连线可直接复用。
+    "ai_quality_review": "data_quality",
+    "data_cleaning": "data_quality",
 }
 
 RGB_2D_TYPES = {
@@ -175,7 +180,9 @@ def migrate_graph_types(graph: dict | None) -> tuple[dict, bool]:
         handle = str(edge.get("sourceHandle") or "")
         result_output = (
             "annotation" if source_type in {"annotation", "ai_annotation"}
-            else "reviewed" if source_type in {"human_review", "ai_quality_review"}
+            # data_quality 是 ai_quality_review 合并后的 slug；node_types 存的是
+            # canonical_node_type() 规范化后的值，所以这里只可能见到新名。
+            else "reviewed" if source_type in {"human_review", "data_quality"}
             else ""
         )
         if result_output and handle == "result":

@@ -6,6 +6,7 @@ import * as api from '../api/workflows';
 import { getProjectInputSources, getProjectBindings, putProjectBinding } from '../api/projects';
 import { getDeviceInputSources } from '../api/devices';
 import { canonicalNodeType, getNodeType } from '../components/WorkflowCanvas/nodes/registry';
+import { currentLang, translate } from '../i18n';
 import { useUiStore } from './uiStore';
 
 interface HistoryEntry {
@@ -268,7 +269,10 @@ function _migrateWorkflowGraph(graph: { nodes?: Node<WorkflowNodeData>[]; edges?
     let nextHandle = sourceHandle;
     const resultOutput = sourceType === 'annotation' || sourceType === 'ai_annotation'
       ? 'annotation'
-      : sourceType === 'human_review' || sourceType === 'ai_quality_review'
+      // 判的是 canonicalNodeType() 之后的类型，所以写新名 —— 之前写旧 slug
+      // 'ai_quality_review' 永远匹配不上。后端 workflow_types.py 用的是
+      // {"human_review", "data_quality"}，这行本来就该与它一致。
+      : sourceType === 'human_review' || sourceType === 'data_quality'
         ? 'reviewed'
         : '';
     if (resultOutput && sourceHandle === 'result') {
@@ -343,14 +347,18 @@ function _hydrateNode(node: Node<WorkflowNodeData>): Node<WorkflowNodeData> {
     'stereo_rgbd_camera',
     'rgbd_to_3d_bare_hand', 'rgb_to_2d_bare_hand',
     'rgbd_to_3d_black_glove', 'rgb_to_2d_black_glove', 'annotation', 'ai_annotation',
-    'human_review', 'ai_quality_review', 'lerobot_export', 'hdf5_export',
-    'gripper_device',
+    'human_review', 'lerobot_export', 'hdf5_export', 'gripper_device',
+    // ★ 这里判的是 canonicalNodeType() **之后**的类型，所以必须写新名。
+    //   之前写的是旧 slug 'ai_quality_review' —— 永远匹配不上（nodeType 那时已经是
+    //   'data_quality'），于是老图一直显示存下来的旧标签 "AI Quality Review"。
+    'data_quality',
   ]);
   const controlledPorts = new Set([
     'rgb_camera', 'mono_camera', 'fisheye_camera', 'rgbd_camera',
     'stereo_camera', 'stereo_rgbd_camera', 'glove_sensor', 'gripper_device', 'mediapipe_hand', 'annotation',
-    'ai_annotation', 'human_review', 'ai_quality_review', 'lerobot_export',
-    'hdf5_export',
+    'ai_annotation', 'human_review', 'lerobot_export', 'hdf5_export',
+    // 同上：写 canonical 名，否则端口用的是图里存下来的旧值
+    'data_quality',
     'rgbd_to_3d_bare_hand', 'rgb_to_2d_bare_hand',
     'rgbd_to_3d_black_glove', 'rgb_to_2d_black_glove',
   ]);
@@ -379,13 +387,43 @@ function _hydrateNode(node: Node<WorkflowNodeData>): Node<WorkflowNodeData> {
 }
 
 /** Normalize a graph from either the API or an old localStorage draft. */
+/** 输入端口按**入边**动态生成的节点类型 —— 目前只有数据质检这一张卡。 */
+export const DYNAMIC_INPUT_TYPES = new Set(['data_quality']);
+
+/** 一条入边在动态端口节点上对应的输入 key。稳定可重复：同一个上游重连仍是同一个口。 */
+export function dynamicInputKey(sourceId: string, sourceHandle?: string | null): string {
+  return `${sourceId}:${sourceHandle || ''}`;
+}
+
+/**
+ * 把指向动态端口节点的边的 ``targetHandle`` 迁成动态 key。
+ *
+ * 老图里这些边全指向统一的 ``"data"``。不迁的话，节点改成按入边画口之后，
+ * 边会指着一个不存在的口 —— 画面上表现为**断线**。
+ *
+ * 幂等：已经是动态 key 的边原样返回。只在打开工作流时跑，保存后才落盘。
+ */
+function _migrateDynamicTargetHandles(
+  nodes: Node<WorkflowNodeData>[] | undefined,
+  edges: Edge[] | undefined,
+): Edge[] {
+  const types = new Map(
+    (nodes || []).map((n) => [String(n.id), canonicalNodeType(n.data?.nodeType)]),
+  );
+  return (edges || []).map((edge) => {
+    if (!DYNAMIC_INPUT_TYPES.has(types.get(String(edge.target)) || '')) return edge;
+    const wanted = dynamicInputKey(String(edge.source), edge.sourceHandle);
+    return edge.targetHandle === wanted ? edge : { ...edge, targetHandle: wanted };
+  });
+}
+
 export function normalizeWorkflowGraphForEditor(
   graph: { nodes?: Node<WorkflowNodeData>[]; edges?: Edge[] },
 ) {
   const migrated = _migrateWorkflowGraph(graph);
   return {
     nodes: (migrated.nodes || []).map(_hydrateNode),
-    edges: migrated.edges || [],
+    edges: _migrateDynamicTargetHandles(migrated.nodes, migrated.edges),
   };
 }
 
@@ -551,12 +589,25 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       const inpLabel = tgt?.data?.inputs?.find((i) => i.key === (conn.targetHandle || tgt?.data?.inputs?.[0]?.key))?.label
         || tgt?.data?.inputs?.[0]?.label || 'input';
       const srcOut = src?.data?.outputs?.find((o) => o.key === (conn.sourceHandle || src?.data?.outputs?.[0]?.key));
+      // store 不是组件，不能调 hook —— 直接取当前语言翻译
+      const tt = (k: string) => translate(k, currentLang());
       const hint = srcOut && srcOut.key !== 'data'
-        ? `Port mismatch: this input only accepts "${inpLabel}" data, but "${srcOut.label || srcOut.key}" outputs "${srcOut.key}"`
-        : 'Self-connection is not allowed';
-      useUiStore.getState().pushToast(`Cannot connect: ${hint}`, 'error');
+        ? `${tt('toast.portMismatch')} (${inpLabel} ← ${srcOut.label || srcOut.key})`
+        : tt('toast.selfEdge');
+      useUiStore.getState().pushToast(`${tt('toast.cannotConnect')}${hint}`, 'error');
       return s;
     }
+    // Data Quality 的输入端口按**入边**动态生成（一条线一个口），所以落点要重写成
+    // 这条边专属的 key，而不是所有线共用的 "data"。
+    //
+    // 挂在有效性检查之后：isConnectionValid 读的是**声明的**端口（data），
+    // 换成动态 key 它找不到会回落到 inputs[0]，语义不变，但没必要多绕一层。
+    const targetNodeType = canonicalNodeType(
+      s.nodes.find((n) => n.id === conn.target)?.data?.nodeType ?? '');
+    const next = DYNAMIC_INPUT_TYPES.has(targetNodeType)
+      ? { ...conn, targetHandle: dynamicInputKey(conn.source, conn.sourceHandle) }
+      : conn;
+
     // 重复连线检查:同一 源端口→目标端口 已存在时阻止再次添加。
     // React Flow 同边 id 冲突会导致后加的连线不显示(看起来"没连上")。
     const isDup = (c: typeof conn) => s.edges.some((e) =>
@@ -564,11 +615,11 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       && e.target === c.target
       && (e.sourceHandle || null) === (c.sourceHandle || null)
       && (e.targetHandle || null) === (c.targetHandle || null));
-    if (isDup(conn)) {
-      useUiStore.getState().pushToast('Already connected: this port pair is already linked.', 'error');
+    if (isDup(next)) {
+      useUiStore.getState().pushToast(translate('toast.dupEdge', currentLang()), 'error');
       return s;
     }
-    let edges = addEdge(conn, s.edges);
+    let edges = addEdge(next, s.edges);
 
     // 双目打包连线:Stereo Video 卡(输出 video_left + video_right 双端口)
     // 任一端口连到目标时,自动把另一端口也连到同一目标输入 ——
@@ -582,13 +633,13 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       const mainHandle = conn.sourceHandle || 'video_left';
       const sibling = mainHandle === 'video_left' ? 'video_right' : 'video_left';
       const siblingConn = {
-        ...conn,
+        ...next,
         sourceHandle: sibling,
       };
       if (!isDup(siblingConn) && isConnectionValid(siblingConn, s.nodes)) {
         edges = addEdge(siblingConn, edges);
         useUiStore.getState().pushToast(
-          `Stereo pair connected: ${mainHandle} + ${sibling} both linked.`, 'info');
+          `${translate('toast.stereoPair', currentLang())}: ${mainHandle} + ${sibling}`, 'info');
       }
     }
     saveDraft({ ...s, edges });

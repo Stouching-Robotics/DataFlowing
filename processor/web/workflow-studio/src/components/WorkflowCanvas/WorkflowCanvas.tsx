@@ -2,7 +2,7 @@ import { useCallback, useMemo, useRef } from 'react';
 import { ReactFlow, Background, MiniMap, Controls, useReactFlow, type NodeTypes, type EdgeTypes } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { useWorkflowStore, nextNodeId } from '../../store/workflowStore';
-import { getAllNodeTypes, getMaxPortRows } from './nodes/registry';
+import { getAllNodeTypes } from './nodes/registry';
 import { WorkflowNodeComponent } from './nodes/WorkflowNode';
 import { DeletableEdge } from './edges/DeletableEdge';
 import type { DeviceInputSource, WorkflowNodeData } from '../../types/workflow';
@@ -19,10 +19,6 @@ export function WorkflowCanvas() {
   const workflowId = useWorkflowStore((s) => s.workflowId);
   const rf = useReactFlow();
   const wrapperRef = useRef<HTMLDivElement>(null);
-
-  // Uniform card height: compute from max port rows across all node types
-  const maxRows = useMemo(() => getMaxPortRows(), []);
-  const cardHeight = maxRows * 22 + 42; // 22px per row + header+padding
 
   const onDragOver = useCallback((e: React.DragEvent) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; }, []);
 
@@ -98,7 +94,7 @@ export function WorkflowCanvas() {
 
   return (
     <div ref={wrapperRef} className="flex-1 h-full" onDragOver={onDragOver} onDrop={onDrop}
-      style={{ '--node-card-height': `${cardHeight}px` } as React.CSSProperties}>
+>
       <ReactFlow
         key={workflowId || 'blank'}
         nodes={nodes} edges={edges}

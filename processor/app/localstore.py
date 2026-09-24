@@ -704,6 +704,36 @@ def write_episode_state(episode_id: str, state: dict) -> None:
     invalidate_session_cache()
 
 
+def mutate_episode_state(
+    episode_id: str,
+    mutator: Callable[[dict], _MutationResult],
+) -> _MutationResult | None:
+    """Atomically read, mutate, and persist one episode's state.
+
+    ``read_episode_state`` / ``write_episode_state`` each take ``_lock`` on
+    their own, so a read-modify-write *across* them is not atomic.  Two writers
+    that overlap lose one side's fields — and when the lost field is ``status``,
+    a batch already pushed back to ``to_review`` can be silently restored to
+    ``reviewed``.
+
+    That window is not theoretical: the post-run quality tasks (the video gate
+    and data quality) both decode the same episode's video and therefore finish
+    within milliseconds of each other, which is exactly when they overlap.
+
+    Mutate the ``state`` dict in place inside ``mutator``; the return value is
+    passed straight through.  Returns ``None`` (and writes nothing) when the
+    episode has no state — callers must not invent one.
+    """
+    key = str(episode_id)
+    with _lock:
+        state = read_episode_state(key)
+        if not state:
+            return None
+        result = mutator(state)
+        write_episode_state(key, state)
+        return result
+
+
 def set_episode_status(episode_id: str, status: str) -> dict:
     with _lock:
         state = read_episode_state(episode_id)

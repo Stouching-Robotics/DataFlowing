@@ -9,6 +9,7 @@ import { ToastContainer, GlobalDialog } from './components/ui/AppDialogs';
 import { deleteWorkflow, getWorkflow, getWorkflowUsage, listModules, updateWorkflow } from './api/workflows';
 import { getCurrentUser } from './api/auth';
 import { hydrateNodeTypes } from './components/WorkflowCanvas/nodes/registry';
+import { useT } from './i18n';
 import type { WorkflowListItem } from './types/workflow';
 
 /**
@@ -55,6 +56,8 @@ function graphsMatch(left: any, right: any) {
 }
 
 export default function App() {
+  const t = useT();
+
   useEffect(() => {
     listModules().then((items) => hydrateNodeTypes(items as any)).catch(() => {
       // The built-in registry remains available when the API is offline.
@@ -200,6 +203,7 @@ interface ConfirmDialogState {
 }
 
 function WorkflowToolbar() {
+  const t = useT();
   const { workflowName, workflowId, isDirty, isSaving, workflows, userRole, isPresetWorkflow, saveWorkflowSafe, saveWorkflowAs, loadWorkflow, loadWorkflowList } =
     useWorkflowStore();
   const [editingName, setEditingName] = useState(false);
@@ -499,7 +503,7 @@ function WorkflowToolbar() {
         onClick={() => loadWorkflowList()}
         className="bg-transparent border border-gray-700 rounded px-1.5 py-0.5 text-xs font-semibold text-gray-200 focus:outline-none focus:border-blue-500 cursor-pointer max-w-[200px]"
       >
-        {!workflowId && <option value="" disabled hidden>New Workflow</option>}
+        {!workflowId && <option value="" disabled hidden>{t('app.newWorkflow')}</option>}
         {workflows.map((w) => (
           <option key={w.id} value={w.id} className="bg-gray-800 text-gray-200">{w.name}{w.is_preset ? ' (Template)' : ''}</option>
         ))}
@@ -524,7 +528,7 @@ function WorkflowToolbar() {
           }}
           title="Click to rename workflow"
           className="text-xs font-semibold text-gray-200 hover:text-blue-400 hover:underline cursor-pointer whitespace-nowrap">
-          {workflowName} {isPresetWorkflow && <span className="text-[9px] text-yellow-400 border border-yellow-700 rounded px-1 ml-1 align-middle">Template</span>}
+          {workflowName} {isPresetWorkflow && <span className="text-[9px] text-yellow-400 border border-yellow-700 rounded px-1 ml-1 align-middle">{t('app.template')}</span>}
           {!presetReadOnly && <span className="text-[10px] text-gray-500 ml-1">✎</span>}
         </span>
       )}
@@ -534,14 +538,14 @@ function WorkflowToolbar() {
         onClick={() => { loadWorkflowList(); openTemplateDialog(); }}
         title="Start a new workflow from a template (processing chain) or a blank canvas"
         className="text-[11px] text-blue-400 hover:text-blue-300 hover:bg-blue-900/30 border border-blue-900/60 px-1.5 py-0.5 rounded">
-        <IconifyIcon icon="ant-design:project-outlined" className="text-[12px] align-[-2px] mr-0.5" /> Template
+        <IconifyIcon icon="ant-design:project-outlined" className="text-[12px] align-[-2px] mr-0.5" />{' '}{t('app.template')}
       </button>
       {isAdmin && workflowId && (
         <button onClick={togglePreset} className="text-[11px] text-yellow-400 hover:text-yellow-300 hover:bg-yellow-900/30 px-1.5 py-0.5 rounded">
-          {isPresetWorkflow ? 'Unset Template' : 'Make Template'}
+          {isPresetWorkflow ? t('app.unsetTemplate') : t('app.makeTemplate')}
         </button>
       )}
-      <button onClick={saveSafe} disabled={isSaving} className="text-[11px] bg-blue-600 hover:bg-blue-500 text-white px-2 py-0.5 rounded disabled:opacity-50">{isSaving ? '...' : 'Save'}</button>
+      <button onClick={saveSafe} disabled={isSaving} className="text-[11px] bg-blue-600 hover:bg-blue-500 text-white px-2 py-0.5 rounded disabled:opacity-50">{isSaving ? '...' : t('app.save')}</button>
       {workflowId && !presetReadOnly && (
         <button onClick={() => setConfirmDialog({
           title: 'Delete this workflow?',
@@ -556,7 +560,7 @@ function WorkflowToolbar() {
             else useWorkflowStore.getState().newWorkflow();
             syncUrl();
           },
-        })} className="text-[11px] text-red-400 hover:text-red-300 hover:bg-red-900/30 px-1.5 py-0.5 rounded">Del</button>
+        })} className="text-[11px] text-red-400 hover:text-red-300 hover:bg-red-900/30 px-1.5 py-0.5 rounded">{t('app.del')}</button>
       )}
       {confirmDialog && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 p-4" role="presentation">
@@ -571,7 +575,7 @@ function WorkflowToolbar() {
               </div>
             </div>
             <div className="flex justify-end gap-2 px-4 py-3">
-              <button type="button" disabled={dialogBusy} onClick={() => setConfirmDialog(null)} className="rounded border border-gray-700 px-3 py-1.5 text-xs text-gray-300 hover:bg-gray-800 disabled:opacity-50">Cancel</button>
+              <button type="button" disabled={dialogBusy} onClick={() => setConfirmDialog(null)} className="rounded border border-gray-700 px-3 py-1.5 text-xs text-gray-300 hover:bg-gray-800 disabled:opacity-50">{t('app.cancel')}</button>
               {confirmDialog.secondaryLabel && (
                 <button type="button" disabled={dialogBusy} onClick={confirmDialogSecondary}
                         className="rounded border border-gray-700 px-3 py-1.5 text-xs text-gray-300 hover:bg-gray-800 disabled:opacity-50">
@@ -589,7 +593,7 @@ function WorkflowToolbar() {
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 p-4" role="presentation">
           <div className="w-full max-w-sm rounded-lg border border-gray-700 bg-gray-900 shadow-2xl" role="dialog" aria-modal="true" aria-labelledby="template-dialog-title">
             <div className="border-b border-gray-800 px-4 py-3">
-              <h2 id="template-dialog-title" className="text-sm font-semibold text-gray-100">Start from Template</h2>
+              <h2 id="template-dialog-title" className="text-sm font-semibold text-gray-100">{t('app.startFromTemplate')}</h2>
               <p className="mt-1 text-xs leading-5 text-gray-400">
                 Templates contain the processing chain only — input device cards appear as your
                 collectors report data. Applying a template replaces the current canvas.
@@ -609,15 +613,15 @@ function WorkflowToolbar() {
                 </button>
               ))}
               {!workflows.some((w) => w.is_preset) && (
-                <div className="text-[11px] text-gray-600 px-1 pt-1">No templates available — an admin can mark workflows as templates.</div>
+                <div className="text-[11px] text-gray-600 px-1 pt-1">{t('app.noTemplates')}</div>
               )}
               <div className="text-[10px] text-gray-600 pt-1">
-                Applying a template replaces the current canvas — your workflow name and ID stay the same.
+                {t('app.templateHint')}
               </div>
             </div>
             <div className="flex justify-end gap-2 px-4 py-3">
               <button type="button" disabled={templateBusy} onClick={() => setTemplateDialog(false)}
-                className="rounded border border-gray-700 px-3 py-1.5 text-xs text-gray-300 hover:bg-gray-800 disabled:opacity-50">Cancel</button>
+                className="rounded border border-gray-700 px-3 py-1.5 text-xs text-gray-300 hover:bg-gray-800 disabled:opacity-50">{t('app.cancel')}</button>
             </div>
           </div>
         </div>

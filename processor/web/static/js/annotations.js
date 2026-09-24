@@ -475,10 +475,10 @@ async function aiAnnotate() {
             try {
                 st = await (await fetch(`/api/v1/episode/${currentEpisodeId}/ai-annotate/status`)).json();
             } catch (_) { /* keep polling */ }
-            if (st.status === 'signal_segmenting') setLabel('<iconify-icon icon="ant-design:loading-outlined" class="icon-sm animate-spin"></iconify-icon> <span>切段中…</span>');
-            else if (st.status === 'vlm_analyzing') setLabel('<iconify-icon icon="ant-design:loading-outlined" class="icon-sm animate-spin"></iconify-icon> <span>VLM 分析中…</span>');
-            else if (st.status === 'writing') setLabel('<iconify-icon icon="ant-design:loading-outlined" class="icon-sm animate-spin"></iconify-icon> <span>写入…</span>');
-            else if (st.status === 'exporting') setLabel('<iconify-icon icon="ant-design:loading-outlined" class="icon-sm animate-spin"></iconify-icon> <span>写入数据集…</span>');
+            if (st.status === 'signal_segmenting') setLabel('<iconify-icon icon="ant-design:loading-outlined" class="icon-sm animate-spin"></iconify-icon> <span>' + t('ai_status_segmenting') + '</span>');
+            else if (st.status === 'vlm_analyzing') setLabel('<iconify-icon icon="ant-design:loading-outlined" class="icon-sm animate-spin"></iconify-icon> <span>' + t('ai_status_analyzing') + '</span>');
+            else if (st.status === 'writing') setLabel('<iconify-icon icon="ant-design:loading-outlined" class="icon-sm animate-spin"></iconify-icon> <span>' + t('ai_status_writing') + '</span>');
+            else if (st.status === 'exporting') setLabel('<iconify-icon icon="ant-design:loading-outlined" class="icon-sm animate-spin"></iconify-icon> <span>' + t('ai_status_exporting') + '</span>');
             if (st.status === 'done') break;
             if (st.status === 'failed') {
                 console.warn('AI annotation failed:', st.detail);

@@ -23,7 +23,8 @@ import asyncio
 import os
 from pathlib import Path
 
-from app.localstore import read_episode_state, write_episode_state
+# 状态写入走 localstore.mutate_episode_state（锁内 RMW），在用到的地方局部导入 ——
+# 见 _apply_video_quality_result 的注释。
 
 
 DEFAULT_SAMPLE_INTERVAL_SEC = 0.5
@@ -330,19 +331,29 @@ async def check_video_quality_async(batch_dir: str | Path,
 
 def _apply_video_quality_result(episode_id: str, report: dict) -> None:
     """Persist the result while preserving the two-state review UI."""
-    state = read_episode_state(episode_id)
-    state["video_quality_status"] = "passed" if report.get("passed") else "failed"
-    state["video_quality_report"] = report
-    current = str(state.get("status") or "")
-    if report.get("passed"):
-        if current in {"to_review", "completed", "reviewed"}:
-            state["status"] = "reviewed"
-            if not state.get("approved_at"):
-                state["approved_at"] = _utcnow()
-    elif current in {"processing", "completed", "reviewed", "approved", "failed"}:
-        state["status"] = "to_review"
-        state["approved_at"] = None
-    write_episode_state(episode_id, state)
+    from app.localstore import mutate_episode_state
+    from app.processing.cleaning.store import is_approval_blocked
+
+    def _apply(state: dict) -> None:
+        state["video_quality_status"] = "passed" if report.get("passed") else "failed"
+        state["video_quality_report"] = report
+        current = str(state.get("status") or "")
+        if report.get("passed"):
+            # 视频干净 ≠ 数据干净。数据质检判 FAIL/ERROR 的批次留了粘性标记，
+            # 这里必须让路 —— 否则质检刚推回 to_review，又被本函数置成 reviewed。
+            if (current in {"to_review", "completed", "reviewed"}
+                    and not is_approval_blocked(state)):
+                state["status"] = "reviewed"
+                if not state.get("approved_at"):
+                    state["approved_at"] = _utcnow()
+        elif current in {"processing", "completed", "reviewed", "approved", "failed"}:
+            state["status"] = "to_review"
+            state["approved_at"] = None
+
+    # 锁内 RMW：本函数会改 ``status``，而数据质检任务在同一个 run 完成后并发
+    # 写同一份 state。分开 read/write 的话，质检那边写回的旧快照会把这里的
+    # to_review 冲掉 —— 失败批次看上去像已通过。
+    mutate_episode_state(episode_id, _apply)
 
 
 def _utcnow() -> str:

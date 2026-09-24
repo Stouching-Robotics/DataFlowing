@@ -914,10 +914,30 @@ def _systemd_available() -> bool:
     return rc in (0, 1) and out.strip() in ("running", "degraded", "starting")
 
 
+# scripts/systemd/host-units/ 那套手工维护的生产单元。它与本脚本渲染的
+# egodata-backend / egodata-workers 是**两套不同的东西**, 并存会抢同一个
+# 8000 端口 —— 谁后启动谁 bind 失败, 然后按 Restart 策略反复重启。
+HOST_UNIT_NAMES = ("egodata-storage", "egodata-db-tunnel", "egodata-api",
+                   "egodata-worker", "egodata-stack-coordinator")
+
+
+def _unit_dir() -> Path:
+    return Path.home() / ".config" / "systemd" / "user"
+
+
+def _host_units_active() -> bool:
+    """本机是否已装 host-units 那套手工单元.
+
+    只要看到 egodata-api.service 就认定是 —— 该单元不由本脚本生成, 它的存在
+    就说明这台机器的服务是由 scripts/systemd/host-units/install.sh 管的。
+    """
+    return (_unit_dir() / "egodata-api.service").is_file()
+
+
 def phase_services_systemd(ports: dict, vllm_enabled: bool) -> None:
     """渲染并安装 systemd 用户级单元 + enable --now (开机自启)."""
     src_dir = PROJECT_ROOT / "scripts" / "systemd"
-    dst_dir = Path.home() / ".config" / "systemd" / "user"
+    dst_dir = _unit_dir()
     dst_dir.mkdir(parents=True, exist_ok=True)
 
     vllm_url = f"http://127.0.0.1:{ports['vllm_port']}/v1/chat/completions"
@@ -1094,6 +1114,17 @@ def phase_services(rep: dict, ports: dict, vllm_enabled: bool, args) -> None:
         phase_services_foreground(ports, vllm_enabled, rep)
         return
     if _systemd_available():
+        if _host_units_active():
+            # 这台机器的 systemd 已经由 scripts/systemd/host-units/ 接管。
+            # 再渲染一套 egodata-backend/egodata-workers 会跟 egodata-api
+            # 抢 8000 端口, 而且那两个单元指向的 Data Acquisition 目录早已
+            # 废弃。这里什么都不装, 直接沿用现有单元。
+            warn("已检测到 scripts/systemd/host-units/ 那套手工单元 "
+                 "(egodata-api / worker / storage / db-tunnel)。")
+            warn("本次跳过 systemd 单元安装, 以免与它争抢端口。")
+            warn("服务管理: systemctl --user restart egodata-api "
+                 "(前端与后端是同一个进程)")
+            return
         phase_services_systemd(ports, vllm_enabled)
     else:
         warn("systemd 用户实例不可用 → 退回前台监督模式")
@@ -1147,10 +1178,13 @@ def phase_report(rep: dict, ports: dict, vllm_enabled: bool, args) -> None:
             + ("   (⚠️ 已避开被占用的 8001)" if ports["vllm_switched"] else ""))
 
     if not IS_WINDOWS and not args.no_services:
-        states = "  ".join(
-            f"{n}: {_unit_state(n)}"
-            for n in (["egodata-backend", "egodata-workers"]
-                      + (["egodata-vllm"] if vllm_enabled else [])))
+        if _host_units_active():
+            managed = list(HOST_UNIT_NAMES)
+        else:
+            managed = ["egodata-backend", "egodata-workers"]
+        states = "  ".join(f"{n}: {_unit_state(n)}"
+                           for n in managed
+                           + (["egodata-vllm"] if vllm_enabled else []))
         say(f"  systemd 服务状态: {states}")
         say("  开机自启: 已启用 (loginctl linger)")
 

@@ -788,7 +788,9 @@ _RE_TASKS: dict[str, dict] = {}
 _RE_TASKS_DIR = STATE_ROOT / "re_export_tasks"
 
 _PASSTHROUGH_TYPES = {
-    "annotation", "human_review", "ai_annotation", "ai_quality_review",
+    # data_quality 由 ai_quality_review + data_cleaning 合并而来；此处的 t 已过
+    # canonical_node_type()，旧 slug 不会出现。
+    "annotation", "human_review", "ai_annotation", "data_quality",
 }
 _CAMERA_TYPES = {"rgb_camera", "fisheye_camera", "rgbd_camera", "stereo_camera",
                  "stereo_rgbd_camera", "mono_camera"}

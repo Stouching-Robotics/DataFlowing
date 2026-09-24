@@ -1,4 +1,6 @@
-import { useState } from 'react';
+import { createPortal } from 'react-dom';
+import { useEffect, useState } from 'react';
+import { useT } from '../../i18n';
 import { useWorkflowStore } from '../../store/workflowStore';
 import type { WorkflowNodeData } from '../../types/workflow';
 
@@ -83,6 +85,7 @@ function entriesFromConfig(config: Record<string, unknown> | undefined): ApiEntr
  * `api_providers` 数组 + 首套同步写回旧字段(兼容旧运行链路)。
  */
 export function NodeSettingsModal({ nodeId, onClose }: Props) {
+  const t = useT();
   const node = useWorkflowStore((s) => s.nodes.find((n) => n.id === nodeId));
   const data = node?.data as unknown as WorkflowNodeData | undefined;
   const schema = data?.configSchema || [];
@@ -100,6 +103,19 @@ export function NodeSettingsModal({ nodeId, onClose }: Props) {
     const value = String(data?.config?.prompt_language || languageField?.default || 'zh').toLowerCase();
     return value === 'en' ? 'en' : 'zh';
   });
+
+  // Esc 关闭 —— 与 DeviceQualityModal 同一处理：捕获阶段拦下，别让 React Flow
+  // 同时清掉画布选择。两个弹窗都在同一块画布上，Esc 行为必须一致。
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.stopPropagation();
+      e.preventDefault();
+      onClose();
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [onClose]);
 
   const active = entries.find((e) => e.id === activeId) || entries[0];
   const vendor = active?.vendor ?? 'kimi';
@@ -156,11 +172,11 @@ export function NodeSettingsModal({ nodeId, onClose }: Props) {
   const handleTestConnection = async () => {
     if (testing) return;
     if (!model.trim()) {
-      setTestResult({ ok: false, message: 'Model required' });
+      setTestResult({ ok: false, message: t('ai.modelRequired') });
       return;
     }
     if (!key.trim()) {
-      setTestResult({ ok: false, message: 'API key required' });
+      setTestResult({ ok: false, message: t('ai.keyRequired') });
       return;
     }
     setTesting(true);
@@ -180,12 +196,12 @@ export function NodeSettingsModal({ nodeId, onClose }: Props) {
       const payload = await response.json().catch(() => ({}));
       setTestResult({
         ok: response.ok && payload.ok === true,
-        message: String(payload.message || (response.ok ? 'Test failed' : `Request failed (${response.status})`)),
+        message: String(payload.message || (response.ok ? t('ai.testFailed') : `${t('ai.requestFailed')} (${response.status})`)),
       });
     } catch (error) {
       setTestResult({
         ok: false,
-        message: `Request failed: ${error instanceof Error ? error.message : 'network error'}`,
+        message: `Request failed: ${error instanceof Error ? error.message : t('ai.networkError')}`,
       });
     } finally {
       setTesting(false);
@@ -232,8 +248,11 @@ export function NodeSettingsModal({ nodeId, onClose }: Props) {
     ? [model, ...modelOptions]
     : modelOptions;
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
+  // 必须走 portal 挂到 document.body —— React Flow 的 viewport 带 transform，
+  // 它会给后代创建新的包含块，导致 position:fixed 的弹窗跟着画布缩放平移。
+  // 详见 DeviceQualityModal 的同款注释。
+  return createPortal(
+    <div className="modal-portal flex items-center justify-center">
       <div className="absolute inset-0 bg-black/60" onClick={onClose} />
       <div className="relative w-96 bg-gray-900 border border-gray-700 rounded-lg shadow-2xl">
         <div className="flex items-center justify-between px-4 py-3 border-b border-gray-800">
@@ -243,7 +262,7 @@ export function NodeSettingsModal({ nodeId, onClose }: Props) {
         </div>
         <div className="p-4 space-y-3">
           <label className="block">
-            <span className="text-xs text-gray-400">Label language</span>
+            <span className="text-xs text-gray-400">{t('ai.labelLanguage')}</span>
             <select
               aria-label="Label language"
               value={language}
@@ -253,7 +272,7 @@ export function NodeSettingsModal({ nodeId, onClose }: Props) {
               <option value="en">English</option>
             </select>
             <span className="mt-1 block text-[10px] text-gray-500">
-              Applies to the next AI annotation run.
+              {t('ai.appliesNextRun')}
             </span>
           </label>
           {String(data?.config?.vlm_provider || 'local') === 'local' && (
@@ -280,7 +299,7 @@ export function NodeSettingsModal({ nodeId, onClose }: Props) {
               className="shrink-0 text-xs px-2 py-1.5 rounded border border-gray-700 text-gray-500 hover:text-red-400 hover:border-red-800 disabled:opacity-30">✕</button>
           </div>
           <label className="block">
-            <span className="text-xs text-gray-400">API vendor</span>
+            <span className="text-xs text-gray-400">{t('ai.vendor')}</span>
             <select value={vendor} onChange={(e) => handleVendorChange(e.target.value)}
               className="mt-1 w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-gray-200">
               {vendorOptions.map((o) => (
@@ -289,7 +308,7 @@ export function NodeSettingsModal({ nodeId, onClose }: Props) {
             </select>
           </label>
           <label className="block">
-            <span className="text-xs text-gray-400">API model</span>
+            <span className="text-xs text-gray-400">{t('ai.model')}</span>
             <select value={model} onChange={(e) => { updateActive({ model: e.target.value }); }}
               className="mt-1 w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-gray-200">
               {visibleModelOptions.length ? visibleModelOptions.map((option) => (
@@ -298,7 +317,7 @@ export function NodeSettingsModal({ nodeId, onClose }: Props) {
             </select>
           </label>
           <label className="block">
-            <span className="text-xs text-gray-400">API key (stored with this workflow)</span>
+            <span className="text-xs text-gray-400">{t('ai.key')}</span>
             <input type="password" value={key} onChange={(e) => updateActive({ key: e.target.value })}
               autoComplete="new-password"
               placeholder="sk-..."
@@ -321,15 +340,16 @@ export function NodeSettingsModal({ nodeId, onClose }: Props) {
         </div>
         <div className="flex justify-end gap-2 px-4 py-3 border-t border-gray-800">
           <button onClick={onClose}
-            className="text-xs px-3 py-1.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-300">Cancel</button>
+            className="text-xs px-3 py-1.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-300">{t('common.cancel')}</button>
           <button onClick={handleTestConnection} disabled={testing}
             className="text-xs px-3 py-1.5 rounded border border-cyan-700 bg-cyan-950/40 hover:bg-cyan-900/60 text-cyan-300 disabled:opacity-50">
             {testing ? 'Testing…' : 'Test Connection'}
           </button>
           <button onClick={handleSave}
-            className="text-xs px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-500 text-white">Save</button>
+            className="text-xs px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-500 text-white">{t('common.save')}</button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

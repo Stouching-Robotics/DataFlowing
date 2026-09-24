@@ -12,7 +12,7 @@ from starlette.middleware.gzip import GZipMiddleware
 
 from app.config import settings
 from app.routes import ingestion, video, export, pages, session, annotations, dashboard, devices, auth
-from app.api import workflows, worker, projects, exceptions
+from app.api import workflows, worker, projects, exceptions, quality
 from app.api import users
 from app.middleware import AuthMiddleware
 from app.paths import STATIC_DIR
@@ -139,4 +139,5 @@ app.include_router(workflows.router)
 app.include_router(worker.router)
 app.include_router(projects.router)
 app.include_router(exceptions.router)
+app.include_router(quality.router)
 app.include_router(users.router)

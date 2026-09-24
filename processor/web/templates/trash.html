@@ -17,18 +17,19 @@
 
 <script src="/static/js/app.js?v={{ asset_version }}"></script>
 <script>
-// Update template static text when lang changes
-const _origSetLang = setLang;
-setLang = function(lang) {
-    _origSetLang(lang);
-    document.getElementById('nav-review').textContent = t('video_review');
-    document.getElementById('nav-trash').innerHTML = '<iconify-icon icon="ant-design:delete-outlined" class="icon-sm"></iconify-icon> ' + t('trash');
+// 本页只需要维护【页面标题】。
+//
+// ★ 这里原先还手动设 nav-review / nav-trash 的 textContent —— 但 base.html 里
+//   **从来没有这两个 id**（侧边栏用的是 <span data-i18n="nav_review">），于是
+//   getElementById 返回 null，每次 DOMContentLoaded 都抛
+//       TypeError: Cannot set properties of null (setting 'textContent')
+//   那两个导航文案现在由 i18n.js 的 applyTranslations() 按 data-i18n 处理，
+//   这段手写逻辑纯属多余 —— 删掉，只留标题。
+function _applyTrashTitle() {
     document.title = t('trash_title') + ' - Data Acquisition';
-};
-// Init
-document.addEventListener('DOMContentLoaded', () => {
-    document.getElementById('nav-review').textContent = t('video_review');
-    document.getElementById('nav-trash').innerHTML = '<iconify-icon icon="ant-design:delete-outlined" class="icon-sm"></iconify-icon> ' + t('trash');
-});
+}
+document.addEventListener('DOMContentLoaded', _applyTrashTitle);
+// 切语言时标题也跟着变（i18n.js 的 setLang 会派发这个事件）
+window.addEventListener('egodata:lang', _applyTrashTitle);
 </script>
 {% endblock %}

@@ -73,7 +73,8 @@ def matrix_to_rotvec(rotation: np.ndarray) -> np.ndarray:
 
 
 def poses_from_trajectory(trajectories, timestamps,
-                          frame_count: int) -> np.ndarray | None:
+                          frame_count: int,
+                          diagnostics: dict | None = None) -> np.ndarray | None:
     """从 ``observation.slam_trajectory`` 的样本缓冲重建逐帧位姿 ``(N, 7)``。
 
     slam_trajectory 是采集端的高频(50Hz)样本缓冲,每格存
@@ -90,6 +91,18 @@ def poses_from_trajectory(trajectories, timestamps,
     的锚点做最小二乘拟合,不依赖外部时钟。
 
     返回 ``(frame_count, 7)``;样本不足返回 ``None``。
+
+    传入 ``diagnostics`` 时会把覆盖率统计写进去(就地更新,不改返回值):
+
+        {"frames": N,              # 总帧数
+         "direct": n,              # 有真实样本直接覆盖的帧
+         "interpolated": n,        # 只能插值兜底的帧  ← ★ 真正该关心的数字
+         "empty_slots": n}         # 自己格子里没有样本的帧(含被相邻格子救回的)
+
+    ★ 注意 ``empty_slots`` 不是问题指标 —— 位姿流是 20/20/60ms 突发、数据帧是
+    1/30s 均匀网格,自己格子为空是**设计使然**(实测占 ~28%),其中 97% 能被
+    相邻格子覆盖。真正该关心的是 ``interpolated``:既没有本地样本、邻近格子
+    也没有,只能靠插值硬补 —— 那才是 SLAM 跟丢的证据。
     """
     import numpy as np
 
@@ -110,13 +123,24 @@ def poses_from_trajectory(trajectories, timestamps,
         groups = values.size // 8
         if groups <= 0:
             continue
+        last_sample_t: float | None = None
         for g in range(groups):
             chunk = values[g * 8:g * 8 + 8]
             if not np.isfinite(chunk).all():
                 continue
-            samples.append((float(chunk[0]), [float(v) for v in chunk[1:8]]))
-        if has_anchor[index]:
-            anchor_slam.append(float(values[(groups - 1) * 8]))
+            last_sample_t = float(chunk[0])
+            samples.append((last_sample_t, [float(v) for v in chunk[1:8]]))
+        # 锚点取【最后一个有效组】的 t,而不是盲取最后一组。
+        #
+        # 导出产物会把 slam_trajectory 补齐到定长(如 128 = 16 组),补的是 NaN
+        # (见 lerobot_export._pad_sparse_matrix_columns)。盲取最后一组会把
+        # NaN 塞进下面的 polyfit 方程 → SVD 不收敛 → LinAlgError,整集派生失败。
+        #
+        # canonical 数据(采集端直接写的变长列表)不含 NaN,所以生产路径碰不到;
+        # 但任何"读导出数据集再派生"的场景(质检、re-export、数据回灌)都会踩。
+        # 上面的循环已经跳过 NaN 组了,这里复用同一个判定即可。
+        if has_anchor[index] and last_sample_t is not None:
+            anchor_slam.append(last_sample_t)
             anchor_data.append(float(stamp[index]))
     if len(samples) < 2 or len(anchor_slam) < 2:
         return None
@@ -153,6 +177,16 @@ def poses_from_trajectory(trajectories, timestamps,
 
     # 4) 真实样本覆盖不到的少数帧(实测约 3%)才插值兜底
     valid = np.where(~missing)[0]
+    if diagnostics is not None and frame_count > 0:
+        # 注意用 missing.sum() 而不是 len(missing) —— 后者是数组长度(恒等于
+        # frame_count),不是 True 的个数。两者相加必须等于 frames。
+        diagnostics.update({
+            "frames": int(frame_count),
+            "direct": int(len(valid)),            # 有真实样本直接覆盖
+            "interpolated": int(missing.sum()),   # 只能插值兜底
+            # 自己格子里没样本的帧数 —— 由调用方按需统计,这里只报总数
+            "empty_slots": int(diagnostics.get("empty_slots", 0)),
+        })
     if len(valid) < 2:
         return None
     for index in np.where(missing)[0]:

@@ -181,7 +181,7 @@
         const boundaryBad = seg.boundary_ok === false || seg.label_matched === false;
         mid.innerHTML = `
             <div style="color:${isCurrent ? '#e0f2fe' : '#d1d5db'};white-space:normal;overflow-wrap:anywhere;line-height:1.35;">
-                ${isCandidate ? '<span style="color:#22d3ee;" title="AI candidate">✨</span> ' : ''}${boundaryBad ? '<span style="color:#f59e0b;" title="边界可疑或标签未命中词表">⚠</span> ' : ''}${globalIdx + 1} · ${esc(seg.label || '—')}
+                ${isCandidate ? '<span style="color:#22d3ee;" title="AI candidate">✨</span> ' : ''}${boundaryBad ? '<span style="color:#f59e0b;" title="' + t('slice_boundary_suspect') + '">⚠</span> ' : ''}${globalIdx + 1} · ${esc(seg.label || '—')}
             </div>
             <div style="color:#9ca3af;font-family:monospace;font-size:10px;">
                 ${seg.start_frame_index}-${seg.end_frame_index} · ${(seg.start_frame_index / fps).toFixed(1)}s

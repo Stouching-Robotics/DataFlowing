@@ -1,7 +1,9 @@
 /* Administrator account management. */
 let managedUsers = [];
 
-const ROLE_LABELS = { admin: 'Admin', engineer: 'Engineer', reviewer: 'Reviewer' };
+// 显示时翻译；查不到就回落原始值（后端加了新角色也不会显示成空白）
+const ROLE_LABEL_KEYS = { admin: 'role_admin', engineer: 'role_engineer', reviewer: 'role_reviewer' };
+const STATUS_LABEL_KEYS = { active: 'status_active', disabled: 'status_disabled', expired: 'status_expired' };
 const ROLE_CLASSES = {
     admin: 'text-blue-400 bg-blue-900/30 border-blue-800',
     engineer: 'text-purple-400 bg-purple-900/30 border-purple-800',
@@ -68,10 +70,10 @@ function renderUsers() {
     const users = managedUsers.filter(user => !query
         || user.username.toLowerCase().includes(query)
         || (user.email || '').toLowerCase().includes(query));
-    document.getElementById('user-list-count').textContent = `${users.length} users`;
+    document.getElementById('user-list-count').textContent = t('users_count').replace('%s', users.length);
     const body = document.getElementById('users-body');
     if (!users.length) {
-        body.innerHTML = '<tr><td colspan="6" class="px-4 py-10 text-center text-gray-600">No users found</td></tr>';
+        body.innerHTML = '<tr><td colspan="6" class="px-4 py-10 text-center text-gray-600">' + t('users_no_found') + '</td></tr>';
         return;
     }
     body.innerHTML = users.map(user => {
@@ -82,19 +84,19 @@ function renderUsers() {
                 : 'text-gray-400 bg-gray-800 border-gray-700';
         let action = '';
         if (user.status === 'expired') {
-            action = `<button onclick="openUserModal('${escUser(user.id)}')" title="Edit the expiry date to reactivate this account" class="border border-yellow-800 text-yellow-400 hover:bg-yellow-900/30 px-2 py-1 rounded">Extend</button>`;
+            action = `<button onclick="openUserModal('${escUser(user.id)}')" title="${t('users_extend_hint')}" class="border border-yellow-800 text-yellow-400 hover:bg-yellow-900/30 px-2 py-1 rounded">${t('users_extend')}</button>`;
         } else if (user.account_status === 'active') {
-            action = `<button onclick="toggleUser('${escUser(user.id)}', 'disabled')" title="Block login temporarily; can be enabled later" class="border border-yellow-900 text-yellow-400 hover:bg-yellow-900/30 px-2 py-1 rounded">Disable</button>`;
+            action = `<button onclick="toggleUser('${escUser(user.id)}', 'disabled')" title="${t('users_disable_hint')}" class="border border-yellow-900 text-yellow-400 hover:bg-yellow-900/30 px-2 py-1 rounded">${t('users_disable')}</button>`;
         } else {
-            action = `<button onclick="toggleUser('${escUser(user.id)}', 'active')" title="Allow this user to log in again" class="border border-green-900 text-green-400 hover:bg-green-900/30 px-2 py-1 rounded">Enable</button>`;
+            action = `<button onclick="toggleUser('${escUser(user.id)}', 'active')" title="${t('users_enable_hint')}" class="border border-green-900 text-green-400 hover:bg-green-900/30 px-2 py-1 rounded">${t('users_enable')}</button>`;
         }
         return `<tr class="border-t border-gray-800 hover:bg-gray-800/30">
-            <td class="px-4 py-3"><div class="text-gray-200">${escUser(user.username)}</div><div class="text-xs text-gray-600">${escUser(user.email || 'No email')}</div></td>
-            <td class="px-4 py-3"><span class="inline-flex px-2 py-0.5 rounded border text-xs ${ROLE_CLASSES[user.role] || 'text-gray-400 bg-gray-800 border-gray-700'}">${escUser(ROLE_LABELS[user.role] || user.role)}</span></td>
-            <td class="px-4 py-3"><span class="inline-flex px-2 py-0.5 rounded border text-xs ${statusClass}">${escUser(user.status)}</span></td>
+            <td class="px-4 py-3"><div class="text-gray-200">${escUser(user.username)}</div><div class="text-xs text-gray-600">${escUser(user.email || t('users_no_email'))}</div></td>
+            <td class="px-4 py-3"><span class="inline-flex px-2 py-0.5 rounded border text-xs ${ROLE_CLASSES[user.role] || 'text-gray-400 bg-gray-800 border-gray-700'}">${escUser(ROLE_LABEL_KEYS[user.role] ? t(ROLE_LABEL_KEYS[user.role]) : user.role)}</span></td>
+            <td class="px-4 py-3"><span class="inline-flex px-2 py-0.5 rounded border text-xs ${statusClass}">${escUser(STATUS_LABEL_KEYS[user.status] ? t(STATUS_LABEL_KEYS[user.status]) : user.status)}</span></td>
             <td class="px-4 py-3 text-xs text-gray-500">${escUser(formatDate(user.last_login_at))}</td>
-            <td class="px-4 py-3 text-xs ${user.status === 'expired' ? 'text-yellow-400' : 'text-gray-500'}">${escUser(user.expires_at ? formatDate(user.expires_at) : 'Never')}</td>
-            <td class="px-4 py-3"><div class="flex justify-end items-center gap-2 whitespace-nowrap text-xs"><button onclick="openUserModal('${escUser(user.id)}')" title="Edit account" class="border border-blue-900 text-blue-400 hover:bg-blue-900/30 px-2 py-1 rounded">Edit</button>${action}<button onclick="deleteUser('${escUser(user.id)}')" title="Permanently delete this account" class="border border-red-900 text-red-400 hover:bg-red-900/30 px-2 py-1 rounded">Delete</button></div></td>
+            <td class="px-4 py-3 text-xs ${user.status === 'expired' ? 'text-yellow-400' : 'text-gray-500'}">${escUser(user.expires_at ? formatDate(user.expires_at) : t('users_never'))}</td>
+            <td class="px-4 py-3"><div class="flex justify-end items-center gap-2 whitespace-nowrap text-xs"><button onclick="openUserModal('${escUser(user.id)}')" title="${t('users_edit_hint')}" class="border border-blue-900 text-blue-400 hover:bg-blue-900/30 px-2 py-1 rounded">${t('users_edit')}</button>${action}<button onclick="deleteUser('${escUser(user.id)}')" title="${t('users_delete_hint')}" class="border border-red-900 text-red-400 hover:bg-red-900/30 px-2 py-1 rounded">${t('users_delete')}</button></div></td>
         </tr>`;
     }).join('');
 }
@@ -110,15 +112,15 @@ function toLocalInput(value) {
 function openUserModal(userId = '') {
     const user = managedUsers.find(item => item.id === userId);
     document.getElementById('user-id').value = user?.id || '';
-    document.getElementById('user-modal-title').textContent = user ? 'Edit user' : 'New user';
-    document.getElementById('user-save-btn').textContent = user ? 'Save changes' : 'Create user';
+    document.getElementById('user-modal-title').textContent = user ? t('users_edit_user') : t('users_new');
+    document.getElementById('user-save-btn').textContent = user ? t('users_save_changes') : t('users_create');
     document.getElementById('user-username').value = user?.username || '';
     document.getElementById('user-username').disabled = Boolean(user);
     document.getElementById('user-role').value = user?.role || 'engineer';
     document.getElementById('user-email').value = user?.email || '';
     document.getElementById('user-password').value = '';
     document.getElementById('user-password').required = !user;
-    document.getElementById('password-hint').textContent = user ? '(leave blank to keep current password)' : '(at least 6 characters)';
+    document.getElementById('password-hint').textContent = user ? t('users_pw_keep') : t('users_pw_hint');
     document.getElementById('user-status').value = user?.account_status || 'active';
     document.getElementById('user-expires').value = toLocalInput(user?.expires_at);
     document.getElementById('user-modal').classList.remove('hidden');
@@ -168,7 +170,7 @@ async function toggleUser(id, status) {
 
 async function deleteUser(id) {
     const user = managedUsers.find(item => item.id === id);
-    if (!user || !window.confirm(`Permanently delete ${user.username}? Disable is safer if you may need the account later.`)) return;
+    if (!user || !window.confirm(t('users_confirm_delete').replace('%s', user.username))) return;
     try {
         await apiUsers(`/api/v1/users/${encodeURIComponent(id)}`, { method: 'DELETE' });
         showUserAlert('User deleted');

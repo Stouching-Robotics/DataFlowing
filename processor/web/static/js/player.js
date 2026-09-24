@@ -2003,7 +2003,7 @@ async function mountGroupedSource(source, tile) {
         const curveCaption = document.createElement('div');
         curveCaption.className = 'absolute pointer-events-none';
         curveCaption.style.cssText = 'top:2px;left:6px;font-size:10px;color:#64748b;';
-        curveCaption.textContent = '力 mN';
+        curveCaption.textContent = t('force_unit_mn');
         curveBox.appendChild(curveCaption);
         holder.appendChild(matrixBox);
         holder.appendChild(curveBox);
@@ -2014,7 +2014,7 @@ async function mountGroupedSource(source, tile) {
             chunks: new Map(), chunkInflight: new Set(),
             frameCount: Number(tactileMatrixData?.frame_count) || 0 };
         _resetTactileView(renderer);
-        canvas.title = '接触力场(固定全幅,不可缩放)';
+        canvas.title = t('force_field_title');
         currentTactileTiles.push(entry);
         const frame = typeof currentFrameTarget === 'number' ? currentFrameTarget : 0;
         _updateTactileForceTile(entry, frame);

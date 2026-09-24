@@ -131,15 +131,18 @@
             </a>
             <a href="/workflow-studio" class="sidebar-link" data-page="workflow-studio">
                 <iconify-icon icon="ant-design:apartment-outlined" class="icon-sm"></iconify-icon>
-                <span>Workflow</span>
+                <span data-i18n="nav_workflow">Workflow</span>
             </a>
             <a href="/users" id="users-nav" class="sidebar-link{% if boot_user.role|default('') != 'admin' %} hidden{% endif %}" data-page="users">
-                <iconify-icon icon="ant-design:team-outlined" class="icon-sm"></iconify-icon>
-                <span>Users</span>
+                {# 图标必须取自 iconify-preload.js 白名单 —— 此处在每个页面的侧边栏,
+                   用白名单外的名字会让每次翻页都去 api.iconify.design 拉一次。
+                   team-outlined 不在表内,改用同义的 user-outlined。 #}
+                <iconify-icon icon="ant-design:user-outlined" class="icon-sm"></iconify-icon>
+                <span data-i18n="nav_users">Users</span>
             </a>
             <a href="/annotation-studio" class="sidebar-link" data-page="annotation-studio">
                 <iconify-icon icon="ant-design:edit-outlined" class="icon-sm"></iconify-icon>
-                <span>Annotation</span>
+                <span data-i18n="nav_annotation">Annotation</span>
             </a>
             <!-- Video Review — status shortcuts; the project→task→video
                  hierarchy list renders on the right side of the page -->
@@ -189,13 +192,28 @@
                     <div id="dd-role" class="text-xs text-gray-500">{{ boot_user.role|default('')|title }}</div>
                 </div>
                 <a href="javascript:void(0)" class="block px-3 py-2 text-xs text-gray-400 hover:bg-gray-700 hover:text-gray-200 transition-colors">
-                    <iconify-icon icon="ant-design:user-outlined" class="icon-sm mr-2"></iconify-icon>Profile
+                    <iconify-icon icon="ant-design:user-outlined" class="icon-sm mr-2"></iconify-icon><span data-i18n="menu_profile">Profile</span>
                 </a>
                 <a href="javascript:void(0)" class="block px-3 py-2 text-xs text-gray-400 hover:bg-gray-700 hover:text-gray-200 transition-colors">
-                    <iconify-icon icon="ant-design:lock-outlined" class="icon-sm mr-2"></iconify-icon>Change Password
+                    <iconify-icon icon="ant-design:lock-outlined" class="icon-sm mr-2"></iconify-icon><span data-i18n="menu_change_password">Change Password</span>
                 </a>
+                <!-- 界面语言。两个选项都写自己的文字（English / 中文 是自名，
+                     不随界面语言翻译），当前项由 updateLangToggle() 高亮。
+                     点这里不会关掉菜单：外部点击的判定用 container.contains(e.target)，
+                     而它在本容器内。 -->
+                <div class="px-3 py-2 border-t border-gray-700">
+                    <div class="mb-1.5 text-xs text-gray-500" data-i18n="language">Language</div>
+                    <div class="flex gap-1">
+                        <button type="button" data-lang-option="en" onclick="setLang('en')"
+                                aria-pressed="false"
+                                class="flex-1 rounded border border-gray-700 px-2 py-1 text-xs text-gray-400 hover:bg-gray-700 hover:text-gray-200 transition-colors">English</button>
+                        <button type="button" data-lang-option="zh" onclick="setLang('zh')"
+                                aria-pressed="false"
+                                class="flex-1 rounded border border-gray-700 px-2 py-1 text-xs text-gray-400 hover:bg-gray-700 hover:text-gray-200 transition-colors">中文</button>
+                    </div>
+                </div>
                 <a href="javascript:void(0)" onclick="handleLogout()" class="block px-3 py-2 text-xs text-red-400 hover:bg-gray-700 hover:text-red-300 transition-colors border-t border-gray-700">
-                    <iconify-icon icon="ant-design:logout-outlined" class="icon-sm mr-2"></iconify-icon>Logout
+                    <iconify-icon icon="ant-design:logout-outlined" class="icon-sm mr-2"></iconify-icon><span data-i18n="menu_logout">Logout</span>
                 </a>
             </div>
         </div>

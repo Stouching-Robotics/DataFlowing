@@ -3,6 +3,7 @@
 const I18N = {
     zh: {
         app_title: 'processor',
+        language: '语言',
         video_review: '视频审核',
         trash: '回收站',
         all_status: '全部状态',
@@ -18,7 +19,7 @@ const I18N = {
         load_failed: '加载失败',
         select_episode: '选择一个视频开始审核 →',
         no_video: '此 Episode 没有视频数据',
-        cameras: 'Cameras',
+        cameras: '相机',
         play_all: '▶ 全部播放',
         pause_all: '⏸ 全部暂停',
         play_btn: '播放',
@@ -56,8 +57,8 @@ const I18N = {
         export_failed: '导出失败',
         no_reviewed: '没有已审核的 Episode 可导出',
         export_created: '导出任务已创建，完成后自动下载',
-        left_hand: 'Left Hand',
-        right_hand: 'Right Hand',
+        left_hand: '左手',
+        right_hand: '右手',
         single_mono: '单目视频',
         glove_sensor: '手套传感器',
         depth_image: '深度图',
@@ -105,7 +106,7 @@ const I18N = {
         confirm_delete_anno: '确定删除此标注段吗？',
         save_annotation: '保存标注',
         save_changes: '保存修改',
-        slice_conflict: '该切片已被其他设备修改，已加载最新版本，请重新确认后保存。',
+        slice_conflict: '此切片已在另一台电脑修改，已加载最新版本。请确认后再次保存。',
         current_frame: '当前帧',
         anno_color: '颜色',
         anno_frame_range: '帧范围',
@@ -132,14 +133,113 @@ const I18N = {
         nav_tasks: '项目',
         nav_review: '视频审核',
         nav_trash: '回收站',
+        nav_workflow: '工作流',
+        nav_users: '用户',
+        nav_annotation: '标注',
+        menu_profile: '个人资料',
+        menu_change_password: '修改密码',
+        menu_logout: '退出登录',
+        // User management
+        users_title: '用户管理',
+        users_subtitle: '管理账号、角色与账号生命周期。',
+        users_new: '新建用户',
+        users_total: '用户总数',
+        users_active: '活跃用户',
+        users_disabled_expired: '已禁用 / 已过期',
+        status_active: '正常',
+        status_expired: '已过期',
+        status_disabled: '已禁用',
+        users_disable_warning: '会临时禁止登录，但保留账号与数据，之后可再启用。',
+        users_all_roles: '全部角色',
+        users_all_status: '全部状态',
+        role_admin: '管理员',
+        role_engineer: '工程师',
+        role_reviewer: '审核员',
+        col_user: '用户',
+        col_role: '角色',
+        col_status: '状态',
+        col_last_login: '最近登录',
+        col_expires: '到期',
+        col_actions: '操作',
+        users_extend: '延期',
+        users_extend_hint: '修改到期时间以重新启用该账号',
+        users_disable: '禁用',
+        users_disable_hint: '临时禁止登录，之后可再启用',
+        users_enable: '启用',
+        users_enable_hint: '允许该用户重新登录',
+        users_edit: '编辑',
+        users_edit_hint: '编辑账号',
+        users_edit_user: '编辑用户',
+        users_save_changes: '保存修改',
+        users_create: '创建用户',
+        users_delete: '删除',
+        users_delete_hint: '永久删除该账号',
+        users_delete_warning: '将永久删除该账号。',
+        users_confirm_delete: '永久删除 %s？如果以后可能还要用这个账号，禁用更稳妥。',
+        users_role_perms: '角色权限',
+        users_perm_admin: '用户、项目、工作流、处理、审核与系统设置',
+        users_perm_engineer: '项目、工作流、处理与审核',
+        users_perm_reviewer: '查看数据、视频审核与标注审核',
+        field_username: '用户名',
+        field_email: '邮箱',
+        field_password: '密码',
+        field_expires_at: '到期时间',
+        users_pw_hint: '（至少 6 个字符）',
+        users_pw_keep: '（留空则保持原密码）',
+        users_optional: '（可选）',
+        users_no_found: '未找到用户',
+        users_no_email: '无邮箱',
+        users_never: '从未',
+        users_count: '%s 个用户',
+        // Video review page / exports / tasks
+        preview_options: '预览选项',
+        video_sources: '视频源',
+        all: '全部',
+        hand_skeleton: '手部骨骼',
+        hand_trail: '手部轨迹',
+        frame_label: '帧：',
+        play: '播放',
+        select: '选择',
+        name_1_to_n: '命名 1→N',
+        name_n_to_1: '命名 N→1',
+        sort_label: '排序：',
+        n_selected: '已选 %s',
+        undo: '撤销',
+        new_export: '新建导出',
+        dataset_name: '数据集名称',
+        train_ratio: '训练集占比',
+        start_export: '开始导出',
+        dataset: '数据集',
+        progress: '进度',
+        created: '创建时间',
+        task_active: '进行中',
+        task_paused: '已暂停',
+        // 原先写死在 JS/HTML 里的中文（英文界面会露出来）
+        ai_status_segmenting: '切段中…',
+        ai_status_analyzing: 'VLM 分析中…',
+        ai_status_writing: '写入…',
+        ai_status_exporting: '写入数据集…',
+        force_unit_mn: '力 mN',
+        force_field_title: '接触力场（固定全幅，不可缩放）',
+        slice_boundary_suspect: '边界可疑或标签未命中词表',
+        anno_ai_mode_title: 'AI 自动切段并提案标注（模式由工作流 AI Annotation 卡片配置决定）',
         // Overview Dashboard
-        overview_title: 'Overview',
+        overview_title: '概览',
         load_failed_stats: '加载统计数据失败',
         retry: '重试',
         stat_reviewing: '待审核',
         stat_approved: '已通过',
         stat_failed: '异常',
         stat_total: '全部',
+        stat_to_review: '待审核',
+        stat_distribution: '状态分布',
+        daily_uploads: '每日上传',
+        last_30_days: '（近 30 天）',
+        donut_total: '总计',
+        stat_processing: '处理中',
+        stat_received: '已接收',
+        cleaning_passed: '质检通过',
+        cleaning_failed: '质检未通过',
         stat_anomaly: '异常',
         recent_episodes: '最近 Episode',
         view_all: '查看全部',
@@ -151,7 +251,7 @@ const I18N = {
         task_name_hint: '请使用字母/数字/下划线/中文，需与上传文件前缀匹配',
         task_description: '描述',
         claimer: '认领人',
-        target_episodes: '目标批次数',
+        target_episodes: '目标条数',
         target_duration: '目标时长(秒)',
         fps: '帧率',
         save: '保存',
@@ -170,7 +270,6 @@ const I18N = {
         expand_episodes: '查看 Episodes',
         load_more: '加载更多',
         no_tasks: '暂无任务，点击"新建任务"创建第一个采集任务',
-        all_status: '全部状态',
         // Project management
         projects_title: '项目',
         search_projects: '搜索项目...',
@@ -189,7 +288,6 @@ const I18N = {
         upload_reupload: '重传',
         upload_total: '总上传',
         upload_unclassified: '历史未分类',
-        target_episodes: '目标条数',
         target_unlimited: '不限',
         no_tasks_in_project: '该项目下暂无任务（上传数据后自动归类）',
         delete_project: '删除',
@@ -228,15 +326,14 @@ const I18N = {
         current_slice: '当前标记',
         enter_slice_name: '请输入标记名称',
         add_slice: '添加切片',
-        save_changes: '保存修改',
         ai_annotate: 'AI 标注',
-        slice_conflict: '此切片已在另一台电脑修改，已加载最新版本。请确认后再次保存。',
         unnamed_slice: '未命名切片',
         slice_save_failed: '保存失败: ',
         slice_delete_failed: '删除失败: ',
     },
     en: {
         app_title: 'processor',
+        language: 'Language',
         video_review: 'Video Review',
         trash: 'Trash',
         all_status: 'All Status',
@@ -339,7 +436,7 @@ const I18N = {
         confirm_delete_anno: 'Delete this annotation segment?',
         save_annotation: 'Save Annotation',
         save_changes: 'Save Changes',
-        slice_conflict: 'This slice was modified by another device. The latest version was loaded — please confirm and save again.',
+        slice_conflict: 'This slice was changed on another computer. The latest version has been loaded.',
         current_frame: 'Current Frame',
         anno_color: 'Color',
         anno_frame_range: 'Frame Range',
@@ -366,6 +463,96 @@ const I18N = {
         nav_tasks: 'Projects',
         nav_review: 'Video Review',
         nav_trash: 'Trash',
+        nav_workflow: 'Workflow',
+        nav_users: 'Users',
+        nav_annotation: 'Annotation',
+        menu_profile: 'Profile',
+        menu_change_password: 'Change Password',
+        menu_logout: 'Logout',
+        // User management
+        users_title: 'User management',
+        users_subtitle: 'Manage accounts, roles and account lifecycle.',
+        users_new: 'New user',
+        users_total: 'Total users',
+        users_active: 'Active users',
+        users_disabled_expired: 'Disabled / expired',
+        status_active: 'Active',
+        status_expired: 'Expired',
+        status_disabled: 'Disabled',
+        users_disable_warning: 'blocks login temporarily and keeps the account/data; it can be enabled later.',
+        users_all_roles: 'All roles',
+        users_all_status: 'All status',
+        role_admin: 'Admin',
+        role_engineer: 'Engineer',
+        role_reviewer: 'Reviewer',
+        col_user: 'User',
+        col_role: 'Role',
+        col_status: 'Status',
+        col_last_login: 'Last login',
+        col_expires: 'Expires',
+        col_actions: 'Actions',
+        users_extend: 'Extend',
+        users_extend_hint: 'Edit the expiry date to reactivate this account',
+        users_disable: 'Disable',
+        users_disable_hint: 'Block login temporarily; can be enabled later',
+        users_enable: 'Enable',
+        users_enable_hint: 'Allow this user to log in again',
+        users_edit: 'Edit',
+        users_edit_hint: 'Edit account',
+        users_edit_user: 'Edit user',
+        users_save_changes: 'Save changes',
+        users_create: 'Create user',
+        users_delete: 'Delete',
+        users_delete_hint: 'Permanently delete this account',
+        users_delete_warning: 'permanently removes the account.',
+        users_confirm_delete: 'Permanently delete %s? Disable is safer if you may need the account later.',
+        users_role_perms: 'Role permissions',
+        users_perm_admin: 'Users, projects, workflows, processing, review and system settings',
+        users_perm_engineer: 'Projects, workflows, processing and review',
+        users_perm_reviewer: 'View data, video review and annotation review',
+        field_username: 'Username',
+        field_email: 'Email',
+        field_password: 'Password',
+        field_expires_at: 'Expires at',
+        users_pw_hint: '(at least 6 characters)',
+        users_pw_keep: '(leave blank to keep current password)',
+        users_optional: '(optional)',
+        users_no_found: 'No users found',
+        users_no_email: 'No email',
+        users_never: 'Never',
+        users_count: '%s users',
+        // Video review page / exports / tasks
+        preview_options: 'Preview Options',
+        video_sources: 'Video Sources',
+        all: 'All',
+        hand_skeleton: 'Hand Skeleton',
+        hand_trail: 'Hand Trail',
+        frame_label: 'Frame:',
+        play: 'Play',
+        select: 'Select',
+        name_1_to_n: 'Name 1→N',
+        name_n_to_1: 'Name N→1',
+        sort_label: 'Sort: ',
+        n_selected: '%s selected',
+        undo: 'Undo',
+        new_export: 'New Export',
+        dataset_name: 'Dataset Name',
+        train_ratio: 'Train Ratio',
+        start_export: 'Start Export',
+        dataset: 'Dataset',
+        progress: 'Progress',
+        created: 'Created',
+        task_active: 'active',
+        task_paused: 'paused',
+        // 原先写死在 JS/HTML 里的中文（英文界面会露出来）
+        ai_status_segmenting: 'Segmenting…',
+        ai_status_analyzing: 'Analyzing (VLM)…',
+        ai_status_writing: 'Writing…',
+        ai_status_exporting: 'Writing dataset…',
+        force_unit_mn: 'Force (mN)',
+        force_field_title: 'Contact force field (fixed full frame, not zoomable)',
+        slice_boundary_suspect: 'Suspicious boundary or label not in vocabulary',
+        anno_ai_mode_title: 'AI auto-segments and proposes annotations (mode is configured on the workflow AI Annotation card)',
         // Overview Dashboard
         overview_title: 'Overview',
         load_failed_stats: 'Failed to load statistics',
@@ -374,6 +561,15 @@ const I18N = {
         stat_approved: 'Approved',
         stat_failed: 'Failed',
         stat_total: 'All Episodes',
+        stat_to_review: 'To Review',
+        stat_distribution: 'Status Distribution',
+        daily_uploads: 'Daily Uploads',
+        last_30_days: '(last 30 days)',
+        donut_total: 'Total',
+        stat_processing: 'Processing',
+        stat_received: 'Received',
+        cleaning_passed: 'Cleaning passed',
+        cleaning_failed: 'Cleaning failed',
         stat_anomaly: 'Anomaly',
         recent_episodes: 'Recent Episodes',
         view_all: 'View All',
@@ -385,7 +581,7 @@ const I18N = {
         task_name_hint: 'Letters/digits/underscore/Chinese; must match zip filename prefix',
         task_description: 'Description',
         claimer: 'Claimer',
-        target_episodes: 'Target Batches',
+        target_episodes: 'Target Episodes',
         target_duration: 'Target Duration (s)',
         fps: 'FPS',
         save: 'Save',
@@ -404,7 +600,6 @@ const I18N = {
         expand_episodes: 'View Episodes',
         load_more: 'Load More',
         no_tasks: 'No tasks yet. Click "New Task" to create one.',
-        all_status: 'All Status',
         // Project management
         projects_title: 'Projects',
         search_projects: 'Search projects...',
@@ -423,7 +618,6 @@ const I18N = {
         upload_reupload: 'reuploads',
         upload_total: 'total uploads',
         upload_unclassified: 'legacy unclassified',
-        target_episodes: 'Target Episodes',
         target_unlimited: 'unlimited',
         no_tasks_in_project: 'No tasks under this project (uploads are grouped automatically).',
         delete_project: 'Delete',
@@ -462,9 +656,7 @@ const I18N = {
         current_slice: 'Current Slice',
         enter_slice_name: 'Enter a slice name',
         add_slice: 'Add Slice',
-        save_changes: 'Save Changes',
         ai_annotate: 'AI Annotate',
-        slice_conflict: 'This slice was changed on another computer. The latest version has been loaded.',
         unnamed_slice: 'Untitled slice',
         slice_save_failed: 'Save failed: ',
         slice_delete_failed: 'Delete failed: ',
@@ -477,16 +669,32 @@ function t(key) {
     return (I18N[currentLang] && I18N[currentLang][key]) || I18N['zh'][key] || key;
 }
 
-function setLang(lang) {
-    currentLang = lang;
-    localStorage.setItem('lang', lang);
-    // Re-apply all data-i18n text
+/** 把静态标注（data-i18n / data-i18n-placeholder）应用到 DOM。 */
+function applyTranslations() {
     document.querySelectorAll('[data-i18n]').forEach(el => {
         el.textContent = t(el.dataset.i18n);
     });
     document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
         el.placeholder = t(el.dataset.i18nPlaceholder);
     });
+    // title 属性此前没人处理 —— 只有 data-i18n（写 textContent）和 placeholder 两种，
+    // 于是带提示的按钮/图标没法靠标记翻译，只能写死中文。
+    document.querySelectorAll('[data-i18n-title]').forEach(el => {
+        el.title = t(el.dataset.i18nTitle);
+    });
+}
+
+function setLang(lang) {
+    if (!I18N[lang]) return;                 // 只认字典里有的语言
+    currentLang = lang;
+    try { localStorage.setItem('lang', lang); } catch (e) { /* 隐私模式禁 storage */ }
+    // 通知**同页面里的其他应用**：工作流画布是独立的 React 应用，不加载本文件，
+    // 它靠这个事件跟着切。不能用 storage 事件 —— 那个只在**别的标签页**触发，
+    // 而切换按钮就在本页侧边栏上。
+    try {
+        window.dispatchEvent(new CustomEvent('egodata:lang', { detail: { lang } }));
+    } catch (e) { /* 老浏览器不支持 CustomEvent 构造：画布不跟随，其余照常 */ }
+    applyTranslations();
     // Update header nav
     const navReview = document.getElementById('nav-review');
     const navTrash = document.getElementById('nav-trash');
@@ -506,6 +714,10 @@ function setLang(lang) {
     if (typeof loadExportJobs === 'function') loadExportJobs();
     if (typeof renderSourceBar === 'function') renderSourceBar();
     if (typeof updateInfoBar === 'function') updateInfoBar();
+    // 首页概览的环形图/柱状图/状态徽标都是 JS 现画的，不重跑就不跟着切语言
+    if (typeof refreshDashboard === 'function') refreshDashboard();
+    // 用户列表同样是 JS 现画的（表头是静态标注，行内容是动态的）
+    if (typeof loadUsers === 'function') loadUsers();
     updateLangToggle();
 }
 
@@ -514,16 +726,28 @@ function updateLangToggle() {
     if (btn) {
         btn.textContent = currentLang === 'zh' ? 'EN' : '中';
     }
+    // 用户菜单里的语言选项：高亮当前项。用的是 class 切换而不是重建 DOM ——
+    // 菜单是常驻元素，重建会丢掉挂在它上面的监听。
+    document.querySelectorAll('[data-lang-option]').forEach(el => {
+        const active = el.dataset.langOption === currentLang;
+        el.setAttribute('aria-pressed', active ? 'true' : 'false');
+        el.classList.toggle('text-cyan-300', active);
+        el.classList.toggle('border-cyan-700', active);
+        el.classList.toggle('bg-cyan-900/30', active);
+        el.classList.toggle('text-gray-400', !active);
+        el.classList.toggle('border-gray-700', !active);
+    });
 }
 
-// Apply translations on every page at load. Default language is English;
-// the toggle (lang-toggle) switches to Chinese for the session.
+// Apply translations on every page at load.
+//
+// ★ 必须**先读回上次选的语言**：setLang 一直在写 localStorage，但此前没有任何
+//   地方读它 —— currentLang 写死 'en'，于是每次刷新都退回英文，切换等于没切。
 document.addEventListener('DOMContentLoaded', () => {
-    document.querySelectorAll('[data-i18n]').forEach(el => {
-        el.textContent = t(el.dataset.i18n);
-    });
-    document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
-        el.placeholder = t(el.dataset.i18nPlaceholder);
-    });
+    try {
+        const saved = localStorage.getItem('lang');
+        if (saved && I18N[saved]) currentLang = saved;
+    } catch (e) { /* 隐私模式禁 storage：保持默认英文 */ }
+    applyTranslations();
     updateLangToggle();
 });

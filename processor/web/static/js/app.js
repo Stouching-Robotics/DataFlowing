@@ -192,9 +192,11 @@ function initStatusFromURL() {
 
 // ── Sort order ──────────────────────────────────────
 
+// label 存 **i18n key** 而不是文案 —— 这个标签会被 toggleSortOrder() 直接写进
+// DOM，写死英文的话切了中文后点一下排序又变回英文。
 const SORT_MODES = [
-    { dir: 'asc',  label: 'Name 1→N', icon: 'ant-design:ordered-list-outlined' },
-    { dir: 'desc', label: 'Name N→1', icon: 'ant-design:ordered-list-outlined' },
+    { dir: 'asc',  labelKey: 'name_1_to_n', icon: 'ant-design:ordered-list-outlined' },
+    { dir: 'desc', labelKey: 'name_n_to_1', icon: 'ant-design:ordered-list-outlined' },
 ];
 let sortModeIdx = 0;  // cycles 0→1→2→3→0
 
@@ -209,8 +211,8 @@ function toggleSortOrder() {
     const label = document.getElementById('sort-order-label');
     const btn = document.getElementById('btn-sort-order');
     if (icon) icon.setAttribute('icon', mode.icon);
-    if (label) label.textContent = mode.label;
-    if (btn) btn.title = 'Sort: ' + mode.label;
+    if (label) label.textContent = t(mode.labelKey);
+    if (btn) btn.title = t('sort_label') + t(mode.labelKey);
     // Re-sort in memory (no network round trip) — only refetch if not yet loaded
     if (hierarchyData.length === 0) {
         loadEpisodes();
@@ -993,7 +995,10 @@ function showAiPendingGate(episodeId) {
         document.body.appendChild(overlay);
     }
     overlay.innerHTML = `
-        <iconify-icon icon="ant-design:loading-3-quarters-outlined" class="text-blue-400 text-4xl animate-spin"></iconify-icon>
+        <!-- 图标须取自 iconify-preload.js 白名单(loading-3-quarters-outlined
+             不在表内,会走 api.iconify.design → 遮罩出现时卡一下)。
+             用表内的 loading-outlined,配合 animate-spin 视觉一致。 -->
+        <iconify-icon icon="ant-design:loading-outlined" class="text-blue-400 text-4xl animate-spin"></iconify-icon>
         <div class="text-gray-200 text-sm">${t('ai_annotating')}</div>
         <div class="text-gray-500 text-xs">${t('ai_annotating_hint')}</div>`;
     if (overlay.dataset.polling === '1') return;
@@ -1370,6 +1375,19 @@ async function deleteEpisode(episodeId) {
 }
 
 
+/** 从失败的响应里取出可读的失败原因。
+ *
+ * FastAPI 的 ``HTTPException`` 把原因放在 ``detail`` 里（如"Episode is not in
+ * trash"、"Episode delete verification failed: [...]"）。拿不到就退回状态码，
+ * **绝不能返回空** —— 静默的失败比报错更难查。 */
+async function apiErrorDetail(res) {
+    try {
+        const body = await res.json();
+        if (body && body.detail) return String(body.detail);
+    } catch (e) { /* 非 JSON 响应 */ }
+    return `HTTP ${res.status}`;
+}
+
 async function restoreEpisode(episodeId) {
     try {
         const res = await fetch(`/api/v1/episode/${episodeId}/restore`, { method: 'POST' });
@@ -1377,6 +1395,10 @@ async function restoreEpisode(episodeId) {
             updateTrashBadge();  // 恢复后徽标立即 -1
             loadTrashList();
             if (typeof refreshReviewTree === 'function') refreshReviewTree();
+        } else {
+            // ★ 非 2xx 时必须发声。此前只有 if(res.ok) 一个分支 —— 后端返回
+            //   409/500 时前端什么都不做，用户看到的是"点了没反应"，也无从查起。
+            alert(t('restore_failed') + ': ' + await apiErrorDetail(res));
         }
     } catch (err) {
         alert(t('restore_failed') + ': ' + err.message);
@@ -1392,6 +1414,8 @@ async function permanentDeleteEpisode(episodeId) {
             updateTrashBadge();
             loadTrashList();
             if (typeof refreshReviewTree === 'function') refreshReviewTree();
+        } else {
+            alert(t('delete_failed') + ': ' + await apiErrorDetail(res));
         }
     } catch (err) {
         alert(t('delete_failed') + ': ' + err.message);
@@ -1407,6 +1431,8 @@ async function purgeTrash() {
             updateTrashBadge();
             loadTrashList();
             if (typeof refreshReviewTree === 'function') refreshReviewTree();
+        } else {
+            alert(t('purge_failed') + ': ' + await apiErrorDetail(res));
         }
     } catch (err) {
         alert(t('purge_failed') + ': ' + err.message);

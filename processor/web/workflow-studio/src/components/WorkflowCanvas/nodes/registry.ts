@@ -9,6 +9,9 @@ export const LEGACY_NODE_TYPE_ALIASES: Record<string, string> = {
   black_hand_rgb_3d: 'rgb_to_2d_black_glove',
   stereo_triangulate: 'rgbd_to_3d_bare_hand',
   black_glove_hand: 'rgbd_to_3d_black_glove',
+  // 质量门禁两个卡片合并为 data_quality，端口 key(data / reviewed)保持不变
+  ai_quality_review: 'data_quality',
+  data_cleaning: 'data_quality',
 };
 
 /** Canonical labels are part of the editor contract, not server-provided copy. */
@@ -91,10 +94,6 @@ const CANONICAL_PORTS: Record<string, Pick<NodeTypeDescriptor, 'inputs' | 'outpu
     inputs: [{ key: 'data', label: 'Review Target' }],
     outputs: [{ key: 'reviewed', label: 'Reviewed Data' }],
   },
-  ai_quality_review: {
-    inputs: [{ key: 'data', label: 'Quality Review Target' }],
-    outputs: [{ key: 'reviewed', label: 'Reviewed Data' }],
-  },
   lerobot_export: {
     inputs: [{ key: 'data', label: 'Exportable Data' }],
     outputs: [{ key: 'dataset', label: 'Dataset' }],
@@ -110,12 +109,40 @@ export function canonicalNodeType(type: string): string {
   return LEGACY_NODE_TYPE_ALIASES[raw.toLowerCase()] || raw;
 }
 
+// ── 变更订阅 ──────────────────────────────────────────────
+//
+// registry 是**模块级 Map**，不是 React state —— 往里塞节点不会触发重渲染。
+// 而 App 挂载后才会异步拉 /modules 并 hydrate 一次（见 App.tsx），
+// 「UMI Slam Action」这类**不在 BUILTIN 兜底清单里**的节点因此要等到
+// **别的无关状态变化**（输入搜索、折叠分类、鼠标悬停出提示……）才顺带出现，
+// 表现为"进入工作流页面后要等一会才刷新"。
+//
+// 这里给注册表配一个版本号 + 订阅，UI 用 useSyncExternalStore 订阅它，
+// hydrate 完立刻重渲染。
+let revision = 0;
+const listeners = new Set<() => void>();
+
+export function subscribeNodeTypes(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => { listeners.delete(listener); };
+}
+
+export function getNodeTypesRevision(): number {
+  return revision;
+}
+
+function notifyNodeTypesChanged() {
+  revision += 1;
+  listeners.forEach((listener) => listener());
+}
+
 export function registerNodeType(n: NodeTypeDescriptor) {
   const type = canonicalNodeType(n.type);
   const normalized = type === n.type ? n : { ...n, type, slug: type };
   registry.set(type, CANONICAL_NODE_LABELS[type]
     ? { ...normalized, label: CANONICAL_NODE_LABELS[type] }
     : normalized);
+  notifyNodeTypesChanged();
 }
 export function getNodeType(type: string) {
   return registry.get(canonicalNodeType(type));
@@ -182,16 +209,8 @@ export function hydrateNodeTypes(items: Array<Partial<NodeTypeDescriptor> & { sl
       capabilities: item.capabilities || [],
     });
   }
-}
-
-/** Max port rows across all registered nodes — used for uniform card height. */
-export function getMaxPortRows(): number {
-  let max = 1;
-  for (const n of registry.values()) {
-    const rows = (n.inputs?.length || 0) + (n.outputs?.length || 0);
-    if (rows > max) max = rows;
-  }
-  return max;
+  // 一次性通知 —— 循环里逐条通知会让调色板重渲染 N 次
+  notifyNodeTypesChanged();
 }
 
 // ── Built-in nodes ────────────────────────────────────
@@ -352,10 +371,13 @@ const BUILTIN: NodeTypeDescriptor[] = [
     defaultConfig: { required: true, reviewers: 1 },
   },
   {
-    type: 'ai_quality_review', category: 'review', label: 'AI Quality Review',
-    icon: 'ant-design:robot-outlined', color: MODULE_COLORS.review,
-    description: 'Checks video decode, frame continuity, black screens, freezes, and AI annotation coverage before automatic approval and export.',
-    inputs: [{ key: 'data', label: 'Quality Review Target' }],
+    // type 必须写 canonical 名：registerNodeType 会 canonicalNodeType() 一次，
+    // 写成旧 slug 'ai_quality_review' 也只会注册到 'data_quality' 这个键上，
+    // 但 label 却留在兜底里 —— 水合完成前卡片会短暂显示旧名。
+    type: 'data_quality', category: 'review', label: 'Data Cleaning',
+    icon: 'ant-design:check-circle-outlined', color: MODULE_COLORS.review,
+    description: 'Runs deterministic quality checks (video, UMI gripper, tactile glove) and sends failed batches back to manual review.',
+    inputs: [{ key: 'data', label: 'Data' }],
     outputs: [{ key: 'reviewed', label: 'Reviewed Data' }],
     defaultConfig: { mode: 'gate' },
   },

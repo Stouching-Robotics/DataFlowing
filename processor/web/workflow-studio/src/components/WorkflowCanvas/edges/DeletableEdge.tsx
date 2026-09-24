@@ -1,3 +1,4 @@
+import { useT } from '../../../i18n';
 import { BaseEdge, EdgeLabelRenderer, getBezierPath, useReactFlow, type EdgeProps } from '@xyflow/react';
 
 /** 可删除连线:默认渲染与现状一致的 BaseEdge(样式/箭头不变);
@@ -5,6 +6,7 @@ import { BaseEdge, EdgeLabelRenderer, getBezierPath, useReactFlow, type EdgeProp
  *  删除走 deleteElements → onEdgesChange(remove) → store 现有
  *  pushHistory + saveDraft 通道,与键盘 Delete 完全同一路径。 */
 export function DeletableEdge(props: EdgeProps) {
+  const t = useT();
   const {
     id, sourceX, sourceY, targetX, targetY,
     sourcePosition, targetPosition, selected, style, markerEnd,
@@ -22,7 +24,7 @@ export function DeletableEdge(props: EdgeProps) {
           <button
             type="button"
             className="nodrag nopan"
-            title="Delete connection"
+            title={t('edge.delete')}
             onClick={() => deleteElements({ edges: [{ id }] })}
             style={{
               position: 'absolute',

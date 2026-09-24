@@ -32,3 +32,21 @@
 .react-flow__handle:hover { background: #3b82f6 !important; border-color: #3b82f6 !important; }
 .react-flow__handle-connecting { background: #f59e0b !important; border-color: #f59e0b !important; }
 .react-flow__handle-valid { background: #22c55e !important; border-color: #22c55e !important; }
+
+/* 深色界面的滚动条 —— 浏览器默认是浅色粗条，配深色面板非常突兀。
+   默认做成接近隐藏的细条，悬停/滚动时才明显一点。 */
+.dark-scroll { scrollbar-width: thin; scrollbar-color: #334155 transparent; }
+.dark-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+.dark-scroll::-webkit-scrollbar-track { background: transparent; }
+.dark-scroll::-webkit-scrollbar-thumb {
+  background: #334155; border-radius: 4px;
+  /* 用透明边框把滑块"缩"进去，视觉上更细，且不占额外宽度 */
+  border: 2px solid transparent; background-clip: content-box;
+}
+.dark-scroll::-webkit-scrollbar-thumb:hover { background: #475569; background-clip: content-box; }
+.dark-scroll::-webkit-scrollbar-corner { background: transparent; }
+
+/* 弹窗挂到 document.body —— 脱离 React Flow 的缩放/平移容器。
+   见 DeviceQualityModal 顶部注释：transform 会给后代创建新的包含块，
+   导致 position:fixed 的弹窗跟着画布缩放，在画布外还会偏出屏幕。 */
+.modal-portal { position: fixed; inset: 0; z-index: 100; }

@@ -5,11 +5,11 @@
 <div class="flex-1 overflow-y-auto hide-scrollbar p-6">
     <!-- Header -->
     <div class="flex items-center justify-between mb-6">
-        <h2 class="text-lg font-semibold text-gray-200">Overview</h2>
+        <h2 class="text-lg font-semibold text-gray-200" data-i18n="overview_title">Overview</h2>
         <button id="btn-refresh" onclick="refreshDashboard()"
                 class="bg-gray-800 hover:bg-gray-700 text-gray-300 text-xs px-3 py-1.5 rounded flex items-center gap-1.5 transition-colors">
             <iconify-icon icon="ant-design:reload-outlined" class="icon-sm"></iconify-icon>
-            Refresh
+            <span data-i18n="refresh">Refresh</span>
         </button>
     </div>
 
@@ -26,7 +26,7 @@
         <div class="bg-gray-900 rounded-lg p-4 border border-gray-800 border-b-2 border-b-slate-500">
             <div class="flex items-center gap-2 text-slate-400 text-xs mb-2">
                 <iconify-icon icon="ant-design:database-outlined" class="icon-sm"></iconify-icon>
-                <span>All Episodes</span>
+                <span data-i18n="stat_total">All Episodes</span>
             </div>
             <div class="text-2xl font-bold text-white" id="stat-total-total">-</div>
             <div class="text-xs text-slate-400 mt-1 hidden" id="stat-total-today"></div>
@@ -35,7 +35,7 @@
         <div class="bg-gray-900 rounded-lg p-4 border border-gray-800 border-b-2 border-b-yellow-500">
             <div class="flex items-center gap-2 text-yellow-400 text-xs mb-2">
                 <iconify-icon icon="ant-design:eye-outlined" class="icon-sm"></iconify-icon>
-                <span>To Review</span>
+                <span data-i18n="stat_to_review">To Review</span>
             </div>
             <div class="text-2xl font-bold text-white" id="stat-reviewing-total">-</div>
             <div class="text-xs text-yellow-400 mt-1 hidden" id="stat-reviewing-today"></div>
@@ -44,7 +44,7 @@
         <div class="bg-gray-900 rounded-lg p-4 border border-gray-800 border-b-2 border-b-green-500">
             <div class="flex items-center gap-2 text-green-400 text-xs mb-2">
                 <iconify-icon icon="ant-design:check-circle-outlined" class="icon-sm"></iconify-icon>
-                <span>Approved</span>
+                <span data-i18n="stat_approved">Approved</span>
             </div>
             <div class="text-2xl font-bold text-white" id="stat-approved-total">-</div>
             <div class="text-xs text-green-400 mt-1 hidden" id="stat-approved-today"></div>
@@ -53,7 +53,7 @@
         <div class="bg-gray-900 rounded-lg p-4 border border-gray-800 border-b-2 border-b-red-500">
             <div class="flex items-center gap-2 text-red-400 text-xs mb-2">
                 <iconify-icon icon="ant-design:warning-outlined" class="icon-sm"></iconify-icon>
-                <span>Failed</span>
+                <span data-i18n="stat_failed">Failed</span>
             </div>
             <div class="text-2xl font-bold text-white" id="stat-failed-total">-</div>
         </div>
@@ -63,23 +63,23 @@
     <div id="stat-error" class="hidden bg-red-900/30 border border-red-800 rounded-lg p-4 mb-6 flex items-center justify-between">
         <div class="flex items-center gap-2 text-red-300 text-sm">
             <iconify-icon icon="ant-design:warning-outlined" class="icon-sm"></iconify-icon>
-            <span>Failed to load statistics</span>
+            <span data-i18n="load_failed_stats">Failed to load statistics</span>
         </div>
-        <button onclick="refreshDashboard()" class="bg-red-800 hover:bg-red-700 text-red-200 text-xs px-3 py-1 rounded">Retry</button>
+        <button onclick="refreshDashboard()" class="bg-red-800 hover:bg-red-700 text-red-200 text-xs px-3 py-1 rounded"><span data-i18n="retry">Retry</span></button>
     </div>
 
     <!-- ===== Row 2: Charts ===== -->
     <div class="grid grid-cols-2 gap-6 mb-6">
         <!-- Donut: Status Distribution -->
         <div class="bg-gray-900 rounded-lg border border-gray-800 p-5">
-            <h3 class="text-sm font-semibold text-gray-300 mb-4">Status Distribution</h3>
+            <h3 class="text-sm font-semibold text-gray-300 mb-4"><span data-i18n="stat_distribution">Status Distribution</span></h3>
             <div id="donut-chart" class="flex items-center justify-center">
                 <div class="skeleton w-48 h-48 bg-gray-800 rounded-full"></div>
             </div>
         </div>
         <!-- Bar: Daily Uploads -->
         <div class="bg-gray-900 rounded-lg border border-gray-800 p-5">
-            <h3 class="text-sm font-semibold text-gray-300 mb-4">Daily Uploads <span class="text-xs text-gray-600 font-normal">(last 30 days)</span></h3>
+            <h3 class="text-sm font-semibold text-gray-300 mb-4"><span data-i18n="daily_uploads">Daily Uploads</span> <span class="text-xs text-gray-600 font-normal" data-i18n="last_30_days">(last 30 days)</span></h3>
             <div id="trend-chart">
                 <div class="flex items-end gap-0.5 h-40 skeleton">
                     <div class="flex-1 bg-gray-800 rounded-t h-full"></div>
@@ -93,8 +93,8 @@
         <!-- Projects -->
         <div class="bg-gray-900 rounded-lg border border-gray-800 p-5">
             <div class="flex items-center justify-between mb-4">
-                <h3 class="text-sm font-semibold text-gray-300">Projects</h3>
-                <a href="/tasks" class="text-xs text-blue-400 hover:text-blue-300">View All →</a>
+                <h3 class="text-sm font-semibold text-gray-300"><span data-i18n="projects_title">Projects</span></h3>
+                <a href="/tasks" class="text-xs text-blue-400 hover:text-blue-300"><span data-i18n="view_all">View All</span> →</a>
             </div>
             <div id="task-progress-list">
                 <div class="space-y-3 skeleton">
@@ -107,7 +107,7 @@
 
         <!-- Recent Episodes -->
         <div class="bg-gray-900 rounded-lg border border-gray-800 p-5">
-            <h3 class="text-sm font-semibold text-gray-300 mb-4">Recent Episodes</h3>
+            <h3 class="text-sm font-semibold text-gray-300 mb-4"><span data-i18n="recent_episodes">Recent Episodes</span></h3>
             <div id="recent-list">
                 <div class="space-y-3 skeleton">
                     <div class="h-10 bg-gray-800 rounded"></div>

@@ -102,6 +102,17 @@ def write_project_episode_index(project_root: Path,
     # The legacy flat JSONL index is intentionally not generated anymore.
     (project_root / "meta" / "episodes.jsonl").unlink(missing_ok=True)
 
+    # ★ 必须失效缓存 —— 本函数是**索引的唯一写入点**，而 project_episode_rows()
+    #   读的是带 60s TTL 的模块级缓存。不失效的话，同一次调用里"写完再读"会拿到
+    #   删除前的旧行。
+    #
+    #   实测后果（2026-09-11 引入缓存时漏掉这步，删除从此全坏）：
+    #     delete_project_episode: 读一次(预热缓存) → 删文件 → 写索引 → 校验
+    #     校验又调 project_episode_rows → 旧缓存 → 报 "missing data" → RuntimeError
+    #     →「清空回收站」500。盘上的索引其实是对的，纯粹是缓存没跟上。
+    #   （delete_episode 末尾也会 invalidate_session_cache()，但那要等异常之后。）
+    invalidate_project_cache(project_root)
+
 
 def is_project_dataset(root: Path) -> bool:
     root = Path(root)
@@ -1402,13 +1413,30 @@ def merge_normalized_episode(project_root: Path, episode_root: Path,
     }
 
 
+# 人工/脚本留下的备份与临时文件 —— 不是删除或合并操作产生的，不该算到校验头上。
+#
+# ★ 为什么必须放过它们：``delete_episode`` 在**删完文件之后**才跑本校验，校验失败就
+#   抛 RuntimeError → 500，而「清空回收站」是循环处理的，一个项目失败整轮中止。
+#   实测踩过：两个 D435 项目的 meta/ 里各有一个 ``info.json.bak-20260908-144550``
+#   （9-08 留下的），于是**每次清空都 500、什么都删不掉**，而前端没有错误分支，
+#   用户看到的是"点了没反应"。一个备份文件不该有这种杀伤力。
+_IGNORED_ENTRY_SUFFIXES = (".bak", ".orig", ".tmp", ".save", "~")
+
+
+def _is_ignorable_entry(name: str) -> bool:
+    """备份/临时文件，或隐藏文件 —— 校验一律不看。"""
+    if name.startswith("."):
+        return True
+    return name.endswith(_IGNORED_ENTRY_SUFFIXES) or ".bak-" in name
+
+
 def verify_project_dataset(project_root: Path) -> dict[str, Any]:
     root = Path(project_root)
     rows = project_episode_rows(root)
     errors: list[str] = []
     unexpected = sorted(
         path.name for path in root.iterdir()
-        if path.name not in _CANONICAL_ROOTS and not path.name.startswith(".")
+        if path.name not in _CANONICAL_ROOTS and not _is_ignorable_entry(path.name)
     ) if root.is_dir() else []
     errors.extend(f"unexpected project root entry: {name}" for name in unexpected)
     expected_meta = {"info.json", "stats.json", "tasks.json", "episodes"}
@@ -1416,7 +1444,7 @@ def verify_project_dataset(project_root: Path) -> dict[str, Any]:
     if meta_root.is_dir():
         unexpected_meta = sorted(
             path.name for path in meta_root.iterdir()
-            if path.name not in expected_meta and not path.name.startswith(".")
+            if path.name not in expected_meta and not _is_ignorable_entry(path.name)
         )
         errors.extend(f"unexpected meta entry: {name}" for name in unexpected_meta)
     for row in rows:

@@ -520,14 +520,14 @@ async def complete_job(
         from app.ai_annotation import (
             run_ai_annotation,
             ai_annotation_node_config,
-            ai_quality_review_node_config,
-            video_quality_review_node_config,
+            annotation_coverage_gate_config,
+            video_quality_gate_config,
         )
         graph = run.get("graph") or {}
         node_configs = run.get("node_configs") or {}
         cfg = ai_annotation_node_config(graph, node_configs)
-        quality_cfg = ai_quality_review_node_config(graph, node_configs)
-        video_quality_cfg = video_quality_review_node_config(graph, node_configs)
+        quality_cfg = annotation_coverage_gate_config(graph, node_configs)
+        video_quality_cfg = video_quality_gate_config(graph, node_configs)
         if cfg is not None and not run.get("ai_suggest_triggered"):
             run["ai_suggest_triggered"] = True
             save_run(run)
@@ -571,6 +571,26 @@ async def complete_job(
                   f"for {run['episode_id']}")
     except Exception as exc:
         print(f"[Worker] AI annotation trigger skipped: {exc}")
+
+    # 数据质检联动:工作流里 Data Quality 卡片**接了数据链路**就跑一次检查。
+    #
+    # 与上面两条是两套东西:ai_annotation / video_quality 会改 episode 状态
+    # (通过→reviewed、失败→卡到 to_review),而质检**只把结论记进**
+    # state 的 cleaning_report,不参与状态流转。
+    #
+    # 两者会同时触发(相机类工作流就同时命中 video_quality_gate 和这里),而且
+    # 都各要解码一遍视频 —— 所以它们几乎同时结束、同时写状态,状态写入一律走
+    # localstore.mutate_episode_state(锁内 RMW),否则后写的会用旧快照把先写的
+    # 冲掉(尤其 status)。
+    #
+    # 必须放后台任务:probe_video 要解码视频(实测约 4.8s/集),不能拖住完成响应。
+    try:
+        from app.processing.cleaning.trigger import spawn_cleaning_for_run
+        if ep is not None and spawn_cleaning_for_run(run, ep):
+            print(f"[Worker] Data quality checks triggered "
+                  f"for {run['episode_id']}")
+    except Exception as exc:
+        print(f"[Worker] Data quality trigger skipped: {exc}")
 
     # 归档联动:处理完成后后台把该批次增量推送到 NAS(只推不删;rsync
     # 逐块校验+断点续传,失败仅记日志不阻塞响应;每晚 cron 兜底补传)。

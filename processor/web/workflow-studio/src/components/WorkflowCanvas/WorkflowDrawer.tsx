@@ -1,3 +1,4 @@
+import { useT } from '../../i18n';
 import { useEffect } from 'react';
 import { useWorkflowStore } from '../../store/workflowStore';
 import type { WorkflowListItem } from '../../types/workflow';
@@ -5,6 +6,7 @@ import type { WorkflowListItem } from '../../types/workflow';
 interface Props { onClose: () => void }
 
 export function WorkflowDrawer({ onClose }: Props) {
+  const t = useT();
   const { workflows, listLoading, loadWorkflowList, loadWorkflow, loadInputsForWorkflow, newWorkflow } = useWorkflowStore();
 
   useEffect(() => { loadWorkflowList(); }, [loadWorkflowList]);
@@ -22,7 +24,7 @@ export function WorkflowDrawer({ onClose }: Props) {
       <div className="absolute inset-0 bg-black/60" onClick={onClose} />
       <div className="relative w-80 bg-gray-900 border-r border-gray-800 h-full flex flex-col shadow-2xl">
         <div className="flex items-center justify-between px-4 py-3 border-b border-gray-800">
-          <h3 className="text-sm font-semibold text-gray-200">Workflows</h3>
+          <h3 className="text-sm font-semibold text-gray-200">{t('drawer.workflows')}</h3>
           <button onClick={handleNew} className="text-xs bg-blue-600 hover:bg-blue-500 text-white px-2 py-1 rounded">+ New</button>
         </div>
         <div className="flex-1 overflow-y-auto">
@@ -31,7 +33,7 @@ export function WorkflowDrawer({ onClose }: Props) {
           ) : workflows.length === 0 ? (
             <div className="flex flex-col items-center py-12 text-gray-600 gap-2">
               <span className="text-3xl">📋</span>
-              <span className="text-xs">No workflows yet</span>
+              <span className="text-xs">{t('drawer.noWorkflows')}</span>
             </div>
           ) : workflows.map((wf) => (
             <button key={wf.id} onClick={() => handleSelect(wf)}

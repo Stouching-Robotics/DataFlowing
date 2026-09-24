@@ -612,23 +612,36 @@ def _set_ai_quality_state(episode_id: str, report: dict, *,
 
     The web UI continues to use only Reviewing/Approved.  The detailed report
     is kept in episode state for diagnostics and future review tooling.
+
+    ★ ``auto_approve`` 会被【数据质检】否决 —— 判 FAIL/ERROR 的批次在
+      ``cleaning_summary.blocking`` 上留了粘性标记。AI 标注覆盖率合格不代表
+      数据本身没问题；只看自己那份报告的话，坏数据会被一路自动批准放行
+      （质检与视频门禁是并发跑的，谁先写没有保证，所以必须查标记而不是
+      比谁写得晚）。
     """
-    state = read_episode_state(episode_id)
-    state["ai_quality_status"] = "passed" if report.get("passed") else "failed"
-    state["ai_quality_report"] = report
-    state["updated_at"] = _utcnow()
-    current = str(state.get("status") or "")
-    if report.get("passed") and auto_approve:
-        if current in {"processing", "to_review", "completed", "failed"}:
-            state["status"] = "reviewed"
-            if not state.get("approved_at"):
-                state["approved_at"] = _utcnow()
-    elif not report.get("passed"):
-        # Fail closed: an incomplete/failed AI result remains in Reviewing.
-        if current in {"processing", "completed", "reviewed", "approved", "failed"}:
-            state["status"] = "to_review"
-            state["approved_at"] = None
-    write_episode_state(episode_id, state)
+    from app.localstore import mutate_episode_state
+    from app.processing.cleaning.store import is_approval_blocked
+
+    def _apply(state: dict) -> None:
+        state["ai_quality_status"] = "passed" if report.get("passed") else "failed"
+        state["ai_quality_report"] = report
+        state["updated_at"] = _utcnow()
+        current = str(state.get("status") or "")
+        if report.get("passed") and auto_approve:
+            if (current in {"processing", "to_review", "completed", "failed"}
+                    and not is_approval_blocked(state)):
+                state["status"] = "reviewed"
+                if not state.get("approved_at"):
+                    state["approved_at"] = _utcnow()
+        elif not report.get("passed"):
+            # Fail closed: an incomplete/failed AI result remains in Reviewing.
+            if current in {"processing", "completed", "reviewed", "approved", "failed"}:
+                state["status"] = "to_review"
+                state["approved_at"] = None
+
+    # 锁内 RMW：数据质检 / 视频门禁在同一次 run 后并发写同一份 state。分开
+    # read→write 的话，后写的会用旧快照把先写的 ``status`` 冲掉。
+    mutate_episode_state(episode_id, _apply)
 
 
 def _set_ai_quality_pending(episode_id: str) -> None:
@@ -3538,7 +3551,7 @@ def _connected_quality_node_config(graph: dict, node_configs: dict,
     }
     quality_nodes = {
         str(node.get("id")): node for node in nodes
-        if canonical_node_type((node.get("data") or {}).get("nodeType")) == "ai_quality_review"
+        if canonical_node_type((node.get("data") or {}).get("nodeType")) == "data_quality"
         and node.get("id") is not None
     }
     if not source_ids or not quality_nodes:
@@ -3570,25 +3583,32 @@ def _connected_quality_node_config(graph: dict, node_configs: dict,
     return None
 
 
-def ai_quality_review_node_config(graph: dict, node_configs: dict) -> dict | None:
-    """Return the quality card only when it is connected to AI Annotation.
+def annotation_coverage_gate_config(graph: dict, node_configs: dict) -> dict | None:
+    """Return the Data Quality card only when it is connected to AI Annotation.
 
     A card sitting alone in the canvas is configuration only.  The gate is
-    enabled for a directed path ``AI Annotation -> ... -> AI Quality Review``;
+    enabled for a directed path ``AI Annotation -> ... -> Data Quality``;
     allowing pass-through nodes in the middle keeps existing workflow layouts
     compatible while making a dangling quality card inert.
+
+    以前叫 ``ai_quality_review_node_config`` —— 当时节点叫 AI Quality Review。
+    节点合并为 Data Quality 后按"它能开启哪项检查"重命名，函数名不再绑定
+    已废弃的 slug。
     """
     return _connected_quality_node_config(
         graph, node_configs, {"ai_annotation"})
 
 
-def video_quality_review_node_config(graph: dict, node_configs: dict) -> dict | None:
-    """Return the quality card when it is connected to a media/data source.
+def video_quality_gate_config(graph: dict, node_configs: dict) -> dict | None:
+    """Return the Data Quality card when it is connected to a media/data source.
 
     This enables a video-only workflow to run the post-processing media gate,
-    while an unconnected ``AI Quality Review`` card remains inert.  The list
+    while an unconnected ``Data Quality`` card remains inert.  The list
     intentionally contains existing input/process node types only; export
     nodes cannot accidentally activate a review gate.
+
+    历史上这段逻辑属于 ``AI Quality Review`` 卡片 —— 视频检查当时"寄居"在
+    标注节点里，好让没有 AI 标注的纯视频工作流也有质量门禁。
     """
     return _connected_quality_node_config(
         graph,
@@ -3656,7 +3676,7 @@ def _workflow_ai_quality_enabled(episode_id: str) -> bool:
         wf = get_workflow(wf_id)
         if wf is None:
             continue
-        if ai_quality_review_node_config(
+        if annotation_coverage_gate_config(
                 wf.get("graph") or {}, wf.get("node_configs") or {}) is not None:
             return True
     return False
@@ -3683,7 +3703,7 @@ def _workflow_video_quality_enabled(episode_id: str) -> bool:
         wf = get_workflow(wf_id)
         if wf is None:
             continue
-        if video_quality_review_node_config(
+        if video_quality_gate_config(
                 wf.get("graph") or {}, wf.get("node_configs") or {}) is not None:
             return True
     return False

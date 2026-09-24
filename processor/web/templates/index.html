@@ -274,20 +274,20 @@
                 class="text-xs px-2.5 py-1.5 rounded-lg border border-gray-600/70 bg-gray-900/55 backdrop-blur-md text-gray-300 hover:border-blue-500 hover:text-white transition-colors flex items-center gap-1 shadow-lg"
                 style="cursor:move;user-select:none;">
             <iconify-icon icon="ant-design:menu-outlined" class="icon-sm"></iconify-icon>
-            <span>Preview Options</span>
+            <span data-i18n="preview_options">Preview Options</span>
         </button>
         <div id="preview-options-menu"
              class="hidden absolute left-0 top-full mt-1 w-64 rounded-lg border border-gray-600/70 bg-gray-900/60 backdrop-blur-md shadow-xl z-40 p-1.5 text-xs">
             <div id="po-video-row" class="hidden px-2 py-1.5 rounded hover:bg-gray-800">
                 <div class="flex items-center justify-between gap-2">
-                    <span class="text-gray-200">Video Sources</span>
+                    <span class="text-gray-200" data-i18n="video_sources">Video Sources</span>
                     <button id="po-video-all" type="button"
-                            class="text-[10px] text-cyan-300 hover:text-white">All</button>
+                            class="text-[10px] text-cyan-300 hover:text-white" data-i18n="all">All</button>
                 </div>
                 <div id="po-video-list" class="mt-1 space-y-1"></div>
             </div>
             <div class="flex items-center justify-between gap-2 px-2 py-1.5 rounded hover:bg-gray-800">
-                <span class="text-gray-200">Hand Skeleton</span>
+                <span class="text-gray-200" data-i18n="hand_skeleton">Hand Skeleton</span>
                 <label class="relative inline-flex items-center cursor-pointer">
                     <input type="checkbox" id="toggle-hand-skeleton" class="sr-only peer" checked>
                     <div class="bg-gray-700 peer-checked:bg-cyan-600 rounded-full relative transition-colors"
@@ -298,7 +298,7 @@
                 </label>
             </div>
             <div class="flex items-center justify-between gap-2 px-2 py-1.5 rounded hover:bg-gray-800">
-                <span class="text-gray-200">Hand Trail</span>
+                <span class="text-gray-200" data-i18n="hand_trail">Hand Trail</span>
                 <label class="relative inline-flex items-center cursor-pointer">
                     <input type="checkbox" id="toggle-hand-trail" class="sr-only peer">
                     <div class="bg-gray-700 peer-checked:bg-cyan-600 rounded-full relative transition-colors"
@@ -309,7 +309,7 @@
                 </label>
             </div>
             <div id="po-glove-row" class="hidden flex items-center justify-between gap-2 px-2 py-1.5 rounded hover:bg-gray-800">
-                <span class="text-gray-200">Glove Sensor</span>
+                <span class="text-gray-200" data-i18n="glove_sensor">Glove Sensor</span>
                 <label class="relative inline-flex items-center cursor-pointer">
                     <input type="checkbox" id="toggle-glove-sensor" class="sr-only peer" checked>
                     <div class="bg-gray-700 peer-checked:bg-emerald-600 rounded-full relative transition-colors"
@@ -351,7 +351,7 @@
     <div id="camera-tabs" class="hidden flex gap-2 px-4 pt-3 pb-0 border-b border-gray-800 items-center flex-shrink-0">
         <span id="episode-info" class="hidden text-xs text-gray-400 items-center gap-2 py-1.5"></span>
         <span id="frame-info-header" class="ml-auto text-xs font-mono text-gray-500 hidden">
-            Frame: <span id="detail-current-frame" class="text-green-400 font-bold">0</span>
+            <span data-i18n="frame_label">Frame:</span> <span id="detail-current-frame" class="text-green-400 font-bold">0</span>
             / <span id="detail-total-frames" class="text-gray-400">0</span>
         </span>
     </div>
@@ -405,7 +405,7 @@
             <button id="btn-skip-back-10" class="frame-control-button bg-gray-700 hover:bg-gray-600 text-white rounded flex items-center justify-center" title="Back 10 frames"><iconify-icon icon="ant-design:step-backward-outlined" class="icon-sm"></iconify-icon></button>
             <button id="btn-step-back" class="frame-control-button bg-gray-700 hover:bg-gray-600 text-white rounded flex items-center justify-center" title="Back 1 frame"><iconify-icon icon="ant-design:left-outlined" class="icon-sm"></iconify-icon></button>
             <button id="btn-play-all" onclick="togglePlayAll()" class="bg-blue-600 hover:bg-blue-500 text-white rounded text-xs flex items-center justify-center gap-1" title="Play all synchronized views" aria-pressed="false">
-                <iconify-icon data-play-icon icon="ant-design:caret-right-filled" class="icon-sm"></iconify-icon> <span class="play-label">Play</span>
+                <iconify-icon data-play-icon icon="ant-design:caret-right-filled" class="icon-sm"></iconify-icon> <span class="play-label" data-i18n="play">Play</span>
             </button>
             <button id="btn-step-forward" class="frame-control-button bg-gray-700 hover:bg-gray-600 text-white rounded flex items-center justify-center" title="Forward 1 frame"><iconify-icon icon="ant-design:right-outlined" class="icon-sm"></iconify-icon></button>
             <button id="btn-skip-forward-10" class="frame-control-button bg-gray-700 hover:bg-gray-600 text-white rounded flex items-center justify-center" title="Forward 10 frames"><iconify-icon icon="ant-design:step-forward-outlined" class="icon-sm"></iconify-icon></button>
@@ -443,12 +443,12 @@
         <span id="episode-list-count" class="text-xs text-gray-500"></span>
         <button id="btn-toggle-select" title="Toggle selection mode"
                 class="bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-gray-200 text-xs px-2 py-0.5 rounded flex-shrink-0 transition-colors"
-                onclick="toggleSelectMode()">Select</button>
+                onclick="toggleSelectMode()"><span data-i18n="select">Select</span></button>
         <button id="btn-sort-order" title="Toggle sort order"
                 class="bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-gray-200 text-xs px-2 py-0.5 rounded flex items-center gap-1 flex-shrink-0 transition-colors"
                 onclick="toggleSortOrder()">
             <iconify-icon id="sort-order-icon" icon="ant-design:ordered-list-outlined" class="icon-sm"></iconify-icon>
-            <span id="sort-order-label">Name 1→N</span>
+            <span id="sort-order-label" data-i18n="name_1_to_n">Name 1→N</span>
         </button>
     </div>
     <!-- Hidden filter controls (programmatic access by nav tree / app.js) -->
@@ -469,7 +469,7 @@
          两个按钮是两条完全不同的路径:导出数据集要整库重建(约 30 秒/集),
          打包下载是原样 zip(秒级)。文案里直接标出快慢,用户才不会点错。 -->
     <div id="batch-bar" class="px-2 py-2 border-b border-gray-700 flex-shrink-0 hidden bg-gray-800">
-        <div id="batch-count" class="text-xs text-gray-300 mb-1.5">0 selected</div>
+        <div id="batch-count" class="text-xs text-gray-300 mb-1.5" data-i18n="n_selected">0 selected</div>
         <div class="flex gap-1.5">
             <button id="batch-export-btn" onclick="batchDownload(this)"
                     class="flex-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs px-1.5 py-1.5 rounded font-medium whitespace-nowrap">
@@ -518,7 +518,7 @@
                 <div class="{{ 'hidden' if page_mode != 'annotation' else '' }} flex items-center gap-1">
                     <button id="btn-ai-annotate" type="button"
                             class="hidden text-[11px] px-2 py-1 rounded border border-cyan-600/60 bg-cyan-900/20 text-cyan-300 hover:bg-cyan-900/40 transition-colors"
-                            title="AI 自动切段并提案标注(模式由工作流 AI Annotation 卡片配置决定)">
+                            data-i18n-title="anno_ai_mode_title" title="AI 自动切段并提案标注(模式由工作流 AI Annotation 卡片配置决定)">
                         <iconify-icon icon="ant-design:thunderbolt-outlined" class="icon-sm"></iconify-icon>
                         <span data-i18n="ai_annotate">AI Annotate</span>
                     </button>
@@ -526,7 +526,7 @@
                             class="text-[11px] px-2 py-1 rounded border border-gray-600/70 bg-gray-800/40 text-gray-400 hover:bg-gray-800 transition-colors"
                             title="Undo (Ctrl+Z)">
                         <iconify-icon icon="ant-design:rollback-outlined" class="icon-sm"></iconify-icon>
-                        <span>Undo</span>
+                        <span data-i18n="undo">Undo</span>
                     </button>
                 </div>
             </div>

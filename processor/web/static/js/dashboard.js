@@ -28,13 +28,13 @@ function timeAgo(isoStr) {
 
 function statusBadge(status) {
     var map = {
-        'completed':  { cls: 'bg-yellow-900/50 text-yellow-400', label: 'Reviewing' },
-        'to_review':  { cls: 'bg-yellow-900/50 text-yellow-400', label: 'Reviewing' },
-        'reviewed':   { cls: 'bg-green-900/50 text-green-400',  label: 'Approved' },
-        'approved':   { cls: 'bg-green-900/50 text-green-400',  label: 'Approved' },
-        'processing': { cls: 'bg-blue-900/50 text-blue-400',    label: 'Processing' },
-        'received':   { cls: 'bg-indigo-900/50 text-indigo-400', label: 'Received' },
-        'failed':     { cls: 'bg-red-900/50 text-red-400',      label: 'Failed' },
+        'completed':  { cls: 'bg-yellow-900/50 text-yellow-400', label: t('stat_reviewing') },
+        'to_review':  { cls: 'bg-yellow-900/50 text-yellow-400', label: t('stat_reviewing') },
+        'reviewed':   { cls: 'bg-green-900/50 text-green-400',  label: t('stat_approved') },
+        'approved':   { cls: 'bg-green-900/50 text-green-400',  label: t('stat_approved') },
+        'processing': { cls: 'bg-blue-900/50 text-blue-400',    label: t('stat_processing') },
+        'received':   { cls: 'bg-indigo-900/50 text-indigo-400', label: t('stat_received') },
+        'failed':     { cls: 'bg-red-900/50 text-red-400',      label: t('stat_failed') },
     };
     var m = map[status] || { cls: 'bg-gray-800 text-gray-400', label: status || 'unknown' };
     return '<span class="text-xs px-2 py-0.5 rounded ' + m.cls + '">' + m.label + '</span>';
@@ -180,9 +180,9 @@ function renderRecent(episodes) {
     el.innerHTML = episodes.map(function(ep) {
         var cleanIcon = '';
         if (ep.cleaning_passed === false) {
-            cleanIcon = ' <iconify-icon icon="ant-design:warning-filled" class="text-red-400 icon-sm" title="Cleaning failed"></iconify-icon>';
+            cleanIcon = ' <iconify-icon icon="ant-design:warning-filled" class="text-red-400 icon-sm" title="' + t('cleaning_failed') + '"></iconify-icon>';
         } else if (ep.cleaning_passed === true) {
-            cleanIcon = ' <iconify-icon icon="ant-design:check-circle-filled" class="text-green-400 icon-sm" title="Cleaning passed"></iconify-icon>';
+            cleanIcon = ' <iconify-icon icon="ant-design:check-circle-filled" class="text-green-400 icon-sm" title="' + t('cleaning_passed') + '"></iconify-icon>';
         }
         return '<a href="/review" class="flex items-center gap-3 px-2 py-2 rounded hover:bg-gray-800/50 transition-colors text-xs border-b border-gray-800/50 last:border-0">' +
             '<span class="text-gray-300 w-24 truncate flex-shrink-0">' + (ep.task_name || '').slice(0, 18) + cleanIcon + '</span>' +
@@ -203,9 +203,9 @@ function renderDonut(reviewing, approved, failed) {
     var total = reviewing + approved + failed || 1;
 
     var segments = [
-        { value: reviewing, color: '#eab308', label: 'To Review' },  // yellow
-        { value: approved,  color: '#22c55e', label: 'Approved'  },  // green
-        { value: failed,    color: '#ef4444', label: 'Failed'    },  // red
+        { value: reviewing, color: '#eab308', label: t('stat_to_review') },  // yellow
+        { value: approved,  color: '#22c55e', label: t('stat_approved')  },  // green
+        { value: failed,    color: '#ef4444', label: t('stat_failed')    },  // red
     ];
 
     var radius = 60;
@@ -240,7 +240,7 @@ function renderDonut(reviewing, approved, failed) {
     html += '<text x="' + cx + '" y="' + (cy - 8) + '" text-anchor="middle" ' +
         'class="fill-white font-bold" style="font-size:22px">' + fmtNum(total) + '</text>';
     html += '<text x="' + cx + '" y="' + (cy + 12) + '" text-anchor="middle" ' +
-        'class="fill-gray-500" style="font-size:11px">Total</text>';
+        'class="fill-gray-500" style="font-size:11px">' + t('donut_total') + '</text>';
 
     html += '</svg>';
 

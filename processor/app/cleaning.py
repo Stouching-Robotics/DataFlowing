@@ -281,20 +281,41 @@ def _check_frame_alignment_fs(batch_dir: Path) -> dict:
                 except Exception:
                     continue
         parquet_frames = len(seen)
+        if parquet_frames == 0:
+            return {"name": "frame_alignment", "passed": True, "detail": "No parquet data"}
+
+        # 2026-09-23 修:此处此前直接用 cv2 却没 import,异常被下方 except 吞掉,
+        # 整个帧对齐检查在文件级路径下**永远静默通过**(detail 里写的是
+        # "Check error (skipped)" 但 passed=True,不会引起任何人注意)。
+        try:
+            import cv2
+        except ImportError:
+            return {"name": "frame_alignment", "passed": True,
+                    "detail": "OpenCV not available — video frame count skipped"}
+
+        mp4s = sorted(batch_dir.rglob("*.mp4"))
+        if not mp4s:
+            # 与 _check_video_decode_fs 同款处理:没有视频就没有可比对的对象,
+            # 判"未适用"而不是"不匹配"——只有传感器的批次(如纯手套)是合法的。
+            # 修复 cv2 漏 import 后,这里若不给守卫会退化成 dev=10000% 的误报。
+            return {"name": "frame_alignment", "passed": True,
+                    "detail": "No video to compare against"}
+
         video_frames = 0
-        for mp4 in batch_dir.rglob("*.mp4"):
+        for mp4 in mp4s:
             cap = cv2.VideoCapture(str(mp4))
             try:
                 video_frames = max(video_frames, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0)
             finally:
                 cap.release()
-        if parquet_frames == 0:
-            return {"name": "frame_alignment", "passed": True, "detail": "No parquet data"}
         ratio = abs(parquet_frames - video_frames) / max(video_frames, 1)
         return {"name": "frame_alignment", "passed": ratio < 0.10,
                 "detail": f"parquet={parquet_frames}, video={video_frames}, dev={ratio:.1%}"}
     except Exception as e:
-        return {"name": "frame_alignment", "passed": True, "detail": f"Check error (skipped): {e}"}
+        # 保持 passed=True(不改变既有行为),但 detail 必须说清是"降级通过",
+        # 免得再出现"看起来全过了其实根本没检查"的情况。
+        return {"name": "frame_alignment", "passed": True,
+                "detail": f"Degraded pass — check errored: {e}"}
 
 
 def _check_sensor_completeness_fs(batch_dir: Path) -> dict:

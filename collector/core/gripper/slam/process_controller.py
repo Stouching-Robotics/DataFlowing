@@ -19,9 +19,11 @@ import traceback
 
 from core.gripper.runtime.device_access import device_access_guard, FAYS_SDK_INITIALIZATION_LOCK, fays_config_device_guard
 
+from config import settings as app_settings
+
 from .protocol import (
-    FAYS_STAGE_KEYS, PoseSample, parse_slam_line, pose_rejection_reason,
-    quat_conjugate, quat_product, rotate_pose_z90,
+    FAYS_STAGE_KEYS, PoseSample, finish_publish_pose, parse_slam_line,
+    pose_rejection_reason, rotate_pose_z90,
 )
 
 
@@ -312,11 +314,25 @@ class SlamProcessController:
         self._pose_buffer_lock = threading.Lock()
         self._last_accepted_pose = None
         self._pose_rejecting = False
-        # 原点后姿态相对化：设原点事件后捕获首帧显示姿态作为基准，
-        # 此后所有姿态左乘基准的逆 → 第一帧姿态恒为单位矩阵，
+        # 原点后姿态相对化：设原点事件后捕获首帧**中间帧**姿态作为
+        # 基准，此后所有姿态左乘基准的逆 → 中间帧第一帧恒为单位矩阵，
         # 帧轴与轨迹同基准（相对原点），见 _publish_pose。
-        self._pose_rotation_zero = None
+        # ★ 基准活在中间帧（rotate_pose_z90 的输出）里，**不是**发布帧。
+        #   字段名里的 _mid 就是提醒这件事，改名前先读 _publish_pose。
+        #   顺序本身自 v1.3.13 起不再敏感（姿态左右各乘一次 M 之后，
+        #   M 在两步相遇处整个约掉，(M·R0·Mᵀ)ᵀ(M·R·Mᵀ) 与先相对化再重标
+        #   逐元素相同，有回归钉着）；但基准必须与**进来的样本**同帧才好
+        #   推理，而样本在这一步还是中间帧 —— 所以基准就留在中间帧。
+        self._pose_rotation_zero_mid = None
         self._pose_rotation_zero_pending = True
+        # 发布坐标帧（v1.3.13）：默认 +X=下 / +Y=左 / +Z=前；环境变量
+        # KSQ_GRIPPER_SLAM_FRAME=right_forward_up 回落旧约定。
+        # **每次会话解析一次**，不逐帧读 env —— 录制中途翻转会让同一个
+        # episode 里混进两种帧，而磁盘上分不出来（见 config/settings.py）。
+        self._publish_relabel = (
+            app_settings.resolve_gripper_slam_frame()
+            != app_settings.GRIPPER_SLAM_FRAME_LEGACY
+        )
         self._last_pose_reject_log = float("-inf")
         self._fays_rates_alarm = FaysRateAlarm()
         self._unmatched_lines = 0
@@ -386,6 +402,11 @@ class SlamProcessController:
         no pose has been accepted yet.  This is the dedicated control/GUI
         channel — it always returns the freshest sample without queue
         contention.
+
+        **The pose is in the PUBLISHED frame** (``_publish_pose`` 的返回值，
+        默认 +X=下 / +Y=左 / +Z=前，与 ``_pose_buffer`` / UI / 落盘同帧）——
+        不是 native、也不是中间帧。直接画它/记它与轨迹同坐标系；要 native
+        （例如做连续性判据）请用内部 ``_last_accepted_pose``，别在这里绕。
         """
         with self._latest_pose_lock:
             return (
@@ -816,28 +837,51 @@ class SlamProcessController:
             self._log("[SLAM] 读取原生日志失败: {}".format(exc))
 
     def _publish_pose(self, pose):
-        # S80M 坐标约定（正对=+Y、Z=上、X=右）：见
-        # protocol.rotate_pose_z90（真机实测定案，位置与姿态统一
-        # 纯左乘 R_z(+90°)，新 ORB 核心后 native=X=正对 Y=左 Z=上）。
-        # 此处是位姿唯一发布入口，UI/落盘/pose.json/回填缓冲全部统一旋转。
+        # 位姿唯一发布入口 —— UI / 落盘（episode 的 slam_trajectory）/
+        # orb_pose.json / 回填缓冲全部走这一条路，帧也只有这一个。
+        #
+        #   native --rotate_pose_z90--> 中间帧(X=右 Y=正对 Z=上)
+        #          --相对化--> --relabel--> 发布帧(X=下 Y=左 Z=前)
+        #
+        # rotate_pose_z90 是真机实测定案（2026-09-09，见 protocol.py）；
+        # 发布帧自 v1.3.13 起是中间帧再叠一次世界重标，环境变量可回落。
+        # ★ 相对化与重标的先后顺序自 v1.3.13 起**不再敏感**：姿态是左右各
+        #   乘一次 M·R·Mᵀ，两步一倒 M 会在相遇处整个约掉，
+        #   (M·R0·Mᵀ)ᵀ(M·R·Mᵀ) == M·R0ᵀ·R·Mᵀ（回归钉在
+        #   tools/tests/test_gripper_pose_axes.py 第 5 节）。改动之前那个
+        #   "反过来就少换一次帧、夹爪跟轨迹差 90°" 的坑已经不在了。
+        #   finish_publish_pose 仍是唯一入口，因为它同时管着锚定与要不要重标。
+        #
+        # **返回发布帧位姿**。入参 pose 是 native 帧的对象，本函数只重绑定
+        # 自己的局部名（rotate_pose_z90 / finish_publish_pose 都返回新对象，
+        # PoseSample 是 frozen dataclass），调用方的那个对象**不会**被换帧。
+        # 所以谁要发布帧的位姿，就得拿这里的返回值 —— 别在调用点拿原来的
+        # 变量（_latest_pose 曾经就是这么写错的，症状是将来接上 GUI 就会
+        # 画成"坐标系没改"）。
         pose = rotate_pose_z90(pose)
         # 原点后姿态相对化：C++ 设原点只把位置归零，静止首帧的姿态
         # 仍带部署校正/启动朝向的常数旋转（旋转跳变的根源，两轮
-        # 变换形式修正都没能抵消它）。改为捕获首帧显示姿态为基准，
-        # 全部姿态左乘基准的逆 → 首帧姿态恒为单位矩阵（帧轴与世界
+        # 变换形式修正都没能抵消它）。改为捕获首帧**中间帧**姿态为基准，
+        # 全部姿态左乘基准的逆 → 中间帧首帧恒为单位矩阵（帧轴与世界
         # 轴对齐，不跳变），此后姿态 = 相对原点的真实转动，与轨迹
         # （位置相对原点）同基准。位置不动，保持已验证的轨迹映射。
+        #
+        # 基准捕获与左乘都必须留在中间帧里 —— 基准是拿来跟**进来的样本**
+        # 直接相乘的，样本走到这一步还是中间帧，基准就得同帧（字段名里的
+        # _mid 就是这个约束）。
+        # ⚠ 别再照抄老注释说"提到前面会让发布帧退回中间帧"：自 v1.3.13
+        # 姿态左右各乘一次 M 之后，整体提前是等价的（M 在两步相遇处自消，
+        # 实测与现状差 1.8e-15）；而只把**姿态**那一道重标提前、基准留在
+        # 中间帧，得到的是 R0ᵀ·M·R·Mᵀ —— 既不是中间帧也不是发布帧，是
+        # 混帧，那才是真正要防的写错法。
         if self._pose_rotation_zero_pending:
-            self._pose_rotation_zero = pose.rotation
+            self._pose_rotation_zero_mid = pose.rotation
             self._pose_rotation_zero_pending = False
-        if self._pose_rotation_zero is not None:
-            pose = replace(
-                pose,
-                rotation=quat_product(
-                    quat_conjugate(self._pose_rotation_zero),
-                    pose.rotation,
-                ),
-            )
+        pose = finish_publish_pose(
+            pose,
+            self._pose_rotation_zero_mid,
+            relabel=self._publish_relabel,
+        )
         self._on_pose(pose)
         timestamp = pose.timestamp
         x, y, z = pose.position
@@ -852,7 +896,7 @@ class SlamProcessController:
             ]:
                 del self._pose_buffer[key]
         if not self._pose_tmp_path or not self._pose_path:
-            return
+            return pose
         try:
             encoded = json.dumps({
                 "ts": timestamp,
@@ -869,6 +913,7 @@ class SlamProcessController:
             os.replace(self._pose_tmp_path, self._pose_path)
         except OSError:
             pass
+        return pose
 
     def send_origin(self, reason="origin reset"):
         """Write the bridge's newline protocol; never use SIGUSR1."""
@@ -940,7 +985,12 @@ class SlamProcessController:
             # 位置在原点帧被 C++ 归零，姿态却带着部署校正/启动朝向的
             # 常数残留（上次跳变的根源）；每个 origin 事件（含 NEW
             # ORIGIN）都重新捕获首帧姿态基准，与位置重归零保持一致。
-            self._pose_rotation_zero = None
+            # 重新锚定后发布帧的首帧姿态是**单位矩阵**（相对化 R0ᵀ·R 再
+            # 左乘 M、右乘 Mᵀ 给体轴改名，M·Mᵀ = I）——夹爪体轴与世界轴
+            # 在原点那一瞬重合，跟位置的"首帧就是原点"一致。
+            # ⚠只左乘不右乘（v1.3.13 之前）时它是常数 M，那才是要留心的
+            # 版本：首帧姿态是个常数，语义上"夹爪体轴指向右/正对/上"。
+            self._pose_rotation_zero_mid = None
             self._pose_rotation_zero_pending = True
             self._set_state(status="Tracking")
             self._log(f"[SLAM] {event.raw}")
@@ -958,6 +1008,14 @@ class SlamProcessController:
                 arrival_monotonic=arrival_monotonic,
                 arrival_wall_time=arrival_wall_time,
             )
+            # 连续性判据跑在 **native 帧**的位姿上（_publish_pose 还没被
+            # 调用）。理由是参照与被比对象必须同帧：进来的样本是 native，
+            # 而 _last_accepted_pose 就是上一次的同一个 native 样本，两者
+            # 直接可比。把发布变换提到这之前会**同时**换掉被比对象与参照
+            # （发布帧 = 中间帧再共轭一次 M，相对转角在共轭下不变，判据本身
+            # 结果一样），但那样判据读到的是"已经发布出去"的位姿、而
+            # _last_accepted_pose 的其余契约（见下方赋值处）也跟着变帧 ——
+            # 没有收益，别动。
             rejection = pose_rejection_reason(
                 pose, self._last_accepted_pose,
             )
@@ -978,14 +1036,22 @@ class SlamProcessController:
             self._pose_rejecting = False
             self._last_accepted_pose = pose
             counters["valid"] += 1
-            self._publish_pose(pose)
+            published = self._publish_pose(pose)
             with self._latest_pose_lock:
                 if self._last_accepted_seq:
                     gap = self._pose_raw_seq - self._last_accepted_seq - 1
                     if gap > 0:
                         self._pose_lost_count += gap
                 self._last_accepted_seq = self._pose_raw_seq
-                self._latest_pose = pose
+                # 存**发布帧**（= _pose_buffer / _on_pose 的那一份），与
+                # read_latest_pose 的契约一致：它自称 GUI/控制通道，给它
+                # native 帧的话，将来接上位姿显示就是「坐标系还是没改」的
+                # 同款症状（v1.3.13 踩过一次）。
+                # 上面那两行别跟着改：连续性判据与 _last_accepted_pose 必须
+                # 留在 native 帧 —— 它们比的是**进来的样本**，那个是 native，
+                # 参照与被比对象得同帧（理由详见 pose 分支开头那段）。
+                # tools/tests/test_gripper_latest_pose_frame.py 钉着这条。
+                self._latest_pose = published
                 lost_count = self._pose_lost_count
             self._set_state(pose_lost_count=lost_count)
             self._set_state(status="Tracking")

@@ -97,6 +97,47 @@ fnum  = (N - 1) % 1000      # 三位零起：episode-000 .. episode-999
 | `calibration` | obj | **任务级最新标定**（每设备一键：如 `head_stereo`，内容为 `StereoCalibration.to_dict()` 规范化结构：`type/name/resolution/fps/baseline/left_camera/right_camera/depth_scale/cam_imu_timeshift`，相机内参为 `{intrinsic: [fx,fy,cx,cy], distortion: [...]}`）。多设备时以设备名/前缀消歧编号（`d435_rgb_calibration` 等） |
 | `total_episodes` | int | 当前 episode 数（上传删除不回退，见 §6） |
 | `video_extensions` | obj | **每个 image_key** → 扩展名（RGB=`mp4`；深度=`mp4`=12-bit 灰度 HEVC、`mkv`=FFV1 回落）；读侧必须按此判文件，勿按扩展名硬猜格式 |
+| `gripper_slam_frame` | str | **条件字段（v1.3.13 增）**：本任务 SLAM 位姿所用的坐标帧 id。**只在任务真有 SLAM 轨迹列时写**——没有 `observation.*slam_trajectory` 的任务不会出现这个键。取值见 §3.1 |
+
+### 3.1 SLAM 位姿坐标帧（v1.3.13 增）
+
+两处标注，作用不同：
+
+- **顶层 `gripper_slam_frame`**（上表）：整个任务的位姿帧，一眼可见。
+- **`features["observation.<sn>_slam_trajectory"]` 里的 `frame` / `frame_axes`**：
+
+  ```json
+  "observation.gripper_1_slam_trajectory": {
+    "dtype": "float64", "shape": [8],
+    "encoding": "flat_points_8_txyz_qxyzw",
+    "frame": "down_left_forward",
+    "frame_axes": {"+X": "down", "+Y": "left", "+Z": "forward"}
+  }
+  ```
+
+  `frame` 是帧 id，`frame_axes` 是各轴在现实中指向哪（中文名只在 GUI 上，不落盘）。
+  两个已知 id：
+
+  | `frame` | `frame_axes` | 叫法 |
+  |---|---|---|
+  | `down_left_forward` | `{"+X":"down","+Y":"left","+Z":"forward"}` | 新帧，**v1.3.13 起的默认** |
+  | `right_forward_up` | `{"+X":"right","+Y":"forward","+Z":"up"}` | 旧帧（`X=右/Y=正对/Z=上`） |
+
+  ★注意旧帧的 `+Y` 是 `forward` 而中文叫「正对」不是「前」：两个帧的 `forward`
+  指的是**不同物理方向**，读端别把两个 id 的 `forward` 当成同一个。
+
+**读侧两条硬规则：**
+
+1. **`frame` 键不在 = 旧帧**，不是"取默认值"。分界是**发布版本**不是日历日：
+   v1.3.13（2026-09-28）起录的才写这个键，v1.3.12 及更早录的**根本不写**。
+   所以对老 episode 忽略这个键、按 `right_forward_up` 解读。
+2. **标注是任务级的**，不是每 episode 一条：`features` 按并集 / 后写覆盖合并，
+   一个任务目录若跨了这次改帧，`info.json` 只能记住**最后写入**的那个帧，
+   该任务早期的 episode 会被标错。要逐 episode 精确区分得往 `meta/episodes`
+   加列（v1.3.13 未加）。跨线的任务目录请按录制日期切开。
+
+坐标约定本身（帧的物理含义、`M` 变换、与相机相对化的关系）见本仓库
+`docs/data.md` 的坐标帧一节。
 
 ## 4. meta/stats.json（任务级全局统计，v1.1.1 契约）
 

@@ -1,6 +1,6 @@
 # collector — Multimodal Data Acquisition SDK · 多模态数据采集 SDK
 
-![Version](https://img.shields.io/badge/version-1.3.12-blue)
+![Version](https://img.shields.io/badge/version-1.3.13-blue)
 ![Python](https://img.shields.io/badge/python-3.10-blue)
 ![License](https://img.shields.io/badge/license-TBD-lightgrey)
 
@@ -339,6 +339,13 @@ venv/bin/python tools/tests/test_sdk_python_version.py
 # gripper pairing / ESP32 port diagnostics in the main GUI (v1.3.12)
 venv/bin/python tools/tests/test_gripper_fays_pairing.py
 venv/bin/python tools/tests/test_gripper_esp_binding.py
+# published pose frame + pose view (v1.3.13) — run all five after touching
+# either side of the frame contract (protocol/ vs ui/pose_view_qt.py)
+venv/bin/python tools/tests/test_gripper_pose_axes.py
+venv/bin/python tools/tests/test_gripper_pose_host_stamp.py
+venv/bin/python tools/tests/test_gripper_slam_columns.py
+venv/bin/python tools/tests/test_gripper_latest_pose_frame.py
+venv/bin/python tools/tests/test_pose_view_qt.py
 # hardware tests require the corresponding device attached: d405_worker_test,
 # d435_e2e_test, d435_gui_smoke_test, mono_regression, d435_playback_test, etc.
 ```
@@ -400,6 +407,48 @@ are documented in [docs/index.md](docs/index.md#开发约定).
 
 ### Changelog
 
+- **v1.3.13** — the published gripper SLAM frame changes to **+X=down /
+  +Y=left / +Z=forward** (was +X=right / +Y=forward / +Z=up). The same
+  numbers feed the pose view, `observation.*slam_trajectory` and
+  `orb_pose.json`, so the frame lives in exactly one place — the publish
+  entry — as one extra world relabel applied *after* the rotation is
+  relativized to the origin. Orientation gets `M` on **both** sides,
+  `M·R·Mᵀ`: the right-hand factor renames the gripper's own body axes
+  into the published vocabulary (`+X=body-down / +Y=body-left /
+  +Z=body-forward`, replacing body-right/forward/up), so at the origin
+  anchor the published rotation is `M·Mᵀ` = the **identity** and the
+  gripper-following triad **coincides** with the world triad. (Left
+  multiply alone would leave it at the constant `M` — two triads ~120°
+  apart, which is exactly what the user rejected; the earlier "order is
+  a contract" hazard is gone too, since the conjugating `M` now cancels:
+  `(M·R0·Mᵀ)ᵀ(M·R·Mᵀ) == M·R0ᵀ·R·Mᵀ`.) The gripper's *physical*
+  orientation is untouched: the view moves the model's local vertices by
+  the same `M` before rotating them, so the drawn model is pixel-identical
+  to before — the two halves must change together, or the gripper renders
+  120° askew. One consequence is deliberate and pinned by tests: the
+  pose view applies **no**
+  frame compensation — the published frame *is* its data frame, so the
+  GUI frame and the trajectory frame are one and the same and the
+  picture changes along with it (the scene rotates ~120° against the
+  canvas while the world triad keeps its screen position and now reads
+  down/left/forward). Because that triad's *screen position* is
+  pixel-identical before and after (its tips are the constants `e_i`,
+  the projection reads no data — measured 0 px), the frame is also
+  **written on the canvas**: a `坐标帧 +X下 +Y左 +Z前` line under the
+  title and a direction word on each world-axis label (`X 下` / `Y 左` /
+  `Z 前`, auto-switching to `X 右` / `Y 正对` / `Z 上` under the
+  fallback), both derived from `settings` and never hardcoded; the full
+  frame id is in the widget tooltip.
+  `KSQ_GRIPPER_SLAM_FRAME=right_forward_up` falls back to the old
+  convention for A/B work; the frame is recorded in `meta/info.json`
+  (`observation.*slam_trajectory.frame` / `frame_axes` and a top-level
+  `gripper_slam_frame`) so external readers can tell the two apart.
+  Caveat: that tag is **task-level** — a task directory spanning the
+  switch can only attest to the last frame written. The cutover is the
+  **release**, not a calendar day: episodes recorded by v1.3.12 or
+  earlier (which includes everything currently on disk — the newest
+  episode is from 2026-09-21 21:01) are the old convention and carry no
+  `frame` key at all, so "key absent" means old frame.
 - **v1.3.12** — pairing a new gripper no longer needs the vendor toolkit GUI.
   When the app refused to connect a fresh gripper
   (`串口连接失败，无法查询绑定的 Fays 序列号: serial open/handshake failed: Write
@@ -1257,6 +1306,34 @@ i18n 文案经 `tr()` 翻译、PyQt5 信号参数用 `object` 封送大整数、
 
 ### 更新记录
 
+- **v1.3.13** — 夹爪 SLAM 的发布坐标帧改为 **+X=下 / +Y=左 / +Z=前**
+  （原 +X=右 / +Y=正对 / +Z=上）。位姿视图、`observation.*slam_trajectory`、
+  `orb_pose.json` 是同一份数值，帧也就只有一处 —— 发布入口，形态是
+  在「姿态相对化到原点」**之后**再叠一次世界重标。姿态是左右**各乘一次**
+  `M·R·Mᵀ`：右边那次给夹爪**体轴改名**（体轴从此跟世界轴共用一套词：
+  `+X=体下 / +Y=体左 / +Z=体前`，取代体右/体前/体上），于是换锚后第一帧
+  发布姿态 = `M·Mᵀ` = **单位矩阵**，跟随夹爪的三支箭头与世界三箭头在原点
+  那一瞬**重合**。只左乘不右乘时它是常数 `M`，两套箭头差约 120° —— 那正是
+  被否掉的一版；而且左右都乘之后 `M` 在两边相遇处整个约掉，
+  `(M·R0·Mᵀ)ᵀ(M·R·Mᵀ) == M·R0ᵀ·R·Mᵀ`，原先"顺序是契约"的隐患也一并消失。
+  夹爪的**物理朝向一点没变**：视图按同一张 `M` 把模型顶点从旧体轴坐标搬到
+  新体轴坐标再旋转，画出来逐像素与改前相同 —— ★这两处必须同进同退，
+  只改一处夹爪会被画歪 120°，且两种改法各自都"看起来自洽"。
+  另一个刻意后果：位姿视图**不做任何换帧补偿** ——
+  发布帧就是它的数据帧，gui 坐标系与轨迹系是同一个，换帧后画面随之整体
+  改变（场景相对画布转约 120°，世界轴三箭头屏幕位置不动、含义改成
+  下/左/前）。正因为那三支箭头的**屏幕位置**换帧前后逐像素相同（箭尖是常数
+  `e_i`，投影不吃数据，实测差 0px），帧才必须**写在画面上**：标题下第二行
+  `坐标帧 +X下 +Y左 +Z前`，三支世界轴标签各带方向词（`X 下` / `Y 左` /
+  `Z 前`，回落旧约定时自动变 `X 右` / `Y 正对` / `Z 上`）—— 两处都从
+  `settings` 派生、不硬编码，完整帧名在图上的 tooltip 里。
+  `KSQ_GRIPPER_SLAM_FRAME=right_forward_up` 可回落旧约定做 A/B；
+  帧名写进 `meta/info.json`（`observation.*slam_trajectory.frame` /
+  `frame_axes` 与顶层 `gripper_slam_frame`），读端据此分辨新旧。
+  注意该标注是**任务级**的：一个任务目录若跨了这次改帧，只能记住最后写入
+  的帧。分界是**发布版本**不是日历日 —— v1.3.12 及更早录的一律旧约定
+  （现存数据最新一段录于 2026-09-21 21:01，全在旧帧那侧），且那些 episode
+  **没有** `frame` 键：键不在就按旧帧读。
 - **v1.3.12** — 接新夹爪不再需要开厂商工具包 GUI。新板子连不上时报的那句
   `串口连接失败，无法查询绑定的 Fays 序列号: serial open/handshake failed: Write
   timeout` 里，最要紧的问题是「板子到底在不在说话」，而主程序原本答不了。夹爪

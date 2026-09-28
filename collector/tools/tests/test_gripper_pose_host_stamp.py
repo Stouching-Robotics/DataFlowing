@@ -21,14 +21,13 @@
   3. 带 Δq 第二行的变体：首行仍解析出位姿（正则只吃首行）
   4. Host 值畸形/缺失不污染其他字段
   5. 宿主戳是 int 不是 float（纳秒精度不能被浮点吃掉）
-  6. 落盘链路的两步变换（rotate_pose_z90 + dataclasses.replace）
-     都不丢戳、不改戳
+  6. 落盘链路的每一步变换（rotate_pose_z90 → 原点后姿态相对化 →
+     发布帧重标，即 protocol.finish_publish_pose 的实参路径）都不丢戳
 退出码 0 = 全部通过。
 """
 
 from __future__ import annotations
 
-import dataclasses
 import os
 import sys
 
@@ -37,7 +36,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
 sys.path.insert(0, REPO_ROOT)
 
 from core.gripper.slam.protocol import (                    # noqa: E402
-    _parse_pose, quat_conjugate, quat_product, rotate_pose_z90,
+    _parse_pose, finish_publish_pose, rotate_pose_z90,
 )
 
 # 与 core/gripper/native/.../fayssense_orb_slam.cc 的 printf 逐字对应
@@ -114,22 +113,36 @@ def main() -> int:
               f"pose={None if got is None else got.position} "
               f"ns={None if got is None else got.host_mono_ns}")
 
-    print("[5] 落盘链路两步变换不丢戳/不改戳")
-    # _publish_pose 实际做的是：rotate_pose_z90 → dataclasses.replace
-    # （原点后姿态相对化）。两步都必须原样带过宿主戳。
+    print("[5] 落盘链路各步不丢戳/不改戳（走 _publish_pose 的真实函数）")
+    # _publish_pose 实际做的是 rotate_pose_z90 → finish_publish_pose
+    # （= 原点后姿态相对化 → 发布帧重标）。每一步都必须原样带过宿主戳。
     rolled = rotate_pose_z90(pose)
     check("rotate_pose_z90 透传", rolled.host_mono_ns == 287607702508638,
           str(rolled.host_mono_ns))
     zero = (0.7071051, 0.0, 0.0, -0.7071051)
-    relativized = dataclasses.replace(
-        rolled,
-        rotation=quat_product(quat_conjugate(zero), rolled.rotation))
-    check("dataclasses.replace 相对化后仍在",
-          relativized.host_mono_ns == 287607702508638,
-          str(relativized.host_mono_ns))
-    check("位置/时间戳未被这两步改动",
-          relativized.position == rolled.position
-          and relativized.timestamp == rolled.timestamp)
+    published = finish_publish_pose(rolled, zero)
+    check("相对化+重标后仍在", published.host_mono_ns == 287607702508638,
+          str(published.host_mono_ns))
+    # 位置**会**被这两步按设计改（(−y,x,z) 再 (−z,−x,y)），不能改的是
+    # 时间戳：它是相机钟、要跟视频帧对齐用。
+    check("timestamp 未被这些步改动",
+          published.timestamp == rolled.timestamp == pose.timestamp,
+          str(published.timestamp))
+    check("位置按 中间帧→发布帧 的复合映射走",
+          rolled.position == (0.2, 0.1, 0.3)
+          and published.position == (-0.3, -0.2, 0.1),
+          f"rolled={rolled.position} published={published.position}")
+    # 回退路径（relabel=False）同样不能丢戳
+    legacy = finish_publish_pose(rolled, zero, relabel=False)
+    check("relabel=False 回退路径也不丢戳",
+          legacy.host_mono_ns == 287607702508638
+          and legacy.position == rolled.position,
+          str(legacy.host_mono_ns))
+    # 无基准分支（还没锚定）也不能丢戳
+    unanchored = finish_publish_pose(rolled, None)
+    check("无基准分支不丢戳",
+          unanchored.host_mono_ns == 287607702508638,
+          str(unanchored.host_mono_ns))
 
     print()
     if _FAILS:

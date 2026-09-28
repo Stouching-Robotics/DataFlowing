@@ -25,6 +25,7 @@
 | `ui/login_dialog.py` | 启动/切换账号登录对话框：账号登录（对话框内同步校验）或游客登录，关闭窗口等价游客；结果经 `choice()/server_url()/username()/cookies()` 等访问器读取 |
 | `ui/guide_dialog.py` | 使用说明窗口（首次启动自动弹出、帮助菜单重开；中英 HTML 模板；「不再显示」持久化到 QSettings）+ `VisibleCheckBox` 复选组件 |
 | `ui/playback_dialog.py` | 录制回放对话框：统一网格同步播放全部视频 + 传感器渲染，深度槽识别、手部关键点叠加、批量删除 |
+| `ui/pose_view_qt.py` | 夹爪位姿视图控件：QPainter 手绘的实时轨迹 + 世界坐标轴 + 跟随夹爪的体轴三箭头 + 夹爪模型（两张夹板按开合度张合） |
 | `ui/task_page.py` | 启动时的任务选择页：任务表、服务器地址/凭据输入、连接状态、进入采集 |
 | `ui/upload_dialog.py` | 录制会话一键打包上传对话框 |
 | `ui/__init__.py` | 空包标记（0 行） |
@@ -401,6 +402,41 @@
 - 会话列表项把上传状态存在 `Qt.UserRole + 1`。
 
 **调用关系**：由 `ui/main_window.py`（`_open_playback`）构造；`tools/tests/test_playback_multifps.py`、`tools/tests/d435_playback_test.py` 直接构造。依赖 `core.session_timeline.load_timeline/SensorTimeline`、`core.session_catalog`（fps/扫描/元数据）、`core.session_loader.SessionLoader`、`core.render_engine` 五种渲染器与 `CONFIG_FILE`/`CONFIG_FILE_LEFT`、`core.sensor_hand_config`、`core.helpers` 路径与扫描函数、`core.uploader.UploadManager.get_upload_status`；可选手部叠加来自 `core.hand_tracking`。
+
+### ui/pose_view_qt.py
+
+**作用**：夹爪位姿视图控件（QWidget 子类），挂在采集页网格的 pose 槽里，把夹爪的实时 SLAM 位姿画成一幅三维示意：**轨迹折线**（跟随夹爪累计的点）、**世界坐标三箭头**（固定在原点）、**跟随夹爪的体轴三箭头**（画的是发布姿态的三列），以及**夹爪模型**（两块夹板按 `set_grip_state` 的开合度张合）。视角可用鼠标拖拽旋转、滚轮缩放、双击复位，视野在轨迹走近边缘时自动扩张。
+
+**模块级常量**：
+
+| 常量 | 值 | 说明 |
+| --- | --- | --- |
+| `DISPLAY_TRAJECTORY_MAX_POINTS` | `6000` | 显示上限（原 400 太小，见 `docs/postmortem_trajectory_and_rgb.md`）；超出按 2 的幂翻倍 stride 抽稀 |
+| `TRAJECTORY_UPDATE_MIN_INTERVAL` | `1/25` 秒 | 轨迹重算节流（位姿本身不受影响） |
+| `SPAN_EXPAND_TRIGGER` / `SPAN_EXPAND_TARGET` / `SPAN_EXPAND_ANIM_SECONDS` | `0.85` / `1.35` / `0.3` | 视野自动扩张的触发比、目标比、动画时长 |
+| `AZIMUTH_DEFAULT` / `ELEVATION_DEFAULT` | `-150°` / `30°` | 初始视角 |
+| `BG` / `TITLE` / `TRAJECTORY` / `PLATE_GRIP` / `PLATE_OPEN` / `CONNECTOR` / `CAM_ORIGIN` | 暗色主题配色 | 背景、标题、轨迹、合拢/张开夹板、连接件、相机原点 |
+| `WORLD_AXES` / `CAM_AXES` | 颜色 + 轴名 | 世界三箭头与跟随夹爪三箭头的配色（`WORLD_AXES` 的标签恰好是 `["X","Y","Z"]`，被测试断言） |
+| `_BODY_RELABEL` | 帧 id → 换基矩阵 | **见下**：新帧 = `M`，旧帧 = 单位阵；把模型顶点从旧体轴搬到新体轴 |
+| `TITLE_TOP` | `2.0` | 画布上两行字（标题、坐标帧）的顶；行高取**字体实测高度**不写死像素（写死会裁掉中文笔画，而帧那行正是「一眼确认改没改」的入口） |
+
+**★ 坐标帧契约（v1.3.13）**：发布侧 `core/gripper/slam/protocol.py` 给位姿做了两次左乘 + 一次右乘（右乘 = **体轴改名**），本控件是那个契约的另一半：
+
+- `_draw_frame_axes` 画的是 `rotation` 的**三列**（= 夹爪体轴），不是三行。同一张 `M` 也在发布侧给体轴改了名，所以重新锚定那一瞬发布姿态 = `M·Mᵀ` = 单位矩阵，**跟随夹爪的三箭头与世界三箭头重合**，标签同写 下/左/前。
+- `_draw_gripper` 用 `_BODY_RELABEL`（与发布侧同一张 `M`）把模型顶点从旧体轴坐标搬到新体轴坐标，于是 `position + R·(M·v) == position + R_旧·v`，**夹爪的物理朝向与画面逐像素与改前相同**。
+- 后果：**只改发布侧不改这里（或反过来）夹爪会被画歪 120°**，而两种改法各自都"看起来自洽"——别只动一处。测试见 `tools/tests/test_pose_view_qt.py`。
+- 三箭头的轴名来自 `config.settings.GRIPPER_SLAM_FRAME_AXES_CN`，**不自己抄**（屏幕上的字与落进 `info.json` 的 `frame_axes` 必须同源）。
+
+**关键方法**：
+
+| 方法 | 签名 | 说明 |
+| --- | --- | --- |
+| `update_pose` | `(position, rotation, trajectory=())` | 主入口：更新位姿与轨迹，节流重算 |
+| `set_grip_state` | `(percentage, gripped)` | 夹板开合度与抓取态（决定配色 `PLATE_GRIP`/`PLATE_OPEN`） |
+| `set_localization_backend` / `reset` | `(backend)` / `()` | 标题栏后端标注 / 清空轨迹与视角（换夹爪、重新录制时调） |
+| `paintEvent` / `_draw_static` | — | 全部绘制走 QPainter；静态层（世界轴、模型）进缓存，只有轨迹逐帧重画 |
+
+**调用关系**：由 `ui/main_window.py:1616` 惰性 import 后构造（`pose_view = PoseViewQt()`），放进该夹爪的 `entry["pose_view"]`；位姿经 `_on_gripper_pose` → `update_pose`，抓取态经 `set_grip_state`，`reset()` 在换设备/重录时调。`tools/tests/test_pose_view_qt.py` 直接构造并离屏渲染（`QT_QPA_PLATFORM=offscreen`）。依赖 PyQt5、`config.settings`（`GRIPPER_SLAM_FRAME_AXES_CN` 等）、`numpy`。lite 包里**没有本控件**（lite 不含位姿视图）。
 
 ### ui/task_page.py
 

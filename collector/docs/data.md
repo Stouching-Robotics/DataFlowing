@@ -301,12 +301,39 @@ data/recordings/                          # 录制根目录（settings.RECORDING
 | `observation.gripper_{left,right}_force_ns` | int64 | 该力样本的采集时刻 |
 | `observation.gripper_{left,right}_force_matrix` | list<int16> / list<float32> | 250×250×3 力矩阵（档位见下） |
 | `observation.gripper_{left,right}_force_matrix_ns` | int64 | 该力矩阵样本的采集时刻 |
-| `observation.slam_trajectory` | list<double> | 轨迹点 `[t,x,y,z,qx,qy,qz,qw]`×N，变长 |
+| `observation.slam_trajectory` | list<double> | 轨迹点 `[t,x,y,z,qx,qy,qz,qw]`×N，变长（坐标帧见下） |
 | `observation.slam_trajectory_ns` | list<int64> | 每个轨迹点对应取样帧的**宿主时刻**，与 `slam_trajectory` 同序等长 |
 | `observation.gripper_state` | list<float32, 3> | `[open_pct, gripped, fz_mn]` |
 
 力矩阵档位记在**每段一份**的 `meta/episodes` 行（`force_matrix_specs` 列），
 不按面值猜——同一任务换档时前一段的倍率不会被后一段顶掉。
+
+#### SLAM 轨迹的坐标帧
+
+`x,y,z,qx,qy,qz,qw` 在现实中指向哪，由 `meta/info.json` 里的帧标注给出：
+
+| 键 | 值 |
+|---|---|
+| `observation.{prefix}slam_trajectory.frame` | 帧 id，如 `down_left_forward` |
+| `observation.{prefix}slam_trajectory.frame_axes` | `{"+X":"down","+Y":"left","+Z":"forward"}` |
+| `gripper_slam_frame`（顶层，仅真有 SLAM 轨迹的任务） | 同上帧 id，一眼可查 |
+
+- **v1.3.13 起**默认 `down_left_forward`：**+X=下 / +Y=左 / +Z=前**，右手系，
+  单位米，原点为按下 ENTER 那一刻的夹爪位置，姿态相对该帧首帧。
+- **v1.3.12 及更早**录的 episode（`data/recordings/UMIGripper_Action_AI` 里
+  那 153 段）是 `right_forward_up`：+X=右 / +Y=正对 / +Z=上。数值本身总是能
+  正常解算，**只是含义不同**，读端必须按帧标注解释，不能假设一种。
+- ⚠ 分界是**发布版本**，不是日历日：v1.3.13（2026-09-28）起才是新帧；
+  此前的版本**不写** `frame` 键 —— 所以旧 episode 里这两个键**不存在**，
+  「键不在」就等于旧帧，不要当成"缺省 = 新帧"。（2026-09-22..09-27 用
+  v1.3.12 录的也在旧帧那侧：没有键。现存数据最新一段录于 2026-09-21 21:01。）
+- ⚠ 帧标注是**任务级**的（`meta/info.json` 的 `features` 按并集/后写覆盖合并）：
+  一个任务目录若跨了这次改帧，它只能记住最后写入的帧，该任务早期 episode
+  会被标错。按 episode 精确区分需要 `meta/episodes` 加列（v1.3.13 未加）——
+  跨改帧的任务目录请按录制日期切分，切点取"那天升到了 v1.3.13"。
+- 环境变量 `KSQ_GRIPPER_SLAM_FRAME=right_forward_up` 可让新录制回落到旧帧
+  （做 A/B 对比用）；未设/空串走新帧，认不出的取值会向 stderr 出声后回落
+  新帧，不静默。该变量**每次会话解析一次**，录制中途改它不生效。
 
 **为什么需要 `_ns` 列。** 同一行里的 RGB 帧和力样本**不是同时刻采集的**，
 两条支路各走各的路：RGB 走外部帧源队列，写线程每 tick 取**队头最旧帧**；

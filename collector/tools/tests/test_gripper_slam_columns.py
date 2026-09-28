@@ -23,6 +23,9 @@ slam_trajectory（变长、每点带真实时间戳）信息严格更多，故�
   7. pipeline 侧 write_slam_trajectory/_pop_gripper_snapshots：时刻与点
      锁步、缺戳补 0 不跳过、弹出后清空、全程无戳（旧 native 二进制）
      不建 _ns 列
+  8. 坐标帧标注（v1.3.13）：features 的 frame/frame_axes、顶层
+     gripper_slam_frame；无 SLAM 的任务不写该键；KSQ_GRIPPER_SLAM_FRAME
+     回退/认不出时的解析行为
 退出码 0 = 全部通过。
 """
 
@@ -271,6 +274,65 @@ def main() -> int:
               "slam_trajectory" in snap7b
               and "slam_trajectory_ns" not in snap7b,
               str(sorted(snap7b)))
+
+        print("[8] 坐标帧标注（v1.3.13）：没有它读端分不出新旧约定")
+        # 帧名只在 config/settings.py 里定义一处；这里不另抄一份字符串，
+        # 抄一份就等于拿常量跟自己比，settings 改错时测试照样绿。
+        from config import settings
+        feat = feats2
+        check("features 带 frame 且是已知帧 id",
+              feat.get("frame") in settings.GRIPPER_SLAM_FRAME_AXES,
+              repr(feat.get("frame")))
+        check("frame_axes 与 settings 的该帧一致",
+              feat.get("frame_axes")
+              == settings.GRIPPER_SLAM_FRAME_AXES[feat["frame"]],
+              str(feat.get("frame_axes")))
+        check("新帧三轴 = 下/左/前",
+              settings.GRIPPER_SLAM_FRAME_AXES[
+                  settings.GRIPPER_SLAM_FRAME_NEW]
+              == {"+X": "down", "+Y": "left", "+Z": "forward"})
+        info8 = json.loads(open(os.path.join(tmp, "traj", "meta",
+                                             "info.json")).read())
+        check("顶层 gripper_slam_frame 与 features 同值",
+              info8.get("gripper_slam_frame") == feat["frame"],
+              repr(info8.get("gripper_slam_frame")))
+        check("rig2 列也带同一帧标注",
+              read_features(os.path.join(tmp, "dual"))[
+                  "observation.gripper_2_slam_trajectory"].get("frame")
+              == feat["frame"])
+        check("无 SLAM 轨迹的任务不塞无关键",
+              "gripper_slam_frame" not in json.loads(open(os.path.join(
+                  tmp, "nopose", "meta", "info.json")).read()),
+              "nopose 任务不该有 gripper_slam_frame")
+
+        print("[8b] 环境变量开关：回退/认不出各自的行为")
+        check("未设 ⇒ 新帧（默认）",
+              settings.resolve_gripper_slam_frame("")
+              == settings.GRIPPER_SLAM_FRAME_NEW)
+        check("旧约定名 ⇒ 旧帧",
+              settings.resolve_gripper_slam_frame("right_forward_up")
+              == settings.GRIPPER_SLAM_FRAME_LEGACY)
+        # 「不静默」得真验：一个认不出的取值必须在 stderr 留一行，否则
+        # 用户以为帧切换生效了、其实悄悄走的是默认值。
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            settings._SLAM_FRAME_WARNED.discard("nonsense")   # 去掉一次性去重
+            got8 = settings.resolve_gripper_slam_frame("nonsense")
+        check("认不出的取值 ⇒ 出声后回落新帧（不静默）",
+              got8 == settings.GRIPPER_SLAM_FRAME_NEW
+              and "nonsense" in err.getvalue()
+              and settings.GRIPPER_SLAM_FRAME_ENV in err.getvalue(),
+              repr(err.getvalue()[:80]))
+        check("大小写/空白不敏感",
+              settings.resolve_gripper_slam_frame("  Right_Forward_Up  ")
+              == settings.GRIPPER_SLAM_FRAME_LEGACY)
+        # 撤销重标 = 发布中间帧，两条路径必须都在 settings 里有一席之地
+        check("旧帧就是中间帧（relabel 关闭态）",
+              settings.GRIPPER_SLAM_FRAME_LEGACY == "right_forward_up"
+              and settings.GRIPPER_SLAM_FRAME_DEFAULT
+              == settings.GRIPPER_SLAM_FRAME_NEW)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

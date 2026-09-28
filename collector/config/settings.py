@@ -550,6 +550,65 @@ GRIPPER_SLOT_FORCE_L = "gripper_force_left"     # Sightac 左（热力图+力曲
 GRIPPER_SLOT_FORCE_R = "gripper_force_right"    # Sightac 右（热力图+力曲线）
 GRIPPER_STEREO_DISPLAY_FPS = 15.0               # 左目显示节流（SLAM 取帧在桥接进程内保持 30fps）
 GRIPPER_SLAM_READY_TIMEOUT_S = 45.0             # wait_sdk_ready 上限（SDK 运行时重读标定）
+# 夹爪 SLAM 发布坐标帧（v1.3.13）。GUI 位姿视图、episode 里的
+# observation.*slam_trajectory、orb_pose.json 三者是同一份数值，帧也只有一个。
+#   down_left_forward（默认）  +X=下 / +Y=左 / +Z=前
+#   right_forward_up（旧约定）  +X=右 / +Y=正对 / +Z=上
+# 环境变量 KSQ_GRIPPER_SLAM_FRAME 可回落旧约定（未设/空串 ⇒ 默认值；
+# 认不出的取值出声后回落默认，不静默）。**每次会话解析一次**，不逐帧读：
+# 录制中途翻转会让同一个 episode 里混进两种帧，而磁盘上分不出（见下）。
+#
+# 磁盘上的帧标注只有 meta/info.json 的 observation.*slam_trajectory.frame。
+# ★ 分界是**发布版本**，不是日历日：v1.3.13（2026-09-28）起录的才是本值，
+#   v1.3.12 及更早录的一律旧约定、而且那时**根本不写**这个键 —— 所以
+#   旧 episode 里 frame 键**不存在**，"键不在"就是"旧帧"，别去 lookup 默认。
+#   （2026-09-22..09-27 用 v1.3.12 录的也一样：没有键、旧帧。现存
+#   data/recordings 最新一段录于 2026-09-21 21:01，尚未跨到这条线。）
+# ★ 标注还是**任务级**的：features 按并集/后写覆盖合并，一个任务目录若跨了
+#   这次改帧，info.json 只能记住最后写入的帧，早期 episode 会被标错。要按
+#   episode 精确区分得往 meta/episodes 加列（本次未加）；跨线的任务目录请按
+#   录制日期切开，切点用"哪一天升到 v1.3.13"而不是写死的日期。
+GRIPPER_SLAM_FRAME_ENV = "KSQ_GRIPPER_SLAM_FRAME"
+GRIPPER_SLAM_FRAME_NEW = "down_left_forward"
+GRIPPER_SLAM_FRAME_LEGACY = "right_forward_up"
+GRIPPER_SLAM_FRAME_DEFAULT = GRIPPER_SLAM_FRAME_NEW
+# 帧 id → 各轴在现实中指向哪（写进 info.json，供外部读端判断）
+GRIPPER_SLAM_FRAME_AXES = {
+    GRIPPER_SLAM_FRAME_NEW: {"+X": "down", "+Y": "left", "+Z": "forward"},
+    GRIPPER_SLAM_FRAME_LEGACY: {"+X": "right", "+Y": "forward", "+Z": "up"},
+}
+# 同上，给界面用的中文。**只此一份** —— ui/pose_view_qt.py 直接读这张表，
+# 不自己抄：屏幕上写的字和上面落进 info.json 的 frame_axes 必须同源，否则
+# 改词只剩一边动，界面和落盘各说各话。
+# 旧约定的 +Y 写"正对"不是"前"：用户自己的叫法就是「X=右 / Y=正对 / Z=上」；
+# 两个帧的 forward 混用同一个中文字，会让人以为它们的 Y 是同一个物理方向。
+GRIPPER_SLAM_FRAME_AXES_CN = {
+    GRIPPER_SLAM_FRAME_NEW: {"+X": "下", "+Y": "左", "+Z": "前"},
+    GRIPPER_SLAM_FRAME_LEGACY: {"+X": "右", "+Y": "正对", "+Z": "上"},
+}
+_SLAM_FRAME_WARNED = set()
+
+
+def resolve_gripper_slam_frame(raw=None):
+    """解析发布坐标帧 id。缺省/空串 → 默认；认不出的值出声后回落默认。
+
+    raw 显式给了就用它（便于调用方传入自己的快照），否则读环境变量。
+    """
+    if raw is None:
+        raw = os.environ.get(GRIPPER_SLAM_FRAME_ENV, "")
+    value = str(raw or "").strip().lower()
+    if not value:
+        return GRIPPER_SLAM_FRAME_DEFAULT
+    if value in GRIPPER_SLAM_FRAME_AXES:
+        return value
+    if value not in _SLAM_FRAME_WARNED:
+        _SLAM_FRAME_WARNED.add(value)
+        known = "/".join(sorted(GRIPPER_SLAM_FRAME_AXES))
+        print(
+            "[settings] {}={!r} 不是已知坐标帧，按默认 {} 走（已知：{}）".format(
+                GRIPPER_SLAM_FRAME_ENV, raw, GRIPPER_SLAM_FRAME_DEFAULT, known),
+            file=sys.stderr)
+    return GRIPPER_SLAM_FRAME_DEFAULT
 GRIPPER_FORCE_MATRIX_DIM = 250                  # 触觉力矩阵边长（250×250×3）
 # 力矩阵落盘规格（工具栏可切换，持久化到 server_config.json）。
 # 与实时显示无关：显示一直走 float32 原值，本档位只决定落盘规格。

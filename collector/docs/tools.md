@@ -422,7 +422,7 @@ venv/bin/python tools/audit_frame_gaps.py [任务目录] [选项]   # 默认 dat
 
 ## tests/ 测试
 
-测试脚本见 `tools/tests/`（当前 71 份；离线测试加 `QT_QPA_PLATFORM=offscreen` 无需任何硬件，真机测试需对应设备在线）。完整运行命令见 `README.md` 测试节。**下表只列了一部分**（早期 16 份 + 帧空洞相关的 5 份 + 夹爪配对/离线入口），其余按需现查文件名。
+测试脚本见 `tools/tests/`（当前 73 份；离线测试加 `QT_QPA_PLATFORM=offscreen` 无需任何硬件，真机测试需对应设备在线）。完整运行命令见 `README.md` 测试节。**下表只列了一部分**（早期 16 份 + 帧空洞相关的 5 份 + 夹爪配对/离线入口 + 位姿坐标帧的 5 份），其余按需现查文件名。
 
 | 文件 | 类型 | 一句话 |
 | --- | --- | --- |
@@ -449,3 +449,8 @@ venv/bin/python tools/audit_frame_gaps.py [任务目录] [选项]   # 默认 dat
 | `test_audit_frame_gaps.py` | 离线 | 审计脚本三层判据/四桶/退出码（全合成 fixture） |
 | `test_gripper_fays_pairing.py` | 离线 | 夹爪配对链失败关闭（QF/WF、按 USB serial 唯一匹配、不猜端口） |
 | `test_gripper_esp_binding.py` | 离线 | 夹爪离线入口：串口诊断只读收集（含写阻塞时仍走通的只读复检、以及卡在第几笔写的留痕日志）、绑定读写与回读、界面三条链路的善后口径、「板子没在服务串口」提示的挂载范围 |
+| `test_gripper_pose_axes.py` | 离线 | 发布帧的行/列符号约定、`PUBLISH_RELABEL_MATRIX` 与 `_PUBLISH_RELABEL_QUAT` **必须同一张 M**（正交/det=+1/非镜像）、相对化与重标的次序无关性 |
+| `test_gripper_pose_host_stamp.py` | 离线 | 两种时刻的解析契约：位姿点的 `t` 是**相机钟**、native 的 `Host:` 是**宿主单调钟**（两者只差一个只能拟合的偏移，实测散布 ~104ms 已超一帧） |
+| `test_gripper_slam_columns.py` | 离线 | SLAM 落盘列契约：**只落 `slam_trajectory`、不再落 `slam_pose`**（后者是被 26.5% 填零的定长 `[0]*7`，下游会把零当真实位姿） |
+| `test_gripper_latest_pose_frame.py` | 离线 | 原生帧 → 发布帧的实际差值就是那张 M（位置 `M·Rz(+90°)`、姿态还多一层体轴改名 `Mᵀ`），拿真数据比对而不是复述公式 |
+| `test_pose_view_qt.py` | 离线 | 位姿视图：轨迹常驻、世界轴与**跟随夹爪的三箭头**重合且标签带方向词、三箭头取**列**（体轴）不取行、夹爪模型换基后逐像素不变、主窗口那次四元数→矩阵转换把帧带上 |

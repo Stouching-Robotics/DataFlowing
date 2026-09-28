@@ -4,7 +4,7 @@ This module is deliberately side-effect free.  It does not know about Tk,
 process handles, files, or the application composition root.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import re
 from types import MappingProxyType
@@ -379,7 +379,12 @@ def _parse_pose(line):
 
 
 def rotate_pose_z90(pose):
-    """S80M 轨迹坐标约定：绕 Z 轴旋转 +90°（X=右 Y=正对 Z=上）。
+    """S80M native → **中间帧**（X=右 Y=正对 Z=上，等价 ENU）。
+
+    ★ 这不是发布帧。自 v1.3.13 起发布帧是本函数的输出再叠一次
+    世界重标（见 finish_publish_pose / relabel_published_frame），
+    默认 +X=下 / +Y=左 / +Z=前。单独调本函数得到的是中间帧：
+    既不是 native，也不是发布出去的那个帧 —— 别拿它当结果。
 
     真机实测定案（2026-09-09，新 ORB 核心上线后）：native 输出
     相对物理系为 R_z(−90°)——native X=正对、Y=左、Z=上（实测：
@@ -394,7 +399,7 @@ def rotate_pose_z90(pose):
     结果：X=右、Y=夹爪正对、Z=上（右手系，等价 ENU）。
     静止首帧姿态 = R_z(+90°)·correction（部署校正的常数残留，
     约 R_x(−90°)，非单位矩阵）——由 process_controller 的原点后
-    姿态相对化（捕获首帧显示姿态为基准）吸收，首帧显示恒为
+    姿态相对化（捕获首帧中间帧姿态为基准）吸收，中间帧首帧恒为
     单位矩阵，帧轴与世界轴对齐、无起始跳变。
     """
     x, y, z = pose.position
@@ -409,6 +414,98 @@ def rotate_pose_z90(pose):
         # "只能按行号/相机钟对齐"的状态，落盘侧拿不到真实取样时刻）
         host_mono_ns=pose.host_mono_ns,
     )
+
+
+# 发布帧重标 M：中间帧 {X=右, Y=正对, Z=上} → 发布帧 {X=下, Y=左, Z=前}。
+# 换基矩阵（行 = 新基在旧坐标下的分量）
+#   M = [[0,0,-1],[-1,0,0],[0,1,0]]，det=+1、trace=0
+#     = 绕 (1,-1,-1)/√3 转 120° = R_y(-90°)·R_z(-90°)
+# 四元数 q_M=(0.5,-0.5,-0.5,0.5)，位置 (x,y,z)→(-z,-x,y)。
+# 物理验收判据（换帧的全部意义就在这里）：
+#   正对(旧 +Y) → +Z ；左(旧 −X) → +Y ；下(旧 −Z) → +X
+#   右(旧 +X) → −Y ；上(旧 +Z) → −X ；后(旧 −Y) → −Z
+# M³ = 单位（M 是 120° 旋转）—— 测试里用它当不变量。
+# 同一张 M 在发布侧要用三处：位置左乘、姿态左乘、姿态右乘 Mᵀ（体轴改名）。
+# 前两处的四元数从下面这个常量来；**位置那次是手写的字面量**（position=
+# (-z,-x,y)，M 的行恰好一行一个 ±1），没有从常量派生 —— 改 M 的话这一处
+# 要跟着手改，别以为引了常量就自动同步。矩阵形式那个常量是给绘制侧
+# （ui/pose_view_qt._BODY_RELABEL）用的，两边共用同一张 M，不要另抄一份。
+_PUBLISH_RELABEL_QUAT = (0.5, -0.5, -0.5, 0.5)
+
+# 同一个 M 的矩阵形式，给**体轴改名**那一侧用：画夹爪模型时把顶点从旧体轴
+# 坐标搬到新体轴坐标（v_新 = M·v_旧）。跟姿态那个右乘 Mᵀ 是一体两面：
+# 姿态少乘一次夹爪就画歪 120°，模型少搬一次同样画歪 120° —— 两处必须同时
+# 用同一个 M（ui/pose_view_qt._BODY_RELABEL 直接引这里，不自己抄矩阵）。
+PUBLISH_RELABEL_MATRIX = (
+    (0.0, 0.0, -1.0),
+    (-1.0, 0.0, 0.0),
+    (0.0, 1.0, 0.0),
+)
+
+
+def relabel_published_frame(pose):
+    """世界重标 + 体轴改名：中间帧 → 发布帧（默认 +X=下 / +Y=左 / +Z=前）。
+
+    位置**左乘** M（世界换基）；姿态**左右各乘一次** M·R·Mᵀ。
+
+    右乘那一次是**夹爪体轴改名**，别删：体轴从此跟世界轴共用一套词，
+    夹爪的"右/前/上"改叫"−Y/+Z/−X"（等价说法：+X=体下、+Y=体左、
+    +Z=体前）。只左乘不右乘的话，发出去的姿态就成了"世界换了名、体轴
+    没换名"——GUI 里跟随夹爪的那三支箭头跟世界三箭头差一个常数 M
+    （约 120°），用户看见的就是"跟随夹爪的坐标轴还没改"。
+
+    补上右乘后，原点那一瞬发布姿态 = M·Mᵀ = **单位矩阵**：夹爪三箭头
+    与世界三箭头重合。这正是画面上"一眼看出用的是哪一帧"的判据。
+
+    ★ 右乘是**常量换基**，不动夹爪的物理朝向：绘制侧把模型顶点按同一个
+    M 从旧体轴搬到新体轴（ui/pose_view_qt._BODY_RELABEL），画出来逐点
+    与改之前相同 —— 见 tools/tests/test_pose_view_qt.py 的像素回归。
+    物理朝向不变、只有叫法变，所以"夹爪体前 = 局部 +Y"这套建模约定不用
+    推翻，只是画之前换一次坐标。
+
+    不动时基：host_mono_ns / timestamp 原样透传。用 dataclasses.replace
+    而不是重建 PoseSample —— PoseSample 上还有 device_name/sequence/
+    arrival_* 等字段，重建会把它们悄悄丢掉。
+    """
+    x, y, z = pose.position
+    return replace(
+        pose,
+        position=(-z, -x, y),
+        rotation=quat_product(
+            quat_product(_PUBLISH_RELABEL_QUAT, pose.rotation),
+            quat_conjugate(_PUBLISH_RELABEL_QUAT),
+        ),
+    )
+
+
+def finish_publish_pose(pose, rotation_zero=None, relabel=True):
+    """发布入口最后一步：原点后姿态相对化 →（可选）世界重标（含体轴改名）。
+
+    顺序：**现在两种顺序等价**，不再有雷。旧版（重标只左乘 M）时反过来做
+    会让 M 整体约掉、发出去的还是中间帧，而位置确实换了帧，于是 GUI 里
+    夹爪体轴模型会画成转了 90° 的姿势；v1.3.13 的重标改成左右各乘一次
+    （M·R·Mᵀ，右乘 = 体轴改名，见 relabel_published_frame）之后，
+        (M·R0·Mᵀ)ᵀ·(M·R·Mᵀ) = M·R0ᵀ·R·Mᵀ
+    与"先相对化再重标"逐元素相同 —— 共轭让 M 在两步里都自消。
+    tools/tests/test_gripper_pose_axes.py 第 5 节把这条等价性钉住了。
+    保留这个函数当唯一入口，是因为它同时管着"锚点相对化"和"要不要重标"
+    两件事，拆开调用迟早有人只做一半。
+
+    pose 必须已处于中间帧（rotate_pose_z90 的输出）。
+    rotation_zero = 本锚段的**中间帧**首帧姿态；None → 不做相对化
+    （设原点后的第一帧、以及还没锚定的阶段走这条）。
+    relabel=False → 旧约定（settings.GRIPPER_SLAM_FRAME_LEGACY），
+    发布中间帧本身（体轴也不改名），供过渡期回退。
+    """
+    if rotation_zero is not None:
+        pose = replace(
+            pose,
+            rotation=quat_product(
+                quat_conjugate(rotation_zero), pose.rotation),
+        )
+    if not relabel:
+        return pose
+    return relabel_published_frame(pose)
 
 
 def quat_conjugate(q):

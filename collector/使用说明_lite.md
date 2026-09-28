@@ -84,7 +84,7 @@
 | `observation.gripper_state` | 开合百分比 / 抓握判定 / 法向力 |
 | `observation.gripper_{left,right}_force` | 三轴合力；`_force_ns` 是它的采集时刻 |
 | `observation.gripper_{left,right}_force_matrix` | 10×10×3 力矩阵（整型编码，倍率见 `meta/info.json` 的 `features.*.scale`） |
-| `observation.slam_trajectory` | SLAM 轨迹（8 个值一个点，时间戳单调） |
+| `observation.slam_trajectory` | SLAM 轨迹（8 个值一个点，时间戳单调）。**坐标帧**：v1.3.13 起 +X=下 / +Y=左 / +Z=前；此前录的是 +X=右 / +Y=正对 / +Z=上。帧名落在 `meta/info.json`（`observation.slam_trajectory.frame` / `frame_axes`，或顶层 `gripper_slam_frame`）—— ⚠极简版**只录不显**，界面上看不到这条信息，读数据时按标注解释、不要假定是哪一套 |
 
 **不存**双目视频与 IMU。录制结束的日志里有一行双目丢帧汇总 —— 只录不显时，那是
 判断链路是否健康的唯一证据，出问题请把它连同 `logs/` 一起发给开发。
@@ -138,7 +138,8 @@ cd <部署目录>
       `videos/chunk-000/uvc_rgb/` 有视频，parquet 无深度相关列
 - [ ] **夹爪**（Linux 包）：冷启无 `[错误 B]` → 列表出现「UMI 夹爪 (序列号)」→ 开启 → 日志有
       链路就绪 → **只开夹爪**录 60s → `videos/…/gripper_rgb/` 有视频、`observation.gripper_state`
-      与 `gripper_{left,right}_force*`、`slam_trajectory` 列有值、抓握时力非零、轨迹时间戳单调
+      与 `gripper_{left,right}_force*`、`slam_trajectory` 列有值、抓握时力非零、轨迹时间戳单调；
+      `meta/info.json` 里 `observation.slam_trajectory.frame` = `down_left_forward`（极简版唯一的坐标帧凭据）
 - [ ] **夹爪**：录制中拔掉夹爪 USB → 弹窗提示 + 条目录回收 + **录制不中断**（其它设备继续录）
 - [ ] **夹爪**：关窗后 `ps -ef | grep -E "fayssense|ksq-camera-service|fays_vikit"` 零残留
 - [ ] **夹爪**：插第二台夹爪 → 列名走 `gripper_2_*` 前缀、两条 RGB 各自成档、互不串列

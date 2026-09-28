@@ -1091,7 +1091,17 @@ class EgoDataWriter(QObject):
         total_episodes/app_version。既有键保留合并（其他机器/旧版本写入
         的不丢）；features/cameras/video_extensions 按并集合并（key 一旦
         存在不因后续 episode 缺席而丢失），值以最新 episode 为准。
+
+        v1.3.13 增：有 SLAM 轨迹时写顶层 gripper_slam_frame（一眼看出
+        该任务的位姿帧）以及 observation.*slam_trajectory 上的
+        frame/frame_axes。都只加不改，服务器依赖的既有键原样不动。
         """
+        # 本任务写入的位姿帧。这里逐次解析（而不是像 process_controller
+        # 那样在构造时定一次）：进程外改不了运行中进程的 environ，所以
+        # 两者实际读到的必然是同一个值，不一致需要进程内有人去写
+        # os.environ —— 仓库里没有这样的代码。逐次读的好处是它永远反映
+        # 「刚录完那段数据时发布侧认的帧」。
+        slam_frame = settings.resolve_gripper_slam_frame()
         # cameras: 必须是 dict 格式 {key: {height, width, fps}}，不能用 list
         # 深度槽过滤以显式注册为准，不猜槽名
         cameras_dict = {}
@@ -1144,9 +1154,20 @@ class EgoDataWriter(QObject):
                 features[f"observation.{key}"] = matrix_features[
                     f"observation.{key}"]
             elif key.endswith("slam_trajectory"):
+                # 帧标注（v1.3.13）：没有它，读端无从知道 xyz 在现实中
+                # 指向哪 —— 2026-09-21 及更早录的 episode 是旧约定
+                # （+X=右/+Y=正对/+Z=上），之后默认 +X=下/+Y=左/+Z=前，
+                # 两者的数值都能正常解出来，只是含义不同。
+                # ⚠ features 是**任务级**、按并集/后写覆盖合并的：一个
+                # 任务目录若跨了这次改帧，这里只能记住最后写入的帧，
+                # 该任务早期的 episode 会被标错。按 episode 精确区分需要
+                # meta/episodes 加列（本次未加）。
                 features[f"observation.{key}"] = {
                     "dtype": "float64", "shape": [8],
-                    "encoding": "flat_points_8_txyz_qxyzw"}
+                    "encoding": "flat_points_8_txyz_qxyzw",
+                    "frame": slam_frame,
+                    "frame_axes": dict(
+                        settings.GRIPPER_SLAM_FRAME_AXES[slam_frame])}
             else:   # _state / _force
                 features[f"observation.{key}"] = {
                     "dtype": "float32", "shape": [3]}
@@ -1218,6 +1239,9 @@ class EgoDataWriter(QObject):
             "total_episodes": len(list_task_episodes(self._task_dir)),
             "video_extensions": merged_exts,
         })
+        # 只在真有 SLAM 轨迹的任务上标帧，别给无 SLAM 的任务塞无关键
+        if any(k.endswith("slam_trajectory") for k in self._present_gripper):
+            info["gripper_slam_frame"] = slam_frame
         self._atomic_write_json(path, info)
 
     def _merge_stats(self):

@@ -16,6 +16,7 @@ import { tr } from '../shared/text.js';
 import { renderCheckpoints } from './checkpoints.js';
 import { renderParams } from './params.js';
 import { renderNewRun } from './newrun.js';
+import { renderJobs } from './jobs.js';
 import { renderInference } from '../inference/view.js';
 
 /**
@@ -49,32 +50,59 @@ const TABS = [
   },
 ];
 
-function field(label, value, extraClass = '') {
-  return el('div', { class: `flex items-baseline gap-2 text-xs ${extraClass}` }, [
-    el('span', { class: 'text-gray-500', text: `${label}:` }),
-    el('span', { class: 'text-gray-300 font-mono break-all', text: value }),
+/** checkpoint 数量的说法 —— 中英的数词位置不同,所以走 ``%s`` 词条而不是拼接。
+ *  (这里原先是硬编码的 ``N 个 checkpoint``:在英文界面里会冒出一句中文。) */
+function ckptCount(run) {
+  return tr('train_ckpt_count', '%s checkpoints').replace('%s', run.checkpoint_count);
+}
+
+/** 选中 run 的头部:名字 + 模型类型 + 产物概况。
+ *
+ *  **不显示位置** —— 那是训练根目录,所有 run 共用一个值,现在提到列表上方显示
+ *  一次。原先每个 run 卡片都印一遍,多 run 时看起来像"每个模型各存一处",
+ *  其实指向的是同一个路径。 */
+function renderRunDetail(run) {
+  const newest = (run.checkpoints || [])[0];
+  return el('div', { class: 'bg-gray-900 rounded-lg border border-gray-800 p-4 mb-4' }, [
+    el('div', { class: 'min-w-0' }, [
+      el('div', { class: 'flex items-center gap-2 flex-wrap' }, [
+        el('span', { class: 'text-base font-semibold text-gray-100 font-mono', text: run.name }),
+        run.model_type
+          ? el('span', {
+            class: 'text-[10px] px-1.5 py-0.5 rounded bg-blue-900/50 text-blue-300',
+            text: run.model_type,
+          })
+          : null,
+      ]),
+      el('div', {
+        class: 'text-xs text-gray-500 mt-1',
+        text: `${ckptCount(run)} · ${bytes(run.total_bytes)}`
+          + (newest
+            ? ` · ${tr('train_latest_step', 'latest step %s').replace('%s', newest.name)}`
+            : ''),
+      }),
+    ]),
   ]);
 }
 
-/** 任务头:名字 + 模型类型 + 产物概况 + 输出目录。 */
-function renderRunHeader(run, root) {
-  const newest = (run.checkpoints || [])[0];
-  return el('div', { class: 'bg-gray-900 rounded-lg border border-gray-800 p-4 mb-4' }, [
-    el('div', { class: 'flex items-start flex-wrap gap-4' }, [
-      el('div', { class: 'min-w-0' }, [
-        el('div', { class: 'text-base font-semibold text-gray-100 font-mono', text: run.name }),
-        el('div', {
-          class: 'text-xs text-gray-500 mt-1',
-          text: `${run.checkpoint_count} 个 checkpoint · ${bytes(run.total_bytes)}`
-            + (newest ? ` · 最新 ${newest.name} 步` : ''),
-        }),
-      ]),
-      el('div', { class: 'ml-auto flex flex-col gap-1 items-end' }, [
-        field(tr('train_label_model', 'Model'), run.model_type || '—'),
-        field(tr('train_label_location', 'Location'), root, 'text-gray-500'),
-      ]),
-    ]),
+/** 左侧 run 列表的一项。 */
+function runListItem(run, active, onSelect) {
+  const item = el('button', {
+    class: 'text-left px-3 py-2 rounded border transition-colors shrink-0 '
+      + 'w-44 md:w-full '
+      + (active ? 'border-blue-600 bg-blue-950/30' : 'border-gray-800 hover:border-gray-700'),
+  }, [
+    el('div', {
+      class: `text-xs font-mono truncate ${active ? 'text-blue-200' : 'text-gray-200'}`,
+      text: run.name,
+    }),
+    el('div', {
+      class: 'text-[10px] text-gray-500 mt-0.5',
+      text: `${ckptCount(run)} · ${bytes(run.total_bytes)}`,
+    }),
   ]);
+  item.addEventListener('click', onSelect);
+  return item;
 }
 
 /** 页签态样式。集中在这里,是因为切换时只改 className —— 重建 DOM 会丢掉
@@ -174,12 +202,52 @@ async function renderRunsPanel(host, _arg, ctx = {}) {
     return;
   }
 
-  for (const run of payload.runs) {
-    host.appendChild(renderRunHeader(run, payload.root));
+  // ── 布局:左列表 + 右详情 ────────────────────────────────
+  //
+  // 曾经是**每个 run 摞一整套**(头部卡 + 子页签 + 检查点表)。模型一多,页面
+  // 就无限变长,而且每个头部卡都要印一遍位置和模型类型 —— 位置是整页共用的
+  // 训练根目录,重复 N 遍只会让人以为"每个模型各存一处"。
+  //
+  // 改成主从式之后:位置显示一次、页面长度恒定、只渲染选中的那个 run。
+  // 窄屏(<768px)降级成上下堆叠,列表变横向可滚 —— 小屏放不下两栏。
+  // 只留标题。**不显示训练根目录** —— 它是服务端配置(settings.TRAIN_OUTPUT_ROOT),
+  // 属于部署细节而不是产物信息,每个用户都对着一条绝对路径没有意义。
+  // 唯一需要看到它的是"目录不存在"那种排障场景 —— 那里的空态仍然带着完整路径,
+  // 因为那时路径本身就是答案(配错了地方)。见下面的 !payload.exists 分支。
+  host.appendChild(el('div', { class: 'mb-4' }, [
+    el('span', { class: 'text-sm font-semibold text-gray-300', text: tr('train_runs_title', 'Trained models') }),
+  ]));
+
+  const listHost = el('div', {
+    class: 'flex md:flex-col gap-2 overflow-x-auto md:overflow-visible '
+      + 'w-full md:w-48 shrink-0 pb-1 md:pb-0',
+  });
+  const detailHost = el('div', { class: 'flex-1 min-w-0 w-full' });
+  host.appendChild(el('div', {
+    class: 'flex flex-col md:flex-row gap-4 items-start',
+  }, [listHost, detailHost]));
+
+  // 默认选中第一个。list_runs() 的 run 顺序由后端定(见 app/training/runs.py)。
+  let selected = payload.runs[0].name;
+
+  function paint() {
+    clear(listHost);
+    for (const run of payload.runs) {
+      listHost.appendChild(runListItem(run, run.name === selected, () => {
+        if (run.name === selected) return;   // 点自己不必重画,免得丢失展开状态
+        selected = run.name;
+        paint();
+      }));
+    }
+    clear(detailHost);
+    const run = payload.runs.find((r) => r.name === selected) || payload.runs[0];
+    detailHost.appendChild(renderRunDetail(run));
     const tabs = el('div', {});
     renderTabs(tabs, run, ctx);
-    host.appendChild(tabs);
+    detailHost.appendChild(tabs);
   }
+
+  paint();
 }
 
 /** 顶部一级页签 —— 切的是**整块内容**(已有产物 / 新建向导 / 推理),
@@ -209,6 +277,15 @@ const PAGE_TABS = [
     icon: 'ant-design:play-circle-outlined',
     render: renderInference,
   },
+  {
+    // 「训练任务」= **任务**,与上面「模型训练」的**产物**是两回事:一个失败的、
+    // 或者刚提交还没写出任何 checkpoint 的任务,只会出现在这里。提交成功后前端
+    // 会自动跳过来(见 newrun.js 的 ctx.goToJobs)。
+    id: 'jobs',
+    label: () => tr('train_page_jobs', 'Training Jobs'),
+    icon: 'ant-design:thunderbolt-outlined',
+    render: renderJobs,
+  },
 ];
 
 const PAGE_ACTIVE = 'px-4 py-2 text-sm rounded-t border-b-2 -mb-px transition-colors '
@@ -224,6 +301,7 @@ function boot() {
   const bar = el('div', { class: 'flex gap-1 border-b border-gray-800 mb-5' });
   const panels = el('div', {});
   const INFERENCE_INDEX = PAGE_TABS.findIndex((t) => t.id === 'inference');
+  const JOBS_INDEX = PAGE_TABS.findIndex((t) => t.id === 'jobs');
 
   /** 切到某个页签。
    *
@@ -248,6 +326,11 @@ function boot() {
       PAGE_TABS[index].render(panel, arg, {
         goToInference: (runName, checkpointName) => selectTab(
           INFERENCE_INDEX, { runName, checkpointName }),
+        // 「新建训练」提交成功后跳到任务列表,并把刚提交的那个任务带过去。
+        // **必须传 arg**:按 selectTab 的规则,不带 arg 时只在**首次显示**才
+        // 渲染 —— 用户之前点过这个页签的话,新任务根本不会出现。传对象
+        // 同时满足两件事:强制重渲染 + 让任务页直接展开这一条。
+        goToJobs: (jobId) => selectTab(JOBS_INDEX, { focus: jobId || null }),
       });
     }
   }

@@ -56,11 +56,18 @@ async def lifespan(app: FastAPI):
     ).start()
     from app import upload_queue
     upload_queue.start()
+    # 训练监控线程。**它不拥有训练子进程** —— 子进程是 detach 起的,这个
+    # 线程只负责跟踪进度并在进程结束时收尾。所以 stop() 不会杀掉正在跑的
+    # 训练,重启后靠作业文档里的 pid 重新挂上(见 app/training/runner.py)。
+    from app.training import runner as train_runner
+    train_runner.start()
     print(f"[Startup] processor Service on port {settings.PORT}")
     print(f"[Startup] Storage: {settings.STORAGE_DIR} ({settings.STORAGE_BACKEND})")
+    print(f"[Startup] Training CLI: {settings.train_cli}")
     try:
         yield
     finally:
+        train_runner.stop()
         upload_queue.stop()
         print("[Shutdown] Done")
 

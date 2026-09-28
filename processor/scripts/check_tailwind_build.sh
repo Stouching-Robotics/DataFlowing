@@ -44,8 +44,13 @@ fi
 if [ "${1:-}" = "--fix" ]; then
     cp "$TMP" "$OUT"
     echo "已重新生成 tailwind-generated.css"
-    echo "⚠ 记得 bump app/version.py 的 __version__ —— 它是这个文件的 ?v= 缓存键,"
-    echo "  不 bump 的话浏览器会继续用旧的,新样式到不了前端。"
+    # 缓存键是 **web/VERSION**(前端号),不是 app/version.py 的后端号 ——
+    # 模板里写的是 ``?v={{ asset_version }}``,而 asset_version 取自
+    # app/web_version.py 读的 web/VERSION。1.19.4 起就是这么分的;这里原本
+    # 还写着"bump app/version.py",照着做会 bump 一个跟缓存无关的文件,
+    # 然后浏览器继续用旧 CSS。
+    echo "⚠ 记得 bump web/VERSION —— 模板里的 ?v={{ asset_version }} 读的是它,"
+    echo "  而且它**要重启服务才生效**(app/web_version.py 是 lru_cache 读一次)。"
     exit 0
 fi
 

@@ -912,4 +912,67 @@
 #
 #       ⚠ 1.16.5 那条变更日志里写的"bump 本文件当缓存键"已经过期,在原文后加了
 #         指向本条的说明,没有改写历史记录。
-__version__ = "1.19.4"
+# 1.20.0 训练执行上线 —— 训练页第一次真的能跑训练(前端 1.14.1)。
+#
+#       此前训练页只能**看产物**:checkpoint 列得出来,但点不动。本期把
+#       `lerobot-train` 真正接上。`app/training/runner.py` 是那个包里**唯一会
+#       写盘、起进程**的模块;gpus / datasets / runs / projects 仍全是只读扫描。
+#
+#       页面新增第四个页签「训练任务」(训练页现在是:新建训练 / 模型训练 /
+#       模型推理 / 训练任务)。它与「模型训练」的分工是:**那边列磁盘上的产物,
+#       这边列任务** —— 一个失败的任务、或者刚提交还没写出任何 checkpoint 的
+#       任务,只会出现在这里。详情面板带实时日志,按字节 offset 增量拉。
+#
+#       ★ 子进程 detach(start_new_session=True)。一次训练几小时,API 重启
+#         (systemd 重启、uvicorn --reload)不该把训练杀掉 —— 那等于白烧几小时
+#         GPU。代价是重启后我们不再是它的父进程、**拿不到退出码**,恢复只能靠
+#         os.kill(pid, 0) 判断死活:活着继续跟,死了标 interrupted。与
+#         upload_queue._recover_jobs() 同构,只是那边恢复"重排队"、这边"重新挂载"。
+#
+#       ★ 训练日志落**本地盘**(upload_staging_root/train_logs),不落 NAS。
+#         作业文档小且写得少,照旧放 state/(与 upload_queue 一致);但日志是
+#         子进程持续追加的,20000 步的 tqdm 走 sshfs 边训边写会一直占着网络
+#         文件系统 —— 训练最怕这种旁路开销。作业文档里存绝对路径,前端只走
+#         端点读,不关心它在哪块盘。
+#
+#       ★ LeRobot **自己不写日志文件**:checkpoint 目录下只有 pretrained_model/
+#         与 training_state/,没有任何 .log/.txt/.jsonl。所以 stdout/stderr 由
+#         runner 接管 —— 那份日志是训练失败原因的唯一记录。
+#
+#       ★ 起训练前要求 ≥16GB 空闲显存。ACT batch=16 实测占用远低于此,留这个
+#         余量是为了避开卡上还挂着 vLLM / 旧 worker 的情况(历史上 000008 工作流
+#         就是 CUDA OOM 失败的)。不够时直接 400,理由原样弹给用户。
+#
+#       命令行有**六个坑**。前四个能从 `lerobot-train --help` + 真实
+#       train_config.json 静态比出来;后两个只有真跑一遍才会暴露 —— 它们是
+#       TrainPipelineConfig.validate() 在导入 torch、扫完数据集**之后**才抛的:
+#         ① --eval_freq 不存在(--help 里命中的全是 env_eval_freq 的子串);
+#            真正有的是 --eval_steps,且要求 dataset.eval_split > 0 才生效
+#         ② --policy.path 不存在。续训是
+#            --resume=true --config_path=<checkpoint>/pretrained_model/train_config.json
+#         ③ LeRobot 不写训练日志(见上),必须自己接管 stdout/stderr
+#         ④ --output_dir 就是 run 目录本身,不会在它下面再拼一层 job_name
+#         ⑤ --dataset.repo_id 必填,哪怕数据集就在本地、根本没有 Hub 这回事
+#            (填 local/<数据集名>)
+#         ⑥ 必须显式 --policy.push_to_hub=false:默认是 true,为 true 时
+#            validate() 就要求顶层 repo_id,而真实 train_config 里没有这个键
+#         另:⑤⑥ 这类 validate() 错误的报文字面会误导(报的是 `dataset` 整个
+#         字段缺失,不是"repo_id 缺失"),照字面查会查错方向 —— 六条连同它们
+#         的踩坑过程都写在 runner.py 的模块 docstring 里,⑤⑥ 各有回归断言。
+#
+#       新增两个配置项:TRAIN_CLI(默认指向 conda 环境 lerobot052_base_piper 里的
+#       lerobot-train,刻意**不用 conda run** —— 那会把子进程输出攒起来,进度条
+#       就流不出来,页面上是个迟迟不动的黑盒)、TRAIN_KEEP_CHECKPOINTS(默认 1,
+#       只留最后一个;一个 checkpoint 约 590MB,中间态只对续训有用)。
+#
+#       新增端点(训练域里唯一会改状态的五个):POST /jobs、GET /jobs、
+#       GET /jobs/{id}、GET /jobs/{id}/log、POST /jobs/{id}/cancel。
+#       路由层仍**不 import subprocess、不碰磁盘**,只做 HTTP 那层:ValueError
+#       翻 400、FileNotFoundError 翻 404,detail 是可直接展示给用户的中文理由
+#       (显卡读不到、数据集不在导出产物里、目录已存在、已有任务在跑……)。
+#
+#       测试:`tests/test_training_runner.py` 15 条(命令拼装 + 状态机 + 日志增量)。
+#
+#       顺带:`scripts/check_tailwind_build.sh` 与 tailwind-generated.css 跟上新
+#       页签用到的类。
+__version__ = "1.20.0"

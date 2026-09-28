@@ -1,20 +1,19 @@
 """Training API —— 路由层,薄薄一层。
 
-业务逻辑在 ``app/training/`` 下(产物扫描 / GPU 读取 / 数据集发现),这里只负责
-把它们挂到 URL 上。**没有任何训练执行** —— 见那个包的 docstring。
-
-将来接执行时,新端点加在这里(创建 / 停止 / 日志),形状与现有的保持一致;
-真正的子进程管理写在 ``app/training/runner.py``。
+业务逻辑在 ``app/training/`` 下(产物扫描 / GPU 读取 / 数据集发现 / 训练执行),
+这里只负责把它们挂到 URL 上。子进程管理、作业状态、日志解析都在
+``app/training/runner.py`` —— 本文件不 import subprocess 也不碰磁盘。
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Body, HTTPException
 from fastapi.responses import FileResponse
 
 from app.training import (
     list_datasets, list_gpus, list_projects_progress, list_runs,
 )
+from app.training import runner
 from app.training.runs import resolve_checkpoint_file
 
 router = APIRouter(prefix="/api/v1/training", tags=["training"])
@@ -76,3 +75,65 @@ def download_checkpoint_file(run_name: str, step: str, name: str):
     # filename 只取最后一段 —— 让浏览器存成 model.safetensors 而不是把整条相对路径
     # 当成文件名(带斜杠的文件名在多数系统上写不出来)。
     return FileResponse(path, filename=path.name)
+
+
+# ── 训练执行 ──────────────────────────────────────────────────────────
+#
+# 下面五个是本模块**唯一会改变系统状态**的端点(其余都是只读扫描)。真正的
+# 校验规则和子进程管理在 ``app/training/runner.py`` —— 这里只做 HTTP 那层:
+# 把 ValueError 翻成 400、把 FileNotFoundError 翻成 404。
+
+@router.post("/jobs", status_code=202)
+def create_job(payload: dict = Body(...)):
+    """创建一个训练任务并**立即起进程**,返回 202 + 作业文档。
+
+    校验不过一律 400,``detail`` 是可以直接显示给用户的中文理由(显卡读不到、
+    数据集不在导出产物里、目录已存在、已有任务在跑……)。前端的做法是把
+    ``detail`` 原样弹出来,所以那些消息要写得**能指导下一步动作**,而不只是
+    描述哪里不对。
+    """
+    try:
+        job = runner.start_job(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return job
+
+
+@router.get("/jobs")
+def list_jobs():
+    """训练任务列表(新的在前)。
+
+    与 ``/runs`` 是两回事:``/runs`` 列的是**磁盘上的产物**,这里列的是
+    **任务记录**。一个失败的、或者刚起还没写产物的任务只在前者之外出现。
+    """
+    return {"jobs": runner.list_jobs()}
+
+
+@router.get("/jobs/{job_id}")
+def get_job(job_id: str):
+    job = runner.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="没有这个训练任务")
+    return job
+
+
+@router.get("/jobs/{job_id}/log")
+def get_job_log(job_id: str, offset: int = 0):
+    """增量读训练日志。``offset`` 是字节偏移,前端带上次的 ``offset`` 回来。
+
+    LeRobot **自己不写日志文件**(见 runner 的模块 docstring),所以这份日志
+    是 runner 接管子进程 stdout/stderr 存下来的 —— 它是唯一的训练过程记录,
+    失败原因全在这里面。
+    """
+    if runner.get_job(job_id) is None:
+        raise HTTPException(status_code=404, detail="没有这个训练任务")
+    return runner.read_log(job_id, offset=offset)
+
+
+@router.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    """取消训练 —— 杀整个进程组(父进程 + dataloader worker),释放显存。"""
+    try:
+        return runner.cancel_job(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))

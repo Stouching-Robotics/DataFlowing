@@ -2,13 +2,16 @@
  *
  * 数据全部来自磁盘真实文件(后端 rglob 出来的),没有任何凑数的假行。
  *
- * **下载已经能用了** —— 文件表逐行一个链接,走后端
- * ``GET /runs/{run}/checkpoints/{step}/files/{name:path}``(逐文件而不是整包:
- * 一个 checkpoint 约 600MB,其中 training_state/ 只在续训时有用)。
+ * **下载是逐文件的** —— 文件表里每行一个链接,走后端
+ * ``GET /runs/{run}/checkpoints/{step}/files/{name:path}``。
  *
- * **其余操作按钮仍然 disabled**:删除 / 推理 / 离线部署都还没有端点。做成可点
- * 但没反应是最糟的 —— 用户会反复点、以为坏了。disabled 加上 title 说明,一眼就
- * 知道"还没接",和有端点了再放开是两回事。
+ * **``training_state/`` 列出来但**不给**下载链接**(见下面 RESUME_ONLY_PREFIX):
+ * 它只是优化器状态,拿去做推理/部署一点用没有,却占了一个 checkpoint 的 2/3。
+ * 列出来是为了让人看清结构完整,给链接就会有人下,下完发现白等 400MB。
+ *
+ * **删除 / 离线部署仍然是 disabled**:没有端点。做成可点但没反应是最糟的 ——
+ * 用户会反复点、以为坏了。disabled 加上 title 说明,一眼就知道"还没接"。
+ * (「推理」已经接上了 —— 那是纯前端跳转,不需要端点。)
  */
 
 import { el, clear } from '../shared/dom.js';
@@ -16,21 +19,44 @@ import { bytes, dateTime } from '../shared/format.js';
 import { tr } from '../shared/text.js';
 import { checkpointFileUrl } from './api.js';
 
+/** **只对续训有用、因而不提供下载**的子树。
+ *
+ *  实测一个 checkpoint 590.9MB,其中 ``training_state/`` 占 393.7MB(优化器状态
+ *  + RNG 状态 + 步数)——**接近 2/3**。拿去跑推理或离线部署只需要
+ *  ``pretrained_model/``(约 197MB)。
+ *
+ *  仍然**列出来**:整个 checkpoint 的结构要看得全,不然用户会以为文件没列完。
+ *  只是不给链接 —— 给了就会有人点、下完 400MB 才发现用不上,而且那 400MB 还得
+ *  从服务器的盘上走一遍。
+ *
+ *  注:后端端点本身仍然提供这个文件(要拉到别的机器续训是合法需求),
+ *  这里不做能力限制,只是不在界面上引导。 */
+const RESUME_ONLY_PREFIX = 'training_state/';
+
 /** 逐个文件一行。文件名可能很长(pretrained_model/xxx.safetensors),
  *  用 break-all 而不是省略号 —— 训练产物看的就是完整名字。 */
 function fileRow(runName, checkpoint, file) {
+  const resumeOnly = String(file.name).startsWith(RESUME_ONLY_PREFIX);
   return el('tr', { class: 'border-b border-gray-800/60 last:border-0' }, [
     el('td', { class: 'py-1.5 pr-4 text-gray-300 font-mono text-[11px] break-all', text: file.name }),
     el('td', { class: 'py-1.5 pr-4 text-gray-400 text-right whitespace-nowrap', text: bytes(file.size) }),
     el('td', { class: 'py-1.5 pr-4 text-gray-500 whitespace-nowrap', text: dateTime(file.mtime) }),
     el('td', { class: 'py-1.5 text-right whitespace-nowrap' }, [
-      // 带 download 属性:浏览器直接存盘,不跳转到一个只会显示二进制内容的页面。
-      el('a', {
-        class: 'text-blue-400 hover:underline',
-        href: checkpointFileUrl(runName, checkpoint.name, file.name),
-        download: true,
-        text: tr('train_btn_download', 'Download'),
-      }),
+      resumeOnly
+        // 灰字而不是链接:一眼看出"这个是故意不给的",不会去点。
+        ? el('span', {
+          class: 'text-gray-600 cursor-default',
+          title: tr('train_file_resume_only_hint',
+            'Optimizer state — only needed to resume training, not for inference or deployment'),
+          text: tr('train_file_resume_only', 'resume only'),
+        })
+        // 带 download 属性:浏览器直接存盘,不跳转到一个只会显示二进制内容的页面。
+        : el('a', {
+          class: 'text-blue-400 hover:underline',
+          href: checkpointFileUrl(runName, checkpoint.name, file.name),
+          download: true,
+          text: tr('train_btn_download', 'Download'),
+        }),
     ]),
   ]);
 }

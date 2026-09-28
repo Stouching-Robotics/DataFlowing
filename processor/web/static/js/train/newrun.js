@@ -6,15 +6,19 @@
  *   ④ 训练参数(每项带一句说明)
  *   ⑤ 从已有训练继续(可选)
  *
- * **本期只做前端 —— 所以这一页是纯表单。**
+ * **这一页现在是真的能训练了** —— 底部的「开始训练」把下面这些字段 POST 给
+ * `POST /api/v1/training/jobs`,后端起 `lerobot-train` 子进程,进度和日志在
+ * 「训练任务」页签看。
  *
- * 这里曾经有一个禁用的「创建训练任务」按钮、外加一条生成好的 `lerobot-train`
- * 命令行(带复制 / 下载 .sh)。已经删掉了:后端执行接上之前,那两样要么是假的
- * 按钮,要么是绕路把命令当交付物。等真接上后端时,直接加一个**能点的**按钮,
- * 把下面这些字段 POST 出去即可 —— 表单本身就已经是接口形状了。
+ * 更早的版本里,这里有一个禁用的「创建训练任务」按钮 + 一条生成好的
+ * `lerobot-train` 命令行(带复制 / 下载 .sh)。那两样在 1.16.2 被删掉了,理由是
+ * "后端没接上之前,要么是假按钮,要么是绕路把命令当交付物"。现在后端接上了,
+ * 按钮就按当初说好的方式加了回来 —— 表单本身一直就是接口形状,没改过。
  *
- * ★ 相应地,现在这一页的选择(数据集 / GPU / 参数 / 续训)**都不驱动任何输出**。
- *   它们是为将来后端准备的状态,不是装饰;但也别指望现在改一下会有什么反应。
+ * ★ 校验全在后端,而且**故意容忍前端传脏数据**:数字是字符串、`save_checkpoint`
+ *   是 `"true"`/`"false"`、GPU 是个 Set —— `app/training/runner.py` 的
+ *   `validate_spec` 负责归一化,并把"为什么不能训"写成能直接显示的中文。
+ *   前端这边**不要**再加一套自己的校验,否则两处的规则迟早会分叉。
  *
  * 只有 ACT —— 其它策略(π0 / SmolVLA / diffusion…)都是 LeRobot 内置、跑得通,
  * 但没在这套硬件上实测过,所以不摆一排点不动的卡片。
@@ -23,7 +27,7 @@
 import { el, clear } from '../shared/dom.js';
 import { bytes, dateTime, thousands } from '../shared/format.js';
 import { tr } from '../shared/text.js';
-import { listDatasets, listGpus, listReadyProjects, listRuns } from './api.js';
+import { createTrainingJob, listDatasets, listGpus, listReadyProjects, listRuns } from './api.js';
 
 /** 默认超参 —— 取自**实测那一次**的真实 train_config.json
  *  (checkpoints/020000),不是参考实现的示例值。
@@ -37,7 +41,16 @@ const DEFAULTS = {
   steps: 20000,
   seed: 1000,
   num_workers: 4,
-  eval_freq: 1000,
+  // ★ 曾经这里叫 eval_freq、默认 1000 —— 两处都错,2026-09-28 实测纠正:
+  //   ① `lerobot-train --help` 里**没有 --eval_freq**(命中的全是 env_eval_freq
+  //      的子串),真实 train_config.json 的 37 个键里也没有它。这个版本叫
+  //      `--eval_steps`。
+  //   ② 实测那次训练 eval_split=0.0 / eval_steps=0 —— **评估根本没开**。默认
+  //      1000 是编的,与上面"取自实测"的说法自相矛盾。
+  //   所以恢复成 0 = 关,跟实测跑通的那次一致。开了会从训练集里留出 10% 做
+  //   验证(--eval_steps 要求 --dataset.eval_split > 0,单给不生效),那是另一种
+  //   训练配置,不该是默认值。
+  eval_steps: 0,
   log_freq: 100,
   save_checkpoint: true,
   save_freq: 5000,
@@ -50,7 +63,7 @@ const PARAM_HELP = {
   steps: ['train_help_steps', 'More steps usually improve the policy but risk overfitting. Start at 10000 and adjust from validation.'],
   seed: ['train_help_seed', 'A fixed seed reproduces the same run, which makes debugging and comparison possible. 1000 or 42.'],
   num_workers: ['train_help_workers', 'More workers load data faster but use more memory. About 1/2 to 1x the CPU core count.'],
-  eval_freq: ['train_help_eval_freq', 'How often to run an evaluation, in steps. About 10% of total steps.'],
+  eval_steps: ['train_help_eval_steps', 'Compute eval loss every N steps. 0 = off (what the measured run used). Turning it on also holds out 10% of the episodes from training.'],
   log_freq: ['train_help_log_freq', 'How often to refresh progress, in steps. 10-100 works well.'],
   save_checkpoint: ['train_help_save_ckpt', 'Save checkpoints while training so a run can be resumed or deployed.'],
   save_freq: ['train_help_save_freq', 'How often to save a checkpoint, in steps. About 30% of total steps.'],
@@ -95,7 +108,13 @@ function errorRow(text) {
   return el('div', { class: 'text-xs text-red-400 py-3', text });
 }
 
-export function renderNewRun(container) {
+/**
+ * @param {HTMLElement} container
+ * @param {object} [_arg] 未使用 —— 由 main.js 的 selectTab 统一传三个参数。
+ * @param {{goToJobs?: (jobId: string) => void}} [ctx]
+ *   跨页签导航能力,由 boot() 注入。提交成功后跳去「训练任务」用它。
+ */
+export function renderNewRun(container, _arg, ctx = {}) {
   clear(container);
 
   const state = { gpus: new Set(), dataset: null, resume: null };
@@ -232,7 +251,7 @@ export function renderNewRun(container) {
   });
 
   const sectionParams = section('train_sec_params', '3. Training Parameters',
-    { cls: PENDING, text: tr('train_new_pending', 'not wired') }, [
+    { cls: LIVE, text: tr('train_new_live', 'live') }, [
       ...paramRows,
       el('button', {
         class: 'mt-3 ' + BTN,
@@ -380,7 +399,7 @@ export function renderNewRun(container) {
   });
 
   const sectionResume = section('train_sec_resume', '5. Continue From a Previous Run',
-    { cls: PENDING, text: tr('train_new_pending', 'not wired') }, [
+    { cls: LIVE, text: tr('train_new_live', 'live') }, [
       el('div', { class: 'flex gap-6 flex-wrap' }, [
         labeled(tr('train_resume_task', 'Source run'), resumeTask),
         labeled(tr('train_resume_step', 'Checkpoint'), resumeStep),
@@ -396,6 +415,59 @@ export function renderNewRun(container) {
     })
     .catch(() => { /* 拿不到就保持"全新训练",不拦整页 */ });
 
+  // ── ⑥ 提交 ──────────────────────────────────────────
+  //
+  // 前端**不做校验** —— 后端 validate_spec 会把"为什么不能训"(显卡读不到、
+  // 数据集不在导出产物里、目录已存在、已有任务在跑)写成一句能指导下一步的中文,
+  // 这里原样显示。两处各写一套规则迟早会分叉。
+  const submitMsg = el('div', { class: 'mt-3 text-xs' });
+  const submitBtn = el('button', {
+    class: 'bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 '
+      + 'disabled:cursor-not-allowed text-white text-sm px-4 py-2 rounded font-medium',
+    text: tr('train_submit', 'Start training'),
+  });
+
+  function setSubmitMsg(kind, text) {
+    clear(submitMsg);
+    if (!text) return;
+    submitMsg.appendChild(el('div', {
+      class: kind === 'error' ? 'text-red-400'
+        : kind === 'ok' ? 'text-green-400' : 'text-gray-500',
+      text,
+    }));
+  }
+
+  submitBtn.addEventListener('click', async () => {
+    submitBtn.disabled = true;
+    setSubmitMsg('info', tr('train_submitting', 'Starting the training process…'));
+    try {
+      // 参数原样字符串送出去(``save_checkpoint`` 是 "true"/"false"),
+      // 归一化是后端的活。``job_name`` 走顶层,不进 params。
+      const params = {};
+      for (const [name, control] of Object.entries(paramInputs)) {
+        if (name !== 'job_name') params[name] = control.value;
+      }
+      const job = await createTrainingJob({
+        job_name: paramInputs.job_name.value.trim(),
+        dataset: state.dataset,          // 整个对象;后端只认 name,并自己去查
+        gpus: Array.from(state.gpus),
+        params,
+        resume: state.resume,
+      });
+      setSubmitMsg('ok', `${tr('train_submitted', 'Training started')}: ${job.job_name}`);
+      // 跳到「训练任务」并把这个任务带过去 —— 进度和日志都在那儿。
+      ctx?.goToJobs?.(job.id);
+    } catch (err) {
+      setSubmitMsg('error', err.message);
+    } finally {
+      submitBtn.disabled = false;
+    }
+  });
+
+  const sectionSubmit = el('div', { class: 'flex items-start gap-4 flex-wrap' }, [
+    submitBtn,
+    el('div', { class: 'flex-1 min-w-[240px]' }, [submitMsg]),
+  ]);
 
 
   // 展示顺序 ≠ 构造顺序。构造时必须先定义好各自依赖的变量(GPU 面板、数据集的
@@ -405,7 +477,7 @@ export function renderNewRun(container) {
   // 再定"在哪训",最后"怎么训" —— 决策依赖就是按这个方向走的(比如数据集决定了
   // 命令里的 --dataset.root)。
   for (const node of [sectionDataset, sectionModel, sectionLocation, sectionParams,
-                      sectionResume]) {
+                      sectionResume, sectionSubmit]) {
     container.appendChild(node);
   }
 }

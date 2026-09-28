@@ -2102,11 +2102,25 @@ def append_project_episode(project_root: Path, episode_root: Path,
         existing = next((row for row in rows
                          if str(row.get("episode_id") or row.get("source_batch") or "") == str(episode_id)), None)
         if existing is None:
-            target_episode_index = max(
-                [_episode_index(row.get("episode_index")) for row in rows
-                 if _episode_index(row.get("episode_index")) is not None],
-                default=-1,
-            ) + 1
+            used = {_episode_index(row.get("episode_index")) for row in rows
+                    if _episode_index(row.get("episode_index")) is not None}
+            # ★ 优先沿用**名字里的编号**，让存储索引与公开 ID 一致。
+            #
+            #   此前一律 max(used)+1，于是"名字说 000005、索引是 3"这种对不上的
+            #   情况会出现 —— 实测 119 个带编号批次里 **21 个**中招。它的直接
+            #   危害在 _match_episode_row 的名字回退：按名字推出索引后会撞上
+            #   别的批次（模拟：删 ..._000002 时若它自己的行已缺失，会去删
+            #   index=2 那个批次的数据和视频）。
+            #
+            #   编号允许空洞（见本模块 delete_project_episode 的说明
+            #   "gaps are valid"），所以直接采用名字里的编号是安全的。
+            #   两种情况仍回落到 max+1：名字里没有编号；或该编号已被别的批次
+            #   占用（撞号）。
+            named = episode_index_from_name(episode_id)
+            if named is not None and named not in used:
+                target_episode_index = named
+            else:
+                target_episode_index = max(used, default=-1) + 1
             chunk_index = episode_chunk_for_index(target_episode_index)
         else:
             if not replace:
@@ -2132,6 +2146,17 @@ def append_project_episode(project_root: Path, episode_root: Path,
             if project_existed and backup_root.exists():
                 backup_root.rename(project_root)
             raise
+        # ★ 换入之后必须失效【project_root】的缓存，不能只靠
+        #   write_project_episode_index 里那次 —— 那次失效的是 **temp_root**
+        #   的 key，而内容是靠 rename 换过来的。
+        #
+        #   不失效的后果有两条：
+        #     (1) 紧跟的 verify_project_dataset(project_root) 读到的还是**追加前**
+        #         的旧行 —— 校验等于在验旧树，"通过"是空头支票（实测：连续三次
+        #         append 全部通过，而盘上索引早已是 [0,1,2,5,6,7]）；
+        #     (2) 缓存有 60 秒的盲目 TTL（TTL 内连指纹都不查），上传后前端
+        #         最长 60 秒看不到新批次。
+        invalidate_project_cache(project_root)
         result["verification"] = verify_project_dataset(project_root)
         result["backup"] = str(backup_root) if project_existed else None
         return result

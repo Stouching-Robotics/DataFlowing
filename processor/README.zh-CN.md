@@ -2,7 +2,7 @@
 
 [中文](README.zh-CN.md) | [English](README.md)
 
-> 文档版本：2026-09-02  ·  后端版本：`1.6.8`  ·  WEB 前端版本：`1.5.6`
+> 文档版本：2026-09-28  ·  后端版本：`1.19.4`  ·  前端版本：`1.12.3`
 
 processor 是 EgoData 的数据采集、处理、审核和导出服务，面向具身智能与机器人
 操作数据。系统由 FastAPI 后端、异步 Worker、Web 审核页面和 Workflow Studio 组成。
@@ -506,11 +506,19 @@ npm run build
 <details>
 <summary>点击展开：版本维护规则</summary>
 
-- 后端版本在 `app/version.py` 中维护；
-- Web 前端版本在 `web/workflow-studio/package.json` 中维护；
+- 后端版本在 `app/version.py` 中维护，**只管后端**；
+- **前端版本在 `web/VERSION` 中维护**。它覆盖 `processor/web/` 下的全部前端代码
+  （`templates/`、`static/`、`workflow-studio/`），**不只是那个 React SPA**。
+  `web/workflow-studio/package.json` 里的 version 只代表 SPA 自己，三者互相独立、不必同步。
+- **改了前端就只 bump `web/VERSION` 这一个文件**。它一个号管两件事：
+  ① 模板里的 `?v={{ asset_version }}` 缓存键（读了它浏览器才会重新拉 JS/CSS）
+  ② 提交信息里的「前端 X」。
+  两个用途共用一个数，不会出现"提交信息写 1.12.3、浏览器却拿 1.12.2"这种对不上的情况。
+  改前端**不需要**动后端版本号。
+- 改完 `web/VERSION` 要**重启服务**才生效（`app/web_version.py` 启动时读一次就缓存）。
 - 修复和小调整增加修订号；新增功能增加次版本号；重大架构变更增加主版本号；
 - 发布前应同步记录软件版本、数据格式和 API 变化。
 
-当前版本：后端 `1.6.8`，WEB 前端 `1.5.6`。
+当前版本：后端 `1.19.4`，前端 `1.12.3`。
 
 </details>

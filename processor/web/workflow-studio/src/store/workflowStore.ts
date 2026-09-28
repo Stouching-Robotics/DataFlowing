@@ -417,13 +417,63 @@ function _migrateDynamicTargetHandles(
   });
 }
 
+/**
+ * 动态端口节点的**输出**口与输入一一对应（同 key 同标签），所以指向下游的边也要跟着改。
+ *
+ * 老图的边 sourceHandle 是 ``"reviewed"``（现在没有这个口了）。
+ *
+ * ★ 必须**展开成 N 条**，不能只把它改成某一个动态 key —— 实测对比：
+ *     1 条边 sourceHandle=reviewed              → 下游收到 3 项（规则 3 平铺全部输出）
+ *     1 条边 sourceHandle=node_cam:video_left   → 下游收到 **1 项**（规则 2 只取那一个）
+ *     3 条边，各一个动态 key                     → 下游收到 3 项，无重复
+ *   所以"改成第一个 key"会**静默丢掉其余几路**。展开成 N 条则每条命中规则 2，
+ *   各取一路、合起来正好是全部，且不会重复（规则 1 的 #N 后缀用不上）。
+ *
+ * 无入边时不出动态口，声明的 ``reviewed`` 仍在，边原样保留。幂等。
+ */
+function _migrateDynamicSourceHandles(
+  nodes: Node<WorkflowNodeData>[] | undefined,
+  edges: Edge[] | undefined,
+): Edge[] {
+  const list = edges || [];
+
+  // 每个动态端口节点的输出口 = 它的输入口（顺序即渲染顺序）
+  const keysByNode = new Map<string, string[]>();
+  for (const node of nodes || []) {
+    if (DYNAMIC_INPUT_TYPES.has(canonicalNodeType(node.data?.nodeType))) {
+      keysByNode.set(String(node.id), []);
+    }
+  }
+  if (!keysByNode.size) return list;
+  for (const edge of list) {
+    const keys = keysByNode.get(String(edge.target));
+    if (!keys) continue;
+    const key = dynamicInputKey(String(edge.source), edge.sourceHandle);
+    if (!keys.includes(key)) keys.push(key);
+  }
+
+  const out: Edge[] = [];
+  for (const edge of list) {
+    const keys = keysByNode.get(String(edge.source));
+    if (!keys || keys.length === 0) { out.push(edge); continue; }   // 无入边 → 保持 reviewed
+    if (keys.includes(String(edge.sourceHandle ?? ''))) { out.push(edge); continue; }
+    for (const key of keys) {
+      out.push({ ...edge, id: `${edge.id}__${key}`, sourceHandle: key });
+    }
+  }
+  return out;
+}
+
+
 export function normalizeWorkflowGraphForEditor(
   graph: { nodes?: Node<WorkflowNodeData>[]; edges?: Edge[] },
 ) {
   const migrated = _migrateWorkflowGraph(graph);
   return {
     nodes: (migrated.nodes || []).map(_hydrateNode),
-    edges: _migrateDynamicTargetHandles(migrated.nodes, migrated.edges),
+    // 输入口先迁（边的 targetHandle 定下来），输出口才有所依据
+    edges: _migrateDynamicSourceHandles(
+      migrated.nodes, _migrateDynamicTargetHandles(migrated.nodes, migrated.edges)),
   };
 }
 
@@ -635,6 +685,20 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       const siblingConn = {
         ...next,
         sourceHandle: sibling,
+        // ★ 动态端口节点的 targetHandle 是**按源端口算出来的**
+        //   （dynamicInputKey(源, 源端口)），换了源端口就必须重算。
+        //
+        //   不重算的后果：配对边指向的是主端口，而 isDup() 恰好按 targetHandle
+        //   判重 —— 于是用户再手动连"另一目"时判成"没连过"，加出**第二条同源
+        //   端口的边**；dynamicInputKey 对两条边算出同一个 key，画布上就出现
+        //   两个同名输入口（实测：Stereo RGB-D 的 3 个输出 → 4 个输入口，
+        //   其中 "Left RGB Video" 重复）。
+        //
+        //   普通节点（targetHandle 恒为 "video" 之类）主副相同，所以这个 bug
+        //   一直没暴露 —— 是动态端口把它揭出来的。
+        ...(DYNAMIC_INPUT_TYPES.has(targetNodeType)
+            ? { targetHandle: dynamicInputKey(conn.source, sibling) }
+            : {}),
       };
       if (!isDup(siblingConn) && isConnectionValid(siblingConn, s.nodes)) {
         edges = addEdge(siblingConn, edges);

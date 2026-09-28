@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="{{ current_lang() }}">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -10,6 +10,9 @@
     <script src="/static/iconify-preload.js"></script>
     <script src="/static/iconify-icon.min.js"></script>
     <script src="/static/plyr.js"></script>
+    <!-- 词典要**先于** i18n.js 加载:后者只带逻辑,语言表从这个文件取。
+         它同时被服务端读(app/i18n.py),两边读同一份才不会分叉。 -->
+    <script src="/static/js/i18n-data.js?v={{ asset_version }}"></script>
     <script src="/static/js/i18n.js?v={{ asset_version }}"></script>
     <style>
         :root {
@@ -123,44 +126,57 @@
         <nav class="flex-1 py-3 flex flex-col gap-0.5">
             <a href="/" class="sidebar-link" data-page="home">
                 <iconify-icon icon="ant-design:home-outlined" class="icon-sm"></iconify-icon>
-                <span data-i18n="nav_home">Home</span>
+                <span data-i18n="nav_home">{{ t('nav_home') }}</span>
             </a>
             <a href="/tasks" class="sidebar-link" data-page="tasks">
                 <iconify-icon icon="ant-design:project-outlined" class="icon-sm"></iconify-icon>
-                <span data-i18n="nav_tasks">Projects</span>
+                <span data-i18n="nav_tasks">{{ t('nav_tasks') }}</span>
             </a>
             <a href="/workflow-studio" class="sidebar-link" data-page="workflow-studio">
                 <iconify-icon icon="ant-design:apartment-outlined" class="icon-sm"></iconify-icon>
-                <span data-i18n="nav_workflow">Workflow</span>
+                <span data-i18n="nav_workflow">{{ t('nav_workflow') }}</span>
             </a>
             <a href="/users" id="users-nav" class="sidebar-link{% if boot_user.role|default('') != 'admin' %} hidden{% endif %}" data-page="users">
                 {# 图标必须取自 iconify-preload.js 白名单 —— 此处在每个页面的侧边栏,
                    用白名单外的名字会让每次翻页都去 api.iconify.design 拉一次。
                    team-outlined 不在表内,改用同义的 user-outlined。 #}
                 <iconify-icon icon="ant-design:user-outlined" class="icon-sm"></iconify-icon>
-                <span data-i18n="nav_users">Users</span>
+                <span data-i18n="nav_users">{{ t('nav_users') }}</span>
             </a>
             <a href="/annotation-studio" class="sidebar-link" data-page="annotation-studio">
                 <iconify-icon icon="ant-design:edit-outlined" class="icon-sm"></iconify-icon>
-                <span data-i18n="nav_annotation">Annotation</span>
+                <span data-i18n="nav_annotation">{{ t('nav_annotation') }}</span>
             </a>
             <!-- Video Review — status shortcuts; the project→task→video
                  hierarchy list renders on the right side of the page -->
             <a href="/review" class="sidebar-link" data-page="review">
                 <iconify-icon icon="ant-design:video-camera-outlined" class="icon-sm"></iconify-icon>
-                <span data-i18n="nav_review">Video Review</span>
+                <span data-i18n="nav_review">{{ t('nav_review') }}</span>
             </a>
             <a href="/review?status=completed" class="sidebar-sub" data-review-status="reviewing">
                 <iconify-icon icon="ant-design:eye-outlined" class="icon-sm"></iconify-icon>
-                <span data-i18n="stat_reviewing">Reviewing</span>
+                <span data-i18n="stat_reviewing">{{ t('stat_reviewing') }}</span>
             </a>
             <a href="/review?status=reviewed" class="sidebar-sub" data-review-status="approved">
                 <iconify-icon icon="ant-design:check-circle-outlined" class="icon-sm"></iconify-icon>
-                <span data-i18n="stat_approved">Approved</span>
+                <span data-i18n="stat_approved">{{ t('stat_approved') }}</span>
             </a>
             <a href="/review?status=failed" class="sidebar-sub" data-review-status="failed">
                 <iconify-icon icon="ant-design:warning-outlined" class="icon-sm"></iconify-icon>
-                <span data-i18n="stat_failed">Failed</span>
+                <span data-i18n="stat_failed">{{ t('stat_failed') }}</span>
+            </a>
+
+            <!-- 模型 — 一级项,与 Video Review **同级同款**(图标 + 可点击 +
+                 选中蓝底高亮),下面挂训练/部署两个二级短名项。
+                 一级项暂时指向 /train:它目前是唯一的二级页。将来有了 /deploy,
+                 这里应该改成一个模型总览页(Video Review 指向 /review 的写法同理)。 -->
+            <!-- 「模型」是**一级项,点进去直接就是那一页** —— 页内三个页签
+                 (模型训练 / 新建训练 / 模型推理)自己分工。
+                 早先这里是两个二级项(训练 / 推理),但它们指向两个页面,而两者
+                 本来是同一批产物的上下游,分两个导航项反而要来回跳。 -->
+            <a href="/train" class="sidebar-link" data-page="model">
+                <iconify-icon icon="ant-design:robot-outlined" class="icon-sm"></iconify-icon>
+                <span data-i18n="nav_model">{{ t('nav_model') }}</span>
             </a>
         </nav>
 
@@ -168,7 +184,7 @@
         <div class="py-3 border-t border-gray-800 flex flex-col gap-0.5">
             <a href="/trash" class="sidebar-link" data-page="trash">
                 <iconify-icon icon="ant-design:delete-outlined" class="icon-sm"></iconify-icon>
-                <span data-i18n="nav_trash">Trash</span>
+                <span data-i18n="nav_trash">{{ t('nav_trash') }}</span>
                 <span id="trash-badge" class="ml-auto text-xs text-gray-500"></span>
             </a>
         </div>
@@ -192,17 +208,17 @@
                     <div id="dd-role" class="text-xs text-gray-500">{{ boot_user.role|default('')|title }}</div>
                 </div>
                 <a href="javascript:void(0)" class="block px-3 py-2 text-xs text-gray-400 hover:bg-gray-700 hover:text-gray-200 transition-colors">
-                    <iconify-icon icon="ant-design:user-outlined" class="icon-sm mr-2"></iconify-icon><span data-i18n="menu_profile">Profile</span>
+                    <iconify-icon icon="ant-design:user-outlined" class="icon-sm mr-2"></iconify-icon><span data-i18n="menu_profile">{{ t('menu_profile') }}</span>
                 </a>
                 <a href="javascript:void(0)" class="block px-3 py-2 text-xs text-gray-400 hover:bg-gray-700 hover:text-gray-200 transition-colors">
-                    <iconify-icon icon="ant-design:lock-outlined" class="icon-sm mr-2"></iconify-icon><span data-i18n="menu_change_password">Change Password</span>
+                    <iconify-icon icon="ant-design:lock-outlined" class="icon-sm mr-2"></iconify-icon><span data-i18n="menu_change_password">{{ t('menu_change_password') }}</span>
                 </a>
                 <!-- 界面语言。两个选项都写自己的文字（English / 中文 是自名，
                      不随界面语言翻译），当前项由 updateLangToggle() 高亮。
                      点这里不会关掉菜单：外部点击的判定用 container.contains(e.target)，
                      而它在本容器内。 -->
                 <div class="px-3 py-2 border-t border-gray-700">
-                    <div class="mb-1.5 text-xs text-gray-500" data-i18n="language">Language</div>
+                    <div class="mb-1.5 text-xs text-gray-500" data-i18n="language">{{ t('language') }}</div>
                     <div class="flex gap-1">
                         <button type="button" data-lang-option="en" onclick="setLang('en')"
                                 aria-pressed="false"
@@ -213,7 +229,7 @@
                     </div>
                 </div>
                 <a href="javascript:void(0)" onclick="handleLogout()" class="block px-3 py-2 text-xs text-red-400 hover:bg-gray-700 hover:text-red-300 transition-colors border-t border-gray-700">
-                    <iconify-icon icon="ant-design:logout-outlined" class="icon-sm mr-2"></iconify-icon><span data-i18n="menu_logout">Logout</span>
+                    <iconify-icon icon="ant-design:logout-outlined" class="icon-sm mr-2"></iconify-icon><span data-i18n="menu_logout">{{ t('menu_logout') }}</span>
                 </a>
             </div>
         </div>
@@ -229,7 +245,11 @@
         // ── Active state (static links only) ──────────
         (function() {
             const pathname = document.location.pathname.replace(/\/$/, '') || '/';
-            document.querySelectorAll('.sidebar-link').forEach(link => {
+            // 同时遍历二级项 .sidebar-sub[data-page] —— 本块原本只认
+            // .sidebar-link,而「训练」挂在 sidebar-sub 上,不改这里它永远不会高亮。
+            // 带 [data-page] 限定是为了避开下面那批 review 状态快捷项:它们没有
+            // data-page,由紧跟着的另一段脚本按 URL 参数管。
+            document.querySelectorAll('.sidebar-link, .sidebar-sub[data-page]').forEach(link => {
                 const linkPage = link.dataset.page;
                 const isActive = (pathname === '/' && linkPage === 'home')
                     || (pathname === '/tasks' && linkPage === 'tasks')
@@ -237,7 +257,10 @@
                     || (pathname === '/users' && linkPage === 'users')
                     || (pathname === '/annotation-studio' && linkPage === 'annotation-studio')
                     || (pathname === '/review' && linkPage === 'review')
-                    || (pathname === '/trash' && linkPage === 'trash');
+                    || (pathname === '/trash' && linkPage === 'trash')
+                    // 一级项「模型」目前也指向 /train,所以它跟着一起亮 ——
+                    // 与 Video Review 在 /review 上「父项 + 某个状态子项同时亮」一致。
+                    || (pathname === '/train' && linkPage === 'model');
                 if (isActive) link.classList.add('active');
             });
         })();

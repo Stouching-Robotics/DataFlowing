@@ -56,6 +56,27 @@ class Settings(BaseSettings):
     EXPORT_SHARD_SIZE: int = 100000
     VIDEO_SHARD_FRAMES: int = 5000
 
+    # Training. Checkpoints are produced *outside* the platform by the official
+    # ``lerobot-train`` CLI (conda env ``lerobot052_base_piper``), so this points
+    # at an existing directory we only ever read. Empty = use the default below.
+    TRAIN_OUTPUT_ROOT: str = ""
+
+    @property
+    def train_root(self) -> Path:
+        """Trained-model directory — **read-only**, never created here.
+
+        Defaults to ``<repo>/文件测试/umi_act_model``, i.e. beside ``processor/``.
+        The directory is git-ignored and may legitimately be absent (fresh
+        clone, or training never run on this host): callers must treat a
+        missing path as "no runs" rather than creating it.  Creating it would
+        make an empty training dir appear out of nowhere on every boot.
+        """
+        raw = str(self.TRAIN_OUTPUT_ROOT or "").strip()
+        if raw:
+            return Path(raw).expanduser()
+        return (Path(__file__).resolve().parent.parent.parent
+                / "文件测试" / "umi_act_model")
+
     model_config = {
         "env_prefix": "",
         "case_sensitive": False,

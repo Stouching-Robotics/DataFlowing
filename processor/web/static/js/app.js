@@ -1449,67 +1449,6 @@ async function downloadEpisode(episodeId) {
 }
 
 
-// ── Export Page ───────────────────────────────────────
-
-async function loadExportJobs() {
-    const listEl = document.getElementById('export-list');
-    if (!listEl) return;
-
-    try {
-        const res = await fetch('/api/v1/export/list?limit=50');
-        const jobs = await res.json();
-
-        if (jobs.length === 0) {
-            listEl.innerHTML = '<tr><td colspan="5" class="text-center text-gray-500 py-8">No export jobs</td></tr>';
-            return;
-        }
-
-        listEl.innerHTML = jobs.map(job => {
-            const time = new Date(job.created_at).toLocaleString('zh-CN');
-            const statusColors = { pending: 'text-yellow-400', running: 'text-blue-400', completed: 'text-green-400', failed: 'text-red-400' };
-            const statusText = { pending: 'Pending', running: 'Running', completed: 'Completed', failed: 'Failed' };
-            const progressBar = job.status === 'running'
-                ? `<div class="w-full bg-gray-700 rounded h-2"><div class="bg-blue-500 h-2 rounded" style="width:${job.progress}%"></div></div>`
-                : job.status === 'completed' ? '100%' : '-';
-            const actions = job.status === 'completed'
-                ? `<a href="/api/v1/export/download/${job.id}" class="text-blue-400 hover:underline text-xs"><iconify-icon icon="ant-design:download-outlined" class="icon-sm"></iconify-icon> Download</a>`
-                : job.status === 'running'
-                    ? `<button onclick="loadExportJobs()" class="text-gray-400 hover:underline text-xs">Refresh</button>`
-                    : '';
-
-            return `<tr class="border-b border-gray-800">
-                <td class="px-4 py-2">${job.dataset_name}</td>
-                <td class="px-4 py-2 ${statusColors[job.status]||'text-gray-400'}">${statusText[job.status]||job.status}</td>
-                <td class="px-4 py-2">${progressBar}</td>
-                <td class="px-4 py-2 text-xs text-gray-400">${time}</td>
-                <td class="px-4 py-2">${actions}</td>
-            </tr>`;
-        }).join('');
-    } catch (err) {
-        listEl.innerHTML = `<tr><td colspan="5" class="text-center text-red-400 py-8">Load failed</td></tr>`;
-    }
-}
-
-
-async function startExport() {
-    const name = document.getElementById('new-dataset-name')?.value;
-    const ratio = parseFloat(document.getElementById('new-split-ratio')?.value) || 0.9;
-    if (!name) return alert('Please enter a dataset name');
-
-    try {
-        const res = await fetch('/api/v1/export/start', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ dataset_name: name, episode_ids: null, split_ratio: ratio }),
-        });
-        if (res.ok) { document.getElementById('new-dataset-name').value = ''; loadExportJobs(); }
-        else { const err = await res.json(); alert('Export creation failed: ' + (err.detail || 'unknown')); }
-    } catch (err) {
-        alert('Export creation failed: ' + err.message);
-    }
-}
-
-
 // ── Init ────────────────────────────────────────────
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -1537,10 +1476,6 @@ document.addEventListener('DOMContentLoaded', () => {
         if (exportBtn) exportBtn.title = t('batch_export_hint');
         const zipBtn = document.getElementById('batch-zip-btn');
         if (zipBtn) zipBtn.title = t('batch_zip_hint');
-    }
-    if (document.getElementById('export-list')) {
-        loadExportJobs();
-        setInterval(loadExportJobs, 10000);
     }
     if (document.getElementById('trash-list')) {
         loadTrashList();

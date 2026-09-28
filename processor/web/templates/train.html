@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Model Training - Data Acquisition{% endblock %}
+
+{% block content %}
+<div class="flex-1 overflow-y-auto hide-scrollbar px-6 pt-3 pb-6">
+    <!-- 这一页没有大标题,也没有右上角的刷新按钮 —— 页签本身已经说明"你在哪一页",
+         再来一个大标题是重复;而刷新在浏览器里就有(F5 / Ctrl+R),自己做一个是多余的。
+         内容高度直接从顶部开始,不预留空行。 -->
+    <!-- 全部内容由 static/js/train/main.js 渲染。它是这一页唯一的入口;
+         train/ 下其余文件,以及 inference/view.js,都是被它 import 的模块。 -->
+    <div id="train-runs">
+        <div class="text-center text-gray-600 text-sm py-10" data-i18n="loading">{{ t('loading') }}</div>
+    </div>
+</div>
+
+<script type="module" src="/static/js/train/main.js?v={{ asset_version }}"></script>
+{% endblock %}

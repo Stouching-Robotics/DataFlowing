@@ -41,7 +41,6 @@ from app.localstore import (
     read_episode_state,
     write_episode_state,
 )
-from app.routes.annotations import notify_annotations_changed
 from app.video_quality import check_video_quality_async
 from app.workflow_types import HAND_PROCESS_TYPES, canonical_node_type
 
@@ -2710,6 +2709,11 @@ def _persist_ai_segment(episode_id: str, generation: int, candidate: dict,
                         index: int, media_sources: list[str], *,
                         pending: bool = False, error: str = "") -> dict:
     """Atomically insert/update one segment without waiting for its siblings."""
+    # 惰性导入 —— 不要提到模块顶层。本模块在路由层**之下**,而 routes.annotations
+    # 反过来惰性引用 ai_annotation(_schedule_dataset_sync)。模块级导入会形成
+    # import 环:谁先被导入,谁就拿不到对方完整的模块对象。放进调用点后方向保持
+    # 单向(路由 → 本模块),将来搬文件也不会因顺序踩坑。
+    from app.routes.annotations import notify_annotations_changed
     record = _ai_annotation_record(
         episode_id, candidate, index, media_sources,
         pending=pending, error=error)
@@ -2836,6 +2840,8 @@ def run_ai_annotation(episode_id: str, mode: str, min_confidence: float,
     走本地 vLLM 抽帧图;provider=api 走 Kimi 原生视频 —— 两模式严格
     分离,配置缺失/请求失败显式报错(任务 detail 可见),绝不互回退。
     """
+    # 同 _persist_ai_segment:惰性导入,避免与 routes.annotations 形成 import 环。
+    from app.routes.annotations import notify_annotations_changed
     episode_id = str(episode_id)
     quality_review_enabled = bool(quality_gate or video_quality_gate)
     if quality_review_enabled:

@@ -1,5 +1,5 @@
 import { memo, useMemo, useState, type KeyboardEvent, type FocusEvent } from 'react';
-import { Handle, Position, type NodeProps } from '@xyflow/react';
+import { Handle, Position, type Node, type NodeProps } from '@xyflow/react';
 import { IconifyIcon } from '../IconifyIcon';
 import { DYNAMIC_INPUT_TYPES, dynamicInputKey, useWorkflowStore } from '../../../store/workflowStore';
 import { nodeLabel, portLabel, useLang, useT } from '../../../i18n';
@@ -42,19 +42,44 @@ function cameraCategoryLabel(data: WorkflowNodeData): string {
   return DEVICE_CATEGORY_LABELS.mono_rgb;
 }
 
-/** 一条边的上游端口名 —— 取不到就回落到 sourceHandle 本身。 */
-function upstreamPortLabelOf(
-  source: { data?: { nodeType?: string; outputs?: { key: string; label: string }[] } },
+/**
+ * 解析「节点 id + 端口 key」的端口名 —— 取不到就回落到 handle 本身。
+ *
+ * 动态端口节点（Data Quality）的**输出**口 key 是 ``dynamicInputKey`` 编出来的
+ * ``${上游节点 id}:${上游端口}``（见 workflowStore）。所以给下游算口名时不能只看
+ * 该节点自己的 ``outputs`` —— 那里只有声明的 ``reviewed``，四个口会全叫
+ * "Reviewed Data"。要顺着 key 往回找：dq → dq → … → 设备节点，一路解到真实
+ * 端口。节点 id 恒为 ``node_N``、不含冒号，按**首个**冒号切分安全；前缀若不是
+ * 已知节点（老图/异构来源），原样回落到 handle。
+ *
+ * depth 上限防环：正常链路的 key 由上游 id 构成不会成环，但图上若被手工造出
+ * dq → dq 的自指边，没有上限会栈溢出。
+ */
+function portLabelOf(
+  byId: Map<string, Node<WorkflowNodeData>>,
+  nodeId: string,
   sourceHandle: string | null | undefined,
   lang: 'en' | 'zh',
+  depth = 0,
 ): string {
-  const outputs = source.data?.outputs || [];
   const handle = String(sourceHandle ?? '');
-  const port = outputs.find((o) => o.key === handle)
-    || (outputs.length === 1 ? outputs[0] : null);
-  const raw = port?.label || handle;
+  const node = byId.get(nodeId);
+  if (!node || depth > 8) return handle;
+  const type = String(node.data?.nodeType ?? '');
+  const outputs = node.data?.outputs || [];
+  // 显式声明的口优先 —— 非动态节点的行为与改动前逐字一致
+  const port = outputs.find((o) => o.key === handle);
+  if (port) return portLabel(type, port.key, port.label, lang);
+  // 动态 key：`${上游节点 id}:${上游端口}`，递归解到真正的端口名
+  if (DYNAMIC_INPUT_TYPES.has(type) && handle.includes(':')) {
+    const at = handle.indexOf(':');
+    if (byId.has(handle.slice(0, at))) {
+      return portLabelOf(byId, handle.slice(0, at), handle.slice(at + 1), lang, depth + 1);
+    }
+  }
+  const only = outputs.length === 1 ? outputs[0] : null;
   // 用**上游**的类型翻译 —— data 这个 key 在不同卡上叫法不同
-  return portLabel(String(source.data?.nodeType ?? ''), port?.key || handle, raw, lang);
+  return portLabel(type, only?.key || handle, only?.label || handle, lang);
 }
 
 /**
@@ -73,11 +98,25 @@ function useDynamicInputs(nodeId: string, enabled: boolean, lang: 'en' | 'zh'): 
     if (!enabled) return '';
     const incoming = s.edges.filter((e) => e.target === nodeId);
     if (!incoming.length) return '';
-    return JSON.stringify(incoming.map((edge) => {
-      const source = s.nodes.find((n) => n.id === edge.source);
+    // ★ 按 key 去重（保序）。端口 key 只由「源节点 + 源端口」决定，所以两条
+    //   同源同端口的边会算出同一个 key —— 不去重就会渲染出**两个同名口**。
+    //   这类重复边本不该存在（onConnect 有 isDup 拦），但历史上配对边写错了
+    //   targetHandle，isDup 判不出来（见 workflowStore 里 siblingConn 的注释）。
+    //   渲染层兜一道，保证"一个 key 一个口"。
+    const seen = new Set<string>();
+    const rows: [string, string][] = [];
+    // 每轮只建一次索引：原来是每条边一次 s.nodes.find（O(E·N)）
+    const byId = new Map(s.nodes.map((n) => [String(n.id), n]));
+    for (const edge of incoming) {
       const key = dynamicInputKey(String(edge.source), edge.sourceHandle);
-      return [key, source ? upstreamPortLabelOf(source, edge.sourceHandle, lang) : key];
-    }));
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const sourceId = String(edge.source);
+      rows.push([key, byId.has(sourceId)
+        ? portLabelOf(byId, sourceId, edge.sourceHandle, lang)
+        : key]);
+    }
+    return JSON.stringify(rows);
   });
   return useMemo(
     () => (encoded ? (JSON.parse(encoded) as [string, string][]) : []),
@@ -150,6 +189,24 @@ export const WorkflowNodeComponent = memo(function WorkflowNodeComponent({ data,
       key, originalLabel: label, label,
     })),
   ], [d.inputs, dynamicInputs, d.nodeType, lang]);
+
+  // 输出端口 = 动态口与输入口**一一对应**（同 key 同标签同顺序）；无入边时回落
+  // 到声明的口（reviewed）。
+  //
+  // 这正是 _migrateDynamicSourceHandles 已经写好的约定 —— 它会把指向下游的边
+  // 展开成 N 条、sourceHandle 设成动态 key（见 workflowStore）。渲染侧此前一直是
+  // 裸的 d.outputs，于是那些边指向了**从来不存在的 Handle**，功能只做了一半。
+  //
+  // ★ 动态口的 label **直接用**，不要再走 portLabel()：输入侧动态口就是不翻译的
+  //   裸 label，输出侧必须与它逐字一致（左右同名是明确要求）。
+  const outputPorts = useMemo(() => (
+    dynamicInputs.length
+      ? dynamicInputs.map(([key, label]) => ({ key, label }))
+      : (d.outputs || []).map((out) => ({
+          key: out.key,
+          label: portLabel(String(d.nodeType), out.key, out.label, lang),
+        }))
+  ), [d.outputs, dynamicInputs, d.nodeType, lang]);
 
   const resolveCameraSource = (value: string): DeviceInputSource | null => {
     const normalized = value.trim().toLowerCase();
@@ -244,20 +301,16 @@ export const WorkflowNodeComponent = memo(function WorkflowNodeComponent({ data,
       .catch((e) => useUiStore.getState().pushToast(`Failed to clear binding: ${e?.message || e}`, 'error'));
   };
 
-  // 卡片高度按**这张卡自己的端口数**算。
-  //
-  // 之前高度是画布统一算的（取所有模块声明端口数的最大值），对**运行时**才长出来的
-  // 动态口无能为力：Data Quality 接第 5 个设备时它根本没变，卡片被撑破。
-  // 改成每张卡按自己实际的口数算，设在自己身上（CSS 自定义属性会继承，
-  // 设在本节点上只影响本节点）。
-  const portRows = inputPorts.length + (d.outputs || []).length;
-  const cardHeight = Math.max(2, portRows) * 22 + 42;   // 22px/行 + 头部与内边距
+  // 卡片高度**交给内容自己撑**（CSS: height:auto + min-height:90px），不再按端口数
+  // 估算。曾用过 ``端口数 * 22 + 42`` 的公式，但 22px/行 与实际行高对不上：估多了
+  // 卡片底部留一大片空白，估少了（比如只数了声明的 d.outputs、漏掉运行时才长出来的
+  // 动态输出口）内容就从底部溢出。让浏览器量实际内容，两种毛病都不会有 —— 端口多
+  // 卡片就高、端口少就矮，本来也就是想要的效果。
 
   return (
     <div className="workflow-node" title={desc} style={{
       borderColor: selected ? '#3b82f6' : d.color || '#334155',
       boxShadow: selected ? `0 0 0 2px ${d.color}33` : undefined,
-      '--node-card-height': `${cardHeight}px`,
     } as React.CSSProperties}>
       <div className="node-header" style={{ backgroundColor: `${hdrColor}22`, borderBottom: `1px solid ${hdrColor}44` }}>
         <div className="node-title-row">
@@ -308,13 +361,13 @@ export const WorkflowNodeComponent = memo(function WorkflowNodeComponent({ data,
           </div>
         ))}
         {/* Output ports: label next to handle, handle on right edge (right-aligned) */}
-        {(d.outputs || []).map((out) => (
+        {outputPorts.map((out) => (
           <div key={out.key} className="node-port" style={{ justifyContent: 'flex-end', paddingRight: 0 }}>
-            {/* 输出端口**保持原文案** —— 之前让透传节点的输出也跟着显示数据种类，
-                结果同一张卡上下两行是同一串文字（如 Data Quality 左右各一行
-                "tactile, device_status, imu"），看着很乱。端口文字只有输入侧需要
-                反映实际流经的数据；输出是本节点产出的什么，用声明文案更清楚。 */}
-            <span>{portLabel(String(d.nodeType), out.key, out.label, lang)}</span>
+            {/* 声明口仍用原文案 —— 之前让透传节点的输出也跟着显示数据种类，结果
+                同一张卡上下两行是同一串文字，看着很乱；输出是本节点产出的什么，
+                用声明文案更清楚。**动态口例外**：它与输入侧逐字一致，见 outputPorts
+                上方的注释。 */}
+            <span>{out.label}</span>
             <Handle type="source" position={Position.Right} id={out.key} style={{ position: 'relative', right: -6, transform: 'none', flexShrink: 0 }} />
           </div>
         ))}

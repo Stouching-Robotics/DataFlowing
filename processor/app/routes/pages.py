@@ -21,10 +21,30 @@ _static_dir = STATIC_DIR
 
 # 静态资源缓存键的唯一来源:模板里写 ``?v={{ asset_version }}``。
 # 以前每个模板各写各的日期串,发版时靠人记得逐个改 —— 漏一个,那个页面
-# 就会继续发浏览器缓存里的旧脚本。现在只 bump app/version.py 一处。
-from app.version import __version__ as _asset_version
+# 就会继续发浏览器缓存里的旧脚本。
+#
+# ★ 取的是**前端号**(web/VERSION),不是后端号。改前端只 bump 那一个文件即可,
+#   提交信息里的「前端 X」就是它 —— 缓存键和版本记录是同一个数,不会对不上。
+#   (原来取后端号,于是每次改前端都要同时 bump 后端号和前端号两个地方。)
+from app.web_version import frontend_version as _frontend_version
 
-templates.env.globals["asset_version"] = _asset_version
+templates.env.globals["asset_version"] = _frontend_version()
+
+# 服务端取词 —— 模板里写 ``{{ t('nav_home') }}``。语言由 app/i18n.py 的
+# LanguageMiddleware 从 cookie 读进 ContextVar,这里是同一个上下文,读得到。
+# 这样首屏渲染出来的就是正确语言,不再"先英文后由 JS 纠正"(那会闪一下)。
+from app.i18n import get_current_lang as _get_lang
+from app.i18n import t as _t
+
+templates.env.globals["t"] = _t
+# 模板要写 <html lang="…">,所以语言码也放进全局。
+#
+# ★ 注册的是**函数**,模板里必须写成 ``{{ current_lang() }}`` 带括号。
+#   Jinja 的全局是"每次渲染取一次这个对象" —— 值是固定的,而语言是**每请求**
+#   才定的(存在 ContextVar 里),所以只能注册一个可调用的东西,渲染时调它。
+#   少写括号不会报错,只会把函数的 repr 渲染进 HTML:
+#       <html lang="&lt;function get_current_lang at 0x7f…&gt;">
+templates.env.globals["current_lang"] = _get_lang
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -66,6 +86,16 @@ async def tasks_page(request: Request):
 @router.get("/trash", response_class=HTMLResponse)
 async def trash_page(request: Request):
     return templates.TemplateResponse("trash.html", {"request": request})
+
+
+@router.get("/train", response_class=HTMLResponse)
+async def train_page(request: Request):
+    """Model training — read-only view of checkpoints produced outside the platform.
+
+    Data comes from ``GET /api/v1/training/runs`` (see ``app/routes/training.py``).
+    Nothing on this page starts or stops training yet.
+    """
+    return templates.TemplateResponse("train.html", {"request": request})
 
 
 @router.get("/users", response_class=HTMLResponse)

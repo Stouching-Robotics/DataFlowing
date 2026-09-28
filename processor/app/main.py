@@ -12,8 +12,10 @@ from starlette.middleware.gzip import GZipMiddleware
 
 from app.config import settings
 from app.routes import ingestion, video, export, pages, session, annotations, dashboard, devices, auth
+from app.routes import training
 from app.api import workflows, worker, projects, exceptions, quality
 from app.api import users
+from app.i18n import LanguageMiddleware
 from app.middleware import AuthMiddleware
 from app.paths import STATIC_DIR
 from app.version import __version__
@@ -75,7 +77,10 @@ app = FastAPI(
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 # Auth middleware — protect routes (after gzip, before everything else)
+# 语言中间件要在 Auth 之外(先于它)跑:鉴权失败跳登录页时,那个页面本身也要
+# 按 cookie 里的语言渲染。add_middleware 是**后加的先跑**,所以放在 Auth 之后加。
 app.add_middleware(AuthMiddleware)
+app.add_middleware(LanguageMiddleware)
 
 # 媒体/压缩文件下载不走 gzip:zip/mp4/parquet/hdf5 本身已是压缩格式,
 # 再压一遍只是烧 CPU(zlib level 9 压缩 180MB ≈ 10s),而且流式压缩会
@@ -109,6 +114,15 @@ async def static_cache_headers(request, call_next):
             response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
         elif request.url.query:
             response.headers["Cache-Control"] = "public, max-age=86400"
+        elif path.startswith("/static/js/"):
+            # ES module 的相对 import 解析出来的 URL **不带查询串** —— 就算入口
+            # script 写了 ?v=,`import './api.js'` 也永远是同一个地址。给它任何
+            # 正数的 max-age,升级后都会出现「新入口 + 旧子模块」混用,直接抛
+            # TypeError。这类文件必须每次回源校验(未变则 304,开销可忽略)。
+            #
+            # 范围刻意收窄到 /static/js/:带 ?v= 的老脚本走上面那支不受影响;
+            # /static/ 顶层的第三方库(plyr.js、iconify-*)也不在范围里。
+            response.headers["Cache-Control"] = "no-cache"
         else:
             response.headers["Cache-Control"] = "public, max-age=3600"
     return response
@@ -141,3 +155,4 @@ app.include_router(projects.router)
 app.include_router(exceptions.router)
 app.include_router(quality.router)
 app.include_router(users.router)
+app.include_router(training.router)

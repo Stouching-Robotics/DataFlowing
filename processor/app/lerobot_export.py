@@ -1806,6 +1806,82 @@ def _depth_assets(session_dir: Path, frame_count: int,
     return assets
 
 
+# 内置默认双目标定 —— 批次标定缺失或整份全零时的兜底。键名取自该文件的
+# ``name`` 字段(head_stereo),与会话里真有一份 head_stereo.json 时算出的键一致。
+_DEFAULT_CALIBRATION_PATH = (Path(__file__).resolve().parent
+                             / "processing" / "modules"
+                             / "calibration_default_head_stereo.json")
+
+
+def _calibration_is_blank(doc: Any) -> bool:
+    """整份标定里找不出任何非零数值 —— 视为未生效的空白标定。
+
+    只递归看数值叶子(标定本质上就是嵌套的数值结构);字符串等非数值字段
+    不构成"有效标定"的证据。所以 ``{"depth_scale": 0.001}`` 不算空白,
+    而全零的 intrinsic/rotation/translation 算。
+    """
+    if isinstance(doc, bool):
+        return True                    # bool 是 int 子类,必须先挡掉
+    if isinstance(doc, (int, float)):
+        return doc == 0
+    if isinstance(doc, dict):
+        return all(_calibration_is_blank(v) for v in doc.values())
+    if isinstance(doc, (list, tuple)):
+        return all(_calibration_is_blank(v) for v in doc)
+    return True
+
+
+def _default_calibration_docs() -> dict[str, Any]:
+    """读内置默认标定;文件缺失/损坏时返回 {} (调用方自行回落到空)。"""
+    try:
+        doc = json.loads(_DEFAULT_CALIBRATION_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    return {str(doc.get("name") or _DEFAULT_CALIBRATION_PATH.stem): doc}
+
+
+def _calibration_docs(session_dir: str | Path,
+                      episode_id: str | None = None) -> dict[str, Any]:
+    """会话标定 → ``{名称: 标定内容}``,供导出侧写进数据集 meta。
+
+    目录口径与其余读取点一致(media_groups / depth_hand_3d / lerobot_v21 /
+    本文件的深度标定段):先看 ``calibration/``;给了 ``episode_id`` 时优先
+    ``meta/calibration/<episode_id>/``,再回退 ``meta/calibration/``。键名优先
+    取 JSON 里的 ``name`` 字段,否则用文件名 stem。
+
+    **批次标定缺失、或整份全零时回退内置默认标定**
+    (``processing/modules/calibration_default_head_stereo.json``)。不这么做的话,
+    导出的 meta 会声明一个从未生效的标定,下游照它复现 3D 全是错的。
+
+    只有**每一份**都空白才回退 —— 只要有一份像样的就用会话里的。
+    """
+    session_dir = Path(session_dir)
+    calib_dir = session_dir / "calibration"
+    if episode_id:
+        namespaced = session_dir / "meta" / "calibration" / str(episode_id)
+        if namespaced.is_dir():
+            calib_dir = namespaced
+    if not calib_dir.is_dir():
+        calib_dir = session_dir / "meta" / "calibration"
+
+    docs: dict[str, Any] = {}
+    if calib_dir.is_dir():
+        for path in sorted(calib_dir.glob("*.json")):
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                continue
+            if not isinstance(value, dict):
+                continue
+            docs[str(value.get("name") or path.stem)] = value
+
+    if docs and not all(_calibration_is_blank(v) for v in docs.values()):
+        return docs
+    return _default_calibration_docs() or docs
+
+
 def _device_metadata(session_dir: Path) -> list[dict]:
     """Return physical-device declarations for export-side pairing metadata."""
     for name in ("metadata.json", "meta/info.json"):

@@ -4,7 +4,7 @@
 
 [English](README.md) | [中文](README.zh-CN.md)
 
-> Documentation: 2026-09-02  ·  Backend: `1.6.8`  ·  Web frontend: `1.5.6`
+> Documentation: 2026-09-28  ·  Backend: `1.19.4`  ·  Frontend: `1.12.3`
 
 processor is EgoData's service for data capture, processing, review, and export. It is
 designed for embodied AI and robot manipulation data. The system consists of a FastAPI backend,
@@ -523,12 +523,22 @@ Troubleshooting order:
 <details>
 <summary>Click to expand: version maintenance rules</summary>
 
-- The backend version is maintained in `app/version.py`;
-- the Web frontend version is maintained in `web/workflow-studio/package.json`;
+- The backend version is maintained in `app/version.py` and covers the backend **only**;
+- **the frontend version is maintained in `web/VERSION`**. It covers every piece of frontend
+  code under `processor/web/` (`templates/`, `static/`, `workflow-studio/`) — **not just the
+  React SPA**. The version inside `web/workflow-studio/package.json` only represents the SPA
+  itself; all three numbers are independent and do not need to stay in sync.
+- **Bump `web/VERSION` — that one file — whenever you change the frontend.** A single number
+  serves two purposes: ① the `?v={{ asset_version }}` cache key on static assets (so browsers
+  re-fetch changed JS/CSS), ② the "frontend X" part of commit messages. Sharing one number
+  means the commit message can never disagree with what the browser actually loaded.
+  You do **not** need to touch the backend version for a frontend change.
+- `web/VERSION` is read once at startup and cached (`app/web_version.py`), so **restart the
+  service** after bumping it.
 - increment the patch version for fixes and small adjustments, the minor version for new features,
   and the major version for architectural changes;
 - before release, record the software version, data format, and API changes together.
 
-Current versions: backend `1.6.8`, Web frontend `1.5.6`.
+Current versions: backend `1.19.4`, frontend `1.12.3`.
 
 </details>

@@ -33,6 +33,14 @@ web/workflow-studio/*.tsbuildinfo
 *.db
 *.log
 
+# 编辑器/工具留下的备份与冲突残留文件 —— 一律不入库。
+# 起因:`web/static/plyr.js.bak`(改 plyr.js 时留下的备份)被误提交进了版本库,
+# 而仓库里没有任何规则拦它。改 JS 时留的 .bak 尤其容易混进来。
+*.bak
+*.orig
+*.rej
+*~
+
 # Local model assets and scratch (large binaries, never in git).
 models/
 *.deb

@@ -38,6 +38,9 @@ router = APIRouter(prefix="/api/v1/export", tags=["export"])
 
 EXPORTS_DIR = STATE_ROOT / "exports"
 EXPORT_TASKS_DIR = STATE_ROOT / "export_tasks"
+# 可训练的数据集 —— 与 EXPORTS_DIR 分开:那边是按 run_id 命名的**处理产物**
+# (每条一集),这边是**能拿去训练的成品**,训练页只列这个目录。
+DATASETS_DIR = STATE_ROOT / "datasets"
 # 导出页/批量导出的构建目录与 zip 放本地盘:同一份视频数据不再在
 # NAS(SSHFS ~28MB/s)上读写三遍,只保留一次源文件读取。
 LOCAL_EXPORTS_DIR = settings.upload_staging_root / "exports"
@@ -484,6 +487,38 @@ async def batch_download_sessions(request: Request):
 
 # ── 导出任务(JSON,后台打包)─────────────────────────
 
+def _persist_trainable_dataset(export_root: Path, dataset_name: str) -> Path | None:
+    """把导出好的数据集落到 ``state/datasets/<名字>/``,让它能当训练输入。
+
+    原来是打包完直接 ``rmtree``(省本地空间)—— 结果导出的成果只剩一个 zip,
+    磁盘上什么都没有,训练页根本无从列起。
+
+    **交换式替换**,不是"先删旧的再搬新的":先把新数据集搬进 ``.staging``,
+    再把旧的挪到 ``.old``,然后 rename 上位,最后删 ``.old``。任何一步失败都不会
+    让目标位置处于"半个数据集"的状态 —— 直接 rmtree 再 move 的话,搬到一半
+    失败就两头落空。
+
+    返回落位后的路径;``export_root`` 里没有 ``meta/info.json``(不是数据集)时
+    返回 None,调用方照旧删掉临时目录。
+    """
+    if not (export_root / "meta" / "info.json").is_file():
+        return None
+
+    DATASETS_DIR.mkdir(parents=True, exist_ok=True)
+    target = DATASETS_DIR / dataset_name
+    staging = DATASETS_DIR / f".{dataset_name}.staging"
+    previous = DATASETS_DIR / f".{dataset_name}.old"
+
+    shutil.rmtree(staging, ignore_errors=True)
+    shutil.move(str(export_root), str(staging))
+    shutil.rmtree(previous, ignore_errors=True)
+    if target.exists():
+        target.rename(previous)
+    staging.rename(target)          # 同盘 rename,原子
+    shutil.rmtree(previous, ignore_errors=True)
+    return target
+
+
 def _load_task(job_id: str) -> dict | None:
     return _read_json(EXPORT_TASKS_DIR / f"{job_id}.json", None)
 
@@ -573,8 +608,9 @@ def _run_export_task(job_id: str, episode_ids: list[str], export_format: str,
         ]
         if blocked:
             raise RuntimeError("Some episodes are still in Reviewing")
-        # 构建与 zip 都在本地盘进行(NAS 只读一次源文件);zip 是最终
-        # 产物,构建目录打包完成后即删除以节省本地空间。
+        # 构建与 zip 都在本地盘进行(NAS 只读一次源文件)。产物两样都留:
+        # zip 供下载,数据集目录(LeRobot 分支)供训练页选用 —— 后者走
+        # _persist_trainable_dataset 落到 state/datasets/,不再是"打完包就删"。
         dest = LOCAL_EXPORTS_DIR / f"{job_id}.zip"
         dest.parent.mkdir(parents=True, exist_ok=True)
         export_root = LOCAL_EXPORTS_DIR / f"{dataset_name}-{job_id[:8]}"
@@ -591,12 +627,17 @@ def _run_export_task(job_id: str, episode_ids: list[str], export_format: str,
                                   progress_callback=_on_episode)
             _set_progress(0.75)
             _zip_directory(export_root, dest)
+            # 打包后**留下**数据集,不要删 —— 训练页的数据集列表就是从这里读的
+            # (state/datasets/)。只有它压根不是数据集时才清掉临时目录。
+            if _persist_trainable_dataset(export_root, dataset_name) is None:
+                shutil.rmtree(export_root, ignore_errors=True)
             _set_progress(0.95)
         else:
             _set_progress(0.2)
             _zip_episode_selection([str(e) for e in episode_ids], dest)
             _set_progress(0.95)
-        shutil.rmtree(export_root, ignore_errors=True)
+            # 非 LeRobot 分支产出的只是一个选集的 zip,没有数据集目录可留。
+            shutil.rmtree(export_root, ignore_errors=True)
         task = _load_task(job_id)
         if task:
             task["status"] = "completed"

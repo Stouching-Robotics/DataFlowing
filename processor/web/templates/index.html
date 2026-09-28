@@ -274,20 +274,20 @@
                 class="text-xs px-2.5 py-1.5 rounded-lg border border-gray-600/70 bg-gray-900/55 backdrop-blur-md text-gray-300 hover:border-blue-500 hover:text-white transition-colors flex items-center gap-1 shadow-lg"
                 style="cursor:move;user-select:none;">
             <iconify-icon icon="ant-design:menu-outlined" class="icon-sm"></iconify-icon>
-            <span data-i18n="preview_options">Preview Options</span>
+            <span data-i18n="preview_options">{{ t('preview_options') }}</span>
         </button>
         <div id="preview-options-menu"
              class="hidden absolute left-0 top-full mt-1 w-64 rounded-lg border border-gray-600/70 bg-gray-900/60 backdrop-blur-md shadow-xl z-40 p-1.5 text-xs">
             <div id="po-video-row" class="hidden px-2 py-1.5 rounded hover:bg-gray-800">
                 <div class="flex items-center justify-between gap-2">
-                    <span class="text-gray-200" data-i18n="video_sources">Video Sources</span>
+                    <span class="text-gray-200" data-i18n="video_sources">{{ t('video_sources') }}</span>
                     <button id="po-video-all" type="button"
-                            class="text-[10px] text-cyan-300 hover:text-white" data-i18n="all">All</button>
+                            class="text-[10px] text-cyan-300 hover:text-white" data-i18n="all">{{ t('all') }}</button>
                 </div>
                 <div id="po-video-list" class="mt-1 space-y-1"></div>
             </div>
             <div class="flex items-center justify-between gap-2 px-2 py-1.5 rounded hover:bg-gray-800">
-                <span class="text-gray-200" data-i18n="hand_skeleton">Hand Skeleton</span>
+                <span class="text-gray-200" data-i18n="hand_skeleton">{{ t('hand_skeleton') }}</span>
                 <label class="relative inline-flex items-center cursor-pointer">
                     <input type="checkbox" id="toggle-hand-skeleton" class="sr-only peer" checked>
                     <div class="bg-gray-700 peer-checked:bg-cyan-600 rounded-full relative transition-colors"
@@ -298,7 +298,7 @@
                 </label>
             </div>
             <div class="flex items-center justify-between gap-2 px-2 py-1.5 rounded hover:bg-gray-800">
-                <span class="text-gray-200" data-i18n="hand_trail">Hand Trail</span>
+                <span class="text-gray-200" data-i18n="hand_trail">{{ t('hand_trail') }}</span>
                 <label class="relative inline-flex items-center cursor-pointer">
                     <input type="checkbox" id="toggle-hand-trail" class="sr-only peer">
                     <div class="bg-gray-700 peer-checked:bg-cyan-600 rounded-full relative transition-colors"
@@ -309,7 +309,7 @@
                 </label>
             </div>
             <div id="po-glove-row" class="hidden flex items-center justify-between gap-2 px-2 py-1.5 rounded hover:bg-gray-800">
-                <span class="text-gray-200" data-i18n="glove_sensor">Glove Sensor</span>
+                <span class="text-gray-200" data-i18n="glove_sensor">{{ t('glove_sensor') }}</span>
                 <label class="relative inline-flex items-center cursor-pointer">
                     <input type="checkbox" id="toggle-glove-sensor" class="sr-only peer" checked>
                     <div class="bg-gray-700 peer-checked:bg-emerald-600 rounded-full relative transition-colors"
@@ -320,7 +320,7 @@
                 </label>
             </div>
             <div id="po-heatmap-row" class="hidden flex items-center justify-between gap-2 px-2 py-1.5 rounded hover:bg-gray-800">
-                <span class="text-gray-200" data-i18n="heatmap_toggle">Depth Heatmap</span>
+                <span class="text-gray-200" data-i18n="heatmap_toggle">{{ t('heatmap_toggle') }}</span>
                 <label class="relative inline-flex items-center cursor-pointer">
                     <input type="checkbox" id="toggle-heatmap" class="sr-only peer" checked>
                     <div class="bg-gray-700 peer-checked:bg-rose-600 rounded-full relative transition-colors"
@@ -331,7 +331,7 @@
                 </label>
             </div>
             <div id="po-hand3d-world-row" class="hidden flex items-center justify-between gap-2 px-2 py-1.5 rounded hover:bg-gray-800">
-                <span class="text-gray-200" data-i18n="hand3d_world">3D Hand World</span>
+                <span class="text-gray-200" data-i18n="hand3d_world">{{ t('hand3d_world') }}</span>
                 <label class="relative inline-flex items-center cursor-pointer">
                     <input type="checkbox" id="toggle-hand3d-world" class="sr-only peer" checked>
                     <div class="bg-gray-700 peer-checked:bg-cyan-600 rounded-full relative transition-colors"
@@ -351,7 +351,7 @@
     <div id="camera-tabs" class="hidden flex gap-2 px-4 pt-3 pb-0 border-b border-gray-800 items-center flex-shrink-0">
         <span id="episode-info" class="hidden text-xs text-gray-400 items-center gap-2 py-1.5"></span>
         <span id="frame-info-header" class="ml-auto text-xs font-mono text-gray-500 hidden">
-            <span data-i18n="frame_label">Frame:</span> <span id="detail-current-frame" class="text-green-400 font-bold">0</span>
+            <span data-i18n="frame_label">{{ t('frame_label') }}</span> <span id="detail-current-frame" class="text-green-400 font-bold">0</span>
             / <span id="detail-total-frames" class="text-gray-400">0</span>
         </span>
     </div>
@@ -365,7 +365,7 @@
     <div id="video-grid" class="flex-1 min-w-0 min-h-0 p-3 overflow-hidden flex items-center justify-center">
         <div class="text-gray-600 text-center">
             <div class="text-4xl mb-3"><iconify-icon icon="ant-design:video-camera-outlined"></iconify-icon></div>
-            <div data-i18n="select_episode">Select an episode to review →</div>
+            <div data-i18n="select_episode">{{ t('select_episode') }}</div>
         </div>
     </div>
     <!-- 批次加载遮罩:媒体组/全部播放器/帧数据/标注就绪前盖住画布,
@@ -374,7 +374,7 @@
          style="background:rgba(2,6,23,.55);backdrop-filter:blur(2px);">
         <div class="flex flex-col items-center gap-3">
             <div class="w-10 h-10 rounded-full border-4 border-blue-500 border-t-transparent animate-spin"></div>
-            <div class="text-sm text-gray-300" data-i18n="loading">Loading…</div>
+            <div class="text-sm text-gray-300" data-i18n="loading">{{ t('loading') }}</div>
         </div>
     </div>
 
@@ -405,7 +405,7 @@
             <button id="btn-skip-back-10" class="frame-control-button bg-gray-700 hover:bg-gray-600 text-white rounded flex items-center justify-center" title="Back 10 frames"><iconify-icon icon="ant-design:step-backward-outlined" class="icon-sm"></iconify-icon></button>
             <button id="btn-step-back" class="frame-control-button bg-gray-700 hover:bg-gray-600 text-white rounded flex items-center justify-center" title="Back 1 frame"><iconify-icon icon="ant-design:left-outlined" class="icon-sm"></iconify-icon></button>
             <button id="btn-play-all" onclick="togglePlayAll()" class="bg-blue-600 hover:bg-blue-500 text-white rounded text-xs flex items-center justify-center gap-1" title="Play all synchronized views" aria-pressed="false">
-                <iconify-icon data-play-icon icon="ant-design:caret-right-filled" class="icon-sm"></iconify-icon> <span class="play-label" data-i18n="play">Play</span>
+                <iconify-icon data-play-icon icon="ant-design:caret-right-filled" class="icon-sm"></iconify-icon> <span class="play-label" data-i18n="play">{{ t('play') }}</span>
             </button>
             <button id="btn-step-forward" class="frame-control-button bg-gray-700 hover:bg-gray-600 text-white rounded flex items-center justify-center" title="Forward 1 frame"><iconify-icon icon="ant-design:right-outlined" class="icon-sm"></iconify-icon></button>
             <button id="btn-skip-forward-10" class="frame-control-button bg-gray-700 hover:bg-gray-600 text-white rounded flex items-center justify-center" title="Forward 10 frames"><iconify-icon icon="ant-design:step-forward-outlined" class="icon-sm"></iconify-icon></button>
@@ -420,13 +420,13 @@
     <div id="heatmap-section" class="flex-shrink-0 border-t border-gray-800 px-4 py-2 hidden" style="display:none">
         <div class="flex gap-2">
             <div class="flex-1 text-center">
-                <div class="text-xs text-gray-500 mb-1" data-i18n="left_hand">Left Hand</div>
+                <div class="text-xs text-gray-500 mb-1" data-i18n="left_hand">{{ t('left_hand') }}</div>
                 <img id="hand-left" src="" alt="Left Hand"
                      class="rounded border border-gray-700 bg-gray-900"
                      style="width:100%;height:95px;object-fit:contain">
             </div>
             <div class="flex-1 text-center">
-                <div class="text-xs text-gray-500 mb-1" data-i18n="right_hand">Right Hand</div>
+                <div class="text-xs text-gray-500 mb-1" data-i18n="right_hand">{{ t('right_hand') }}</div>
                 <img id="hand-right" src="" alt="Right Hand"
                      class="rounded border border-gray-700 bg-gray-900"
                      style="width:100%;height:95px;object-fit:contain">
@@ -443,12 +443,12 @@
         <span id="episode-list-count" class="text-xs text-gray-500"></span>
         <button id="btn-toggle-select" title="Toggle selection mode"
                 class="bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-gray-200 text-xs px-2 py-0.5 rounded flex-shrink-0 transition-colors"
-                onclick="toggleSelectMode()"><span data-i18n="select">Select</span></button>
+                onclick="toggleSelectMode()"><span data-i18n="select">{{ t('select') }}</span></button>
         <button id="btn-sort-order" title="Toggle sort order"
                 class="bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-gray-200 text-xs px-2 py-0.5 rounded flex items-center gap-1 flex-shrink-0 transition-colors"
                 onclick="toggleSortOrder()">
             <iconify-icon id="sort-order-icon" icon="ant-design:ordered-list-outlined" class="icon-sm"></iconify-icon>
-            <span id="sort-order-label" data-i18n="name_1_to_n">Name 1→N</span>
+            <span id="sort-order-label" data-i18n="name_1_to_n">{{ t('name_1_to_n') }}</span>
         </button>
     </div>
     <!-- Hidden filter controls (programmatic access by nav tree / app.js) -->
@@ -460,7 +460,7 @@
     <div id="select-all-bar" class="px-3 py-1.5 border-b border-gray-800 flex items-center justify-between flex-shrink-0 hidden bg-gray-800/50">
         <label class="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
             <input type="checkbox" id="select-all-checkbox" onchange="toggleSelectAll(this.checked)" class="w-3.5 h-3.5 rounded accent-blue-600">
-            <span id="select-all-label" data-i18n="select_all">Select All</span>
+            <span id="select-all-label" data-i18n="select_all">{{ t('select_all') }}</span>
             <span id="select-count" class="text-gray-500">(0/0)</span>
         </label>
     </div>
@@ -469,26 +469,26 @@
          两个按钮是两条完全不同的路径:导出数据集要整库重建(约 30 秒/集),
          打包下载是原样 zip(秒级)。文案里直接标出快慢,用户才不会点错。 -->
     <div id="batch-bar" class="px-2 py-2 border-b border-gray-700 flex-shrink-0 hidden bg-gray-800">
-        <div id="batch-count" class="text-xs text-gray-300 mb-1.5" data-i18n="n_selected">0 selected</div>
+        <div id="batch-count" class="text-xs text-gray-300 mb-1.5" data-i18n="n_selected">{{ t('n_selected') }}</div>
         <div class="flex gap-1.5">
             <button id="batch-export-btn" onclick="batchDownload(this)"
                     class="flex-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs px-1.5 py-1.5 rounded font-medium whitespace-nowrap">
-                <span id="batch-export-label" data-i18n="batch_export_dataset">Export dataset</span>
+                <span id="batch-export-label" data-i18n="batch_export_dataset">{{ t('batch_export_dataset') }}</span>
             </button>
             <button id="batch-zip-btn" onclick="batchZipDownload(this)"
                     class="flex-1 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 disabled:cursor-not-allowed text-gray-100 text-xs px-1.5 py-1.5 rounded font-medium whitespace-nowrap">
-                <span data-i18n="batch_zip_download">Zip download</span>
+                <span data-i18n="batch_zip_download">{{ t('batch_zip_download') }}</span>
             </button>
             <button id="batch-cancel-btn" onclick="toggleSelectMode()"
                     class="bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-gray-200 text-xs px-2 py-1.5 rounded font-medium whitespace-nowrap border border-gray-600"
-                    data-i18n="cancel">Cancel</button>
+                    data-i18n="cancel">{{ t('cancel') }}</button>
         </div>
     </div>
 
     <!-- 4. Episode list section (fills available space, independent scroll) -->
     <div id="episode-list-section" class="flex-1 min-h-0 overflow-y-auto hide-scrollbar">
         <div id="episode-list-inline">
-            <div class="p-4 text-center text-gray-500 text-sm" data-i18n="loading">Loading...</div>
+            <div class="p-4 text-center text-gray-500 text-sm" data-i18n="loading">{{ t('loading') }}</div>
         </div>
     </div>
 
@@ -510,23 +510,23 @@
              only Annotation Studio mounts the editing controls. -->
         <div class="px-3 py-2 border-t border-gray-800 flex items-center justify-between flex-shrink-0">
             <div class="flex items-center gap-1.5 text-xs font-medium text-gray-200">
-                <span data-i18n="slice_marker">Slice Markers</span>
+                <span data-i18n="slice_marker">{{ t('slice_marker') }}</span>
                 <span id="anno-count" class="text-[10px] text-gray-500 bg-gray-800 rounded-full px-1.5 py-0.5">0</span>
             </div>
             <div class="flex items-center gap-1">
-                <span class="{{ 'hidden' if page_mode == 'annotation' else '' }} text-[10px] text-gray-500 border border-gray-700 rounded px-1.5 py-0.5" data-i18n="annotation_readonly">只读</span>
+                <span class="{{ 'hidden' if page_mode == 'annotation' else '' }} text-[10px] text-gray-500 border border-gray-700 rounded px-1.5 py-0.5" data-i18n="annotation_readonly">{{ t('annotation_readonly') }}</span>
                 <div class="{{ 'hidden' if page_mode != 'annotation' else '' }} flex items-center gap-1">
                     <button id="btn-ai-annotate" type="button"
                             class="hidden text-[11px] px-2 py-1 rounded border border-cyan-600/60 bg-cyan-900/20 text-cyan-300 hover:bg-cyan-900/40 transition-colors"
-                            data-i18n-title="anno_ai_mode_title" title="AI 自动切段并提案标注(模式由工作流 AI Annotation 卡片配置决定)">
+                            data-i18n-title='{{ t('anno_ai_mode_title') }}' title="AI 自动切段并提案标注(模式由工作流 AI Annotation 卡片配置决定)">
                         <iconify-icon icon="ant-design:thunderbolt-outlined" class="icon-sm"></iconify-icon>
-                        <span data-i18n="ai_annotate">AI Annotate</span>
+                        <span data-i18n="ai_annotate">{{ t('ai_annotate') }}</span>
                     </button>
                     <button id="btn-undo-annotation" type="button"
                             class="text-[11px] px-2 py-1 rounded border border-gray-600/70 bg-gray-800/40 text-gray-400 hover:bg-gray-800 transition-colors"
                             title="Undo (Ctrl+Z)">
                         <iconify-icon icon="ant-design:rollback-outlined" class="icon-sm"></iconify-icon>
-                        <span data-i18n="undo">Undo</span>
+                        <span data-i18n="undo">{{ t('undo') }}</span>
                     </button>
                 </div>
             </div>
@@ -535,8 +535,8 @@
         <div id="episode-detail-annos" class="flex-1 min-h-0 overflow-y-auto hide-scrollbar p-2 space-y-1.5">
             <div class="p-4 text-center text-gray-600 text-xs">
                 <iconify-icon icon="ant-design:scissor-outlined" class="text-lg mb-1"></iconify-icon>
-                <div data-i18n="no_slices">No slices yet</div>
-                <div class="text-[10px] text-gray-700 mt-1" data-i18n="no_slices_hint">Drag the timeline to create a marker range</div>
+                <div data-i18n="no_slices">{{ t('no_slices') }}</div>
+                <div class="text-[10px] text-gray-700 mt-1" data-i18n="no_slices_hint">{{ t('no_slices_hint') }}</div>
             </div>
         </div>
         {% if page_mode == 'annotation' %}
@@ -544,34 +544,34 @@
         <div id="anno-form" class="border-t border-gray-800 p-2 flex-shrink-0">
             <div class="bg-gray-800/90 border border-gray-700 rounded-lg p-2.5 space-y-2 text-xs">
                 <div class="flex items-center justify-between">
-                    <span id="anno-form-title" class="text-gray-200 font-medium" data-i18n="current_slice">Current Slice</span>
+                    <span id="anno-form-title" class="text-gray-200 font-medium" data-i18n="current_slice">{{ t('current_slice') }}</span>
                 </div>
                 <div class="grid grid-cols-2 gap-1.5">
-                    <label class="text-[10px] text-gray-500"><span data-i18n="start_frame">Start Frame</span>
+                    <label class="text-[10px] text-gray-500"><span data-i18n="start_frame">{{ t('start_frame') }}</span>
                         <input id="anno-start-frame-input" type="number" min="0"
                                class="mt-1 w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-gray-200 font-mono focus:border-red-500 focus:outline-none">
                     </label>
-                    <label class="text-[10px] text-gray-500"><span data-i18n="end_frame">End Frame</span>
+                    <label class="text-[10px] text-gray-500"><span data-i18n="end_frame">{{ t('end_frame') }}</span>
                         <input id="anno-end-frame-input" type="number" min="0"
                                class="mt-1 w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-gray-200 font-mono focus:border-blue-500 focus:outline-none">
                     </label>
                 </div>
                 <div class="grid grid-cols-2 gap-1.5">
-                    <button id="btn-anno-set-start" type="button" data-i18n="set_start_frame" class="text-[10px] text-red-300 bg-red-900/20 border border-red-800/60 hover:bg-red-900/40 rounded py-1.5">Set Start</button>
-                    <button id="btn-anno-set-end" type="button" data-i18n="set_end_frame" class="text-[10px] text-blue-300 bg-blue-900/20 border border-blue-800/60 hover:bg-blue-900/40 rounded py-1.5">Set End</button>
+                    <button id="btn-anno-set-start" type="button" data-i18n="set_start_frame" class="text-[10px] text-red-300 bg-red-900/20 border border-red-800/60 hover:bg-red-900/40 rounded py-1.5">{{ t('set_start_frame') }}</button>
+                    <button id="btn-anno-set-end" type="button" data-i18n="set_end_frame" class="text-[10px] text-blue-300 bg-blue-900/20 border border-blue-800/60 hover:bg-blue-900/40 rounded py-1.5">{{ t('set_end_frame') }}</button>
                 </div>
                 <input id="anno-label-input"
                        class="bg-gray-900 border border-gray-700 rounded px-2.5 py-2 w-full text-gray-200 text-xs focus:border-blue-500 focus:outline-none"
-                       data-i18n-placeholder="label_name" placeholder="Label name, e.g. pick up cup"
+                       data-i18n-placeholder='{{ t('label_name') }}' placeholder="Label name, e.g. pick up cup"
                        oninput="this.classList.remove('border-red-500');document.getElementById('anno-label-warn').classList.add('hidden')">
                 <div id="anno-label-warn" class="text-red-400 text-xs hidden">
-                    <iconify-icon icon="ant-design:warning-outlined" class="icon-sm"></iconify-icon> <span data-i18n="enter_slice_name">Enter a slice name</span>
+                    <iconify-icon icon="ant-design:warning-outlined" class="icon-sm"></iconify-icon> <span data-i18n="enter_slice_name">{{ t('enter_slice_name') }}</span>
                 </div>
                 <div id="anno-frame-preview" class="bg-gray-900 rounded px-2.5 py-1.5 text-center text-[11px]"></div>
                 <button id="btn-save-annotation" type="button"
                         class="w-full bg-gray-700 text-gray-500 py-2 rounded text-xs cursor-not-allowed font-medium transition-colors" disabled>
                     <iconify-icon icon="ant-design:check-outlined" class="icon-sm"></iconify-icon>
-                    <span data-i18n="add_slice">Add Slice</span>
+                    <span data-i18n="add_slice">{{ t('add_slice') }}</span>
                 </button>
             </div>
         </div>

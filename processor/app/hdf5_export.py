@@ -34,6 +34,7 @@ from app.localstore import get_episode
 from app.lerobot_export import (
     _annotation_maps,
     _calibration_docs,
+    _depth_video_paths,
     _hand_columns,
     _infer_hand_3d_unit,
     _key_matches_any,
@@ -288,6 +289,66 @@ def build_hdf5_dataset(dataset_name: str, episode_ids: list[str], output_dir: Pa
                     "video_info": {"video.fps": vfps, "video.is_depth_map": False},
                 }
 
+            # 1b) 深度流 → 逐帧 uint16 毫米(单独一组,不和 RGB 混在 images/ 下)
+            #
+            # 深度**不在** camera_streams 里 —— 它单独放在 depth/<source>/,
+            # 所以上面的 RGB 循环根本看不到它,必须用 lerobot_export 的发现函数。
+            #
+            # 解码必须走 DepthVideoReader(ffmpeg 解 gray12le):OpenCV 会把
+            # 12-bit 深度当普通显示图转成 8-bit,真实毫米值全丢。
+            #
+            # **0 表示"没测到深度"的无效像素,不是 0 毫米** —— 与采集端语义一致,
+            # 原样保留,不要当数值去算均值。
+            for source_key, depth_path in _depth_video_paths(session_dir, episode_id):
+                if include_video_keys is not None and not _key_matches_any(
+                        source_key, include_video_keys):
+                    continue
+                reader = None
+                try:
+                    from app.lerobot_v21 import DEPTH_VIDEO_ENCODING, DepthVideoReader
+                    reader = DepthVideoReader(depth_path)
+                    dheight, dwidth = reader.height, reader.width
+                    if dheight <= 0 or dwidth <= 0 or T <= 0:
+                        continue
+                    dfps = float(reader.fps or episode_fps)
+                    ds = obs.create_dataset(
+                        f"depth/{source_key}", shape=(T, dheight, dwidth),
+                        dtype="uint16", chunks=(1, dheight, dwidth),
+                        compression=compression, compression_opts=level)
+                    ds.attrs["unit"] = "millimetre"
+                    ds.attrs["invalid_value"] = 0
+                    ds.attrs["fps"] = dfps
+                    ds.attrs["source_key"] = source_key
+                    ds.attrs["source_episode"] = episode_id
+                    ds.attrs["encoding"] = DEPTH_VIDEO_ENCODING
+                    i = 0
+                    while i < T:
+                        frame = reader.read_mm()
+                        if frame is None:
+                            break
+                        ds[i] = frame
+                        i += 1
+                    features[f"observation.depth.{source_key}"] = {
+                        "dtype": "uint16", "shape": [T, dheight, dwidth],
+                        "unit": "millimetre",
+                        "note": "0 = 无效像素(该点未测到深度),不是 0 毫米",
+                        "video_info": {
+                            "video.fps": dfps,
+                            "video.is_depth_map": True,
+                            "video.height": dheight,
+                            "video.width": dwidth,
+                        },
+                    }
+                except Exception as exc:
+                    print(f"[hdf5_export] depth stream {source_key} "
+                          f"skipped: {exc}")
+                finally:
+                    if reader is not None:
+                        try:
+                            reader.close()
+                        except Exception:
+                            pass
+
             # 2) 表列:传感器 + 手部骨骼 + 标注(与 LeRobot 列同构,按帧号对齐)
             columns: dict[str, dict[int, Any]] = {}
             str_columns: set[str] = set()
@@ -406,11 +467,11 @@ def build_hdf5_dataset(dataset_name: str, episode_ids: list[str], output_dir: Pa
                     annotation_defs, ensure_ascii=False)
 
             # 6) 标定 → /meta/calibration/<episode>/<name> attrs(JSON 字符串)
-            # 与 stereo_triangulate 一致:批次标定缺失/全零 → 回退内置默认标定
-            # (否则 meta 里声明的是未生效的标定,3D 数据无法复现)。
-            # 回退逻辑统一在 lerobot_export._calibration_docs(单点维护)。
+            # 每集一份,所以把 episode_id 一起传进去 —— 批次内各集标定可以不同,
+            # 不传就只会看到批次级的 calibration/ 目录。
+            # 缺失/全零时的默认标定回退统一在 lerobot_export._calibration_docs。
             cal_group = meta.create_group(f"calibration/{episode_id}")
-            cal_docs = _calibration_docs(session_dir)
+            cal_docs = _calibration_docs(session_dir, episode_id)
             for name, value in cal_docs.items():
                 cal_group.attrs[name] = json.dumps(value, ensure_ascii=False)
 
@@ -506,7 +567,16 @@ def _build_readme(dataset_name: str, h5: Any) -> str:
     img_keys = sorted(n for n in all_names
                       if n.startswith(f"{root}/observation/images/"))
     if img_keys:
-        rows.append(f"| **原视频** | {len(img_keys)} 路原始帧 | ✅ 全量 |")
+        # 不写"全量" —— 视频可能被工作流的 include_video_keys 过滤过,而且
+        # 深度流走 depth_sources、不经 camera_streams,本文件**从来不导**。
+        # 声称"全量"会让客户以为拿到的是全部视频。
+        rows.append(f"| **原视频** | {len(img_keys)} 路原始帧(逐帧 uint8 RGB)"
+                    " | ✅ 已导出,清单见上方结构树 |")
+    depth_keys = sorted(n for n in all_names
+                        if n.startswith(f"{root}/observation/depth/"))
+    if depth_keys:
+        rows.append(f"| **深度图** | {len(depth_keys)} 路,uint16 **毫米**"
+                    " | ✅ 0 = 无效像素(未测到),不是 0 毫米 |")
     hand_coordinate = next(
         (coord for coord in ("world", "3d", "2d")
          if f"{root}/observation/state/hand_left_{coord}" in all_names),
@@ -558,6 +628,27 @@ with open("hand_skeleton.mp4", "wb") as f:
 ```
 """
 
+    # 读取示例:只给文件里**确实存在**的路径。原来是左目写死 stereo_left、
+    # 手部无数据时仍回落到 hand_right_3d —— 客户照抄都是 KeyError;而且
+    # `import h5py` 在 0 列、`with` 却缩进了 4 格,示例本身就不是合法 Python。
+    first_img = img_keys[0].split("/")[-1] if img_keys else None
+    example = ["import h5py", "", 'with h5py.File("dataset.h5", "r") as h5:']
+    if first_img:
+        example.append(f"    # 读一帧图像({first_img})")
+        example.append(f'    img = h5["{root}/observation/images/{first_img}"][0]')
+    if depth_keys:
+        first_depth = depth_keys[0].split("/")[-1]
+        example.append(f"    # 读一帧深度({first_depth};uint16 毫米,0 = 无效像素)")
+        example.append(f'    depth = h5["{root}/observation/depth/{first_depth}"][0]')
+    if hand_coordinate:
+        example.append("    # 读第一帧右手骨骼(字段可能是 world / 3d / 2d)")
+        example.append(f'    hand3d = h5["{root}/observation/state/'
+                       f'hand_right_{hand_coordinate}"][0]')
+    if f"{root}/observation/annotation" in all_names:
+        example.append("    # 读全部标注")
+        example.append(f'    labels = h5["{root}/observation/annotation"][:]')
+    read_example = "\n".join(example)
+
     readme = f"""# {dataset_name} 数据文件说明(HDF5 格式)
 
 > 本文件由 EgoData 数据采集系统工作流自动生成
@@ -588,15 +679,7 @@ with open("hand_skeleton.mp4", "wb") as f:
 ## 四、如何读取
 
 ```python
-import h5py
-
-    with h5py.File("dataset.h5", "r") as h5:
-        # 读一帧左目图像
-        img = h5["episode_000000/observation/images/stereo_left"][0]
-    # 读第一帧右手骨骼(字段可能是 world / 3d / 2d)
-    hand3d = h5["episode_000000/observation/state/hand_right_{hand_coordinate or '3d'}"][0]
-    # 读全部标注
-    labels = h5["episode_000000/observation/annotation"][:]
+{read_example}
 ```
 {video_extract}
 其他工具:HDFView、Panoply、MATLAB(h5read)等支持 HDF5 的软件均可打开。

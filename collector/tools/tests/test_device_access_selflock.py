@@ -29,6 +29,17 @@
   8. fays_device_guard_path 拒绝非 /dev/videoN
   9. UVC 配对失败文案带上逐组拒绝原因（原先只报 matches/groups 计数）
 
+第 9 条以外，以下三条钉的是提交 00612cb1「UVC 发现结果不再丢弃」的三处改动
+（改前它们**零测试覆盖**：唯一触边的第 9 条用它自己的 fixture 键 `physical_usb_path`
+—— 那键在 UVC 报告里根本不存在 —— 且不打标签，所以标签改错了它照样 PASS）：
+  10. 逐组拒绝原因的标签取报告真键 `outer_path`（键名写错就退化成 group#N；
+      报告里真缺这个键时才回退 group#N）
+  11. Flash 身份失败报错带 `sightac[i]` + side/flash_ok/device_type/serial/error
+      五项（否则三种不同故障报同一句话），且**「side 空/无效」与「左右重复」两条
+      分支的抬头不同**（前者会被误指成「拓扑重复」，真因却是厂商没写 side）
+  12. 发现程序 rc==0 时 stderr 也逐行进 `[UVC-DISCOVER]` 日志（rc!=0 的既有行为
+      不变：stderr 尾部进异常文案、不重复转发）
+
 退出码 0 = 全部通过。
 """
 
@@ -203,15 +214,33 @@ def test_invalid_node():
     check(raised, "fays_device_guard_path 拒绝非 /dev/videoN")
 
 
-def test_pairing_message_carries_reason():
-    """配对失败必须把逐组拒绝原因带出来，不能只剩 matches/groups 计数。"""
-    from core.gripper.devices.uvc_camera_service import (
-        UvcCameraServiceError, UvcCameraServiceManager,
-    )
+def fake_manager(**attrs):
+    """object.__new__ 造的假 manager：只装本次要用的属性（不起设备/子进程）。
+
+    `_resolve_current_group` / `_associate_group` / `_run_discovery` 都是拿
+    self 当命名空间用的纯逻辑，构造真 manager 会去碰设备，所以照旧绕过。
+    """
+    from core.gripper.devices.uvc_camera_service import UvcCameraServiceManager
 
     service = object.__new__(UvcCameraServiceManager)
+    for key, value in attrs.items():
+        setattr(service, key, value)
+    return service
+
+
+def test_pairing_message_carries_reason():
+    """配对失败必须把逐组拒绝原因带出来，不能只剩 matches/groups 计数。
+
+    组里用的是报告里**真有的** `outer_path`（C 侧 `discover_uvc_config.c:1239`
+    写出 `"bus":N,"outer_path":...`）—— 这个 fixture 原先写的是
+    `physical_usb_path`，那个键在报告里根本不存在，于是标签一直退化成
+    `group#0`，把「标签对不对」这件事测成了假绿（见 test_rejection_label_...）。
+    """
+    from core.gripper.devices.uvc_camera_service import UvcCameraServiceError
+
+    service = fake_manager()
     reason = "sightac mode=failed error='MJPEG 640x480@30: Invalid mode'"
-    group = {"physical_usb_path": "3-1", "valid": False}
+    group = {"outer_path": "1.2", "valid": False}
     with mock.patch.object(service, "_discovery_scope", return_value=(3, "1")), \
             mock.patch.object(service, "_run_discovery", return_value=[group]), \
             mock.patch.object(service, "_associate_group",
@@ -226,6 +255,182 @@ def test_pairing_message_carries_reason():
             check("matches=0" in text and "groups=1" in text,
                   "文案仍保留 matches/groups 计数")
             check(reason in text, "文案带上了逐组拒绝原因（真因不再被吞）")
+            check("1.2: " in text,
+                  "拒绝原因的标签是报告里真有的 outer_path（不是 group#N）")
+            check("group#0" not in text,
+                  "标签没有退化成 group#0（键名写错就会退化，见下一条测试）")
+
+
+def test_rejection_label_uses_outer_path():
+    """改动③：逐组拒绝原因的标签必须是报告里真有的键。
+
+    真键由 C 侧定：`discover_uvc_config.c:1239` 写的是
+    `{"bus":N,"outer_path":...}`；`physical_usb_path` 在整个 C 源码里
+    一次都没出现（那是 ESP32 清单 side 的键，不是 UVC 报告的）。
+    标签写错键名 → 真实失败下每一组都退化成 `group#0`/`group#1`，
+    用户看不出是哪条 USB 路径出的问题。
+    """
+    from core.gripper.devices.uvc_camera_service import UvcCameraServiceError
+
+    def rejections_for(groups):
+        service = fake_manager()
+        with mock.patch.object(service, "_discovery_scope",
+                              return_value=(3, "1")), \
+                mock.patch.object(service, "_run_discovery",
+                                  return_value=groups), \
+                mock.patch.object(service, "_associate_group",
+                                  side_effect=UvcCameraServiceError("拒绝原因")), \
+                mock.patch.object(service, "_assignment_identity",
+                                  return_value=("ESP-SN", "FAYS-SN")):
+            try:
+                service._resolve_current_group({"id": "umi"})
+            except UvcCameraServiceError as exc:
+                return str(exc)
+        return ""
+
+    # 两把键都在、且值不同：标签必须取 outer_path（拿错键就会取到 3-1）——
+    # 这是本条的判据，只断言「有标签」会两种实现都通过。
+    text = rejections_for([{"outer_path": "1.2", "physical_usb_path": "3-1",
+                            "valid": False}])
+    check("1.2: 拒绝原因" in text,
+          "标签取 outer_path（报告真键）")
+    check("3-1: 拒绝原因" not in text,
+          "标签没有误取 physical_usb_path（那个键在 UVC 报告里不存在）")
+
+    # 多组时逐组一条，下标与标签一一对应（别把两条压成同一条）。
+    text = rejections_for([{"outer_path": "1.2"}, {"outer_path": "2.3"}])
+    check("1.2: 拒绝原因" in text and "2.3: 拒绝原因" in text,
+          "逐组各记一条拒绝原因，标签各不相同")
+
+    # 报告里真的没有 outer_path 时按 group#N 回退（不是静默变空）——
+    # 这是有意的兜底：C 侧若某天不再写这个键，日志里仍能定位到第几组。
+    text = rejections_for([{"bus": 3}])
+    check("group#0: 拒绝原因" in text,
+          "报告里没有 outer_path 时回退到 group#N（不静默变空）")
+
+
+def test_pairing_uniqueness_message_carries_identity():
+    """改动②：「Flash 身份」失败必须带上 sightac[i] 的元素身份，且**两种故障分开报**。
+
+    不加身份字段时，「Flash 读不出 / 读出来是空串 / device_type 不对」
+    三种完全不同的故障报的是**同一句话**（`side=''`），现场又要从头猜。
+    字段名都是 C 侧 `write_json_candidate` 真写出来的键
+    （discover_uvc_config.c:1092 起：side / flash_ok / device_type /
+    flash_serial / error）。
+
+    另一半是**抬头本身**：同一个抬头 `身份不唯一` 同时盖住①这台没报出左右
+    （side 空/无效）与②两台报了同一个左右 —— ①的真因是 Flash 没写 side
+    （只能厂商补写，仓库无写路径），照"左右重复"去查拓扑是白转一圈。所以两条
+    分支的抬头必须不同。
+    """
+    from core.gripper.devices.uvc_camera_service import UvcCameraServiceError
+
+    def message_for(sightac):
+        service = fake_manager()
+        group = {"bus": 3, "outer_path": "1", "valid": True,
+                 "sightac": sightac,
+                 "decxin": {"mode_ok": True, "port": "1.3"}}
+        live_esp = [{"serial": "ESP-SN", "physical_usb_path": "3-1.2"}]
+        with mock.patch.object(service, "_assignment_identity",
+                               return_value=("ESP-SN", "FAYS-SN")):
+            try:
+                service._associate_group(group, {"id": "umi"}, live_esp)
+            except UvcCameraServiceError as exc:
+                return str(exc)
+        return ""
+
+    # 真实的 field failure：side 读出来是空串，JSON 里有 error 说明为什么。
+    bad = {"side": "", "flash_ok": False, "device_type": "",
+           "flash_serial": "",
+           "error": "LIBUSB_ERROR_TIMEOUT reading Flash side"}
+    text = message_for([{"side": "left", "flash_ok": True,
+                         "device_type": "sightac", "flash_serial": "L-SN"},
+                        bad])
+    check("sightac[1]" in text, "带上出问题的那个下标（sightac[1]，不是笼统的组）")
+    check("side=''" in text, "带上 side 原文")
+    check("flash_ok=False" in text, "带上 flash_ok（区分「Flash 读失败」）")
+    check("device_type=''" in text, "带上 device_type（区分「类型不对」）")
+    check("serial=''" in text, "带上 flash_serial（区分「读出来是空串」）")
+    check("LIBUSB_ERROR_TIMEOUT" in text,
+          "带上 error 原文（真因不再被压成同一句话）")
+    check("身份不唯一" not in text,
+          "side 空/无效报的是「没报出有效左右」，**不是**「身份不唯一」"
+          "（照「重复」去查拓扑会把方向指错）")
+
+    # 左右重了：报的是**第二个**（i=1）那个，不是第一个；抬头是「不唯一」。
+    text = message_for([{"side": "left", "flash_ok": True},
+                        {"side": "left", "flash_ok": True}])
+    check("sightac[1]" in text and "side='left'" in text,
+          "左右重复时报出重复的那个下标与值（sightac[1] side='left'）")
+    check("身份不唯一" in text,
+          "真的左右重复时仍然报「身份不唯一」（两分支抬头不同）")
+
+
+def test_discover_stderr_kept_on_success():
+    """改动①：rc==0 时 stderr 也要进 [UVC-DISCOVER] 日志。
+
+    发现程序（core/gripper/camera_service_src/tools/discover_uvc_config.c）
+    把每台相机的现场打到 stderr 的 [DISCOVERY] 行。JSON 里虽然有 error
+    字段，但并非全都在：`mode=unknown` 与 `mode=failed` 在 JSON 里都被压成
+    `mode_ok:false`，flash/calibration 的 ok|failed|skipped 三态也只剩布尔
+    —— 而 rc==0 的「配对失败」现场恰恰就是这些差别。过去只在 rc!=0 时读
+    stderr，rc=0 的那次等于整份丢掉，只剩一句 side=''。
+    """
+    import json as _json
+    from pathlib import Path
+
+    from core.gripper.devices.uvc_camera_service import (
+        UvcCameraServiceError, UvcCameraServiceManager,
+    )
+
+    reports = _json.dumps({"groups": [{"bus": 3, "outer_path": "1",
+                                       "sightac": [{}, {}], "decxin": {},
+                                       "valid": True}]})
+    lines = [
+        "[DISCOVERY] Sightac vidpid=2207:0019 bus=3 port=1.2 "
+        "usb_serial=<none> control_if=0 stream_if=1 alt=7 "
+        "descriptor_payload=327680 negotiated_payload=241664 mode=unknown "
+        "flash=failed calibration=failed side=<none> serial=<none> "
+        "type=<none> error=XU6 prepare failed",
+        "[DISCOVERY] complete group(s)=1",
+    ]
+
+    def run_with(returncode, stdout, stderr):
+        logs = []
+        service = fake_manager(_logger=logs.append,
+                               _discovery_binary=Path("/bin/true"))
+        completed = subprocess.CompletedProcess(
+            ["/bin/true"], returncode, stdout=stdout, stderr=stderr)
+        with mock.patch.object(subprocess, "run", return_value=completed):
+            try:
+                result, error = service._run_discovery(), None
+            except UvcCameraServiceError as exc:
+                result, error = None, str(exc)
+        return logs, result, error
+
+    logs, result, error = run_with(0, reports, "\n".join(lines) + "\n")
+    check(error is None and result is not None,
+          "rc==0 仍正常解析出 groups（改动没干扰成功路径）")
+    check(logs == ["[UVC-DISCOVER] " + line for line in lines],
+          f"rc==0 的 stderr 逐行进日志（{len(logs)} 行；改动前这里一行都没有）")
+
+    logs, _, _ = run_with(0, reports, "")
+    check(logs == [], "stderr 为空时不打空行（不制造噪声）")
+
+    # rc!=0 的既有行为不变：stderr 尾部进异常文案（不是进日志），
+    # 且异常发生在转发之前 —— 别把失败路径的 stderr 打两遍。
+    many = [f"[DISCOVERY] line {i}" for i in range(30)]
+    logs, _, error = run_with(1, "", "\n".join(many))
+    check(error is not None and "rc=1" in error,
+          "rc!=0 仍抛错并带上 rc")
+    check("line 29" in error and "line 0" not in error,
+          "rc!=0 只带 stderr 尾部 20 行（既有行为不变）")
+    check(logs == [], "rc!=0 时不重复转发（stderr 已进异常文案）")
+
+    # 防御：_logger 是实例属性（构造时注入），不是全局 print。
+    check(UvcCameraServiceManager.__init__.__code__.co_varnames[:6]
+          and "logger" in UvcCameraServiceManager.__init__.__code__
+          .co_varnames[:6], "_logger 由构造参数注入（真机上打给 SLAM/设备面板）")
 
 
 def main():
@@ -243,6 +448,12 @@ def main():
     test_invalid_node()
     print("\n[7. 配对失败文案带原因]")
     test_pairing_message_carries_reason()
+    print("\n[8. 逐组拒绝原因的标签用真键 outer_path（改动③）]")
+    test_rejection_label_uses_outer_path()
+    print("\n[9. 「Flash 身份不唯一」带 sightac[i] 身份字段（改动②）]")
+    test_pairing_uniqueness_message_carries_identity()
+    print("\n[10. rc==0 也留发现程序 stderr（改动①）]")
+    test_discover_stderr_kept_on_success()
 
     print()
     if FAILS:

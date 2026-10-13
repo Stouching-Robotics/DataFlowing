@@ -450,6 +450,8 @@ JSON 读写。docstring 写明其 JSON 布局即为 `calibration/head_stereo.jso
 `core.database` 的单例 `db`。其中 `mark_uploaded` 支持"上传成功、本地保留"
 的语义（行保留、状态改为 `uploaded`），`mark_uploaded_deleted` 支持"上传
 成功、本地已删"（状态 `uploaded_deleted`），两者都保证历史可查。
+**本地文件被真删除时用 `delete_local_episode` / `delete_local_dir` 把录制行
+一并真删**（2026-10-12：删除 = 真删除，文件与记录一起消失，不再留痕迹行）。
 
 **类/函数**：
 
@@ -459,6 +461,8 @@ JSON 读写。docstring 写明其 JSON 布局即为 `calibration/head_stereo.jso
 | `RecordingRepo.list_all` | `(limit=100)` | 按 `started_at` 倒序取最近 N 条 | `List[RecordingRecord]` |
 | `RecordingRepo.list_by_camera` | `(camera_index, limit=50)` | 按摄像机索引筛选 | `List[RecordingRecord]` |
 | `RecordingRepo.delete` | `(record_id)` | 按 id 删除 | 删除并 commit |
+| `RecordingRepo.delete_local_episode` | `(file_path, episode_index=None)` | 本地文件已删净后真删该 episode 的录制行（DELETE，不标状态） | 删除行数 `int` |
+| `RecordingRepo.delete_local_dir` | `(dir_path)` | 真删某录制目录下全部录制行（路径 abspath+normpath 归一化比较） | 删除行数 `int` |
 | `RecordingRepo.mark_uploaded` | `(file_path)` | 按路径把状态改为 `uploaded`（已上传、本地保留） | 受影响行数 `int` |
 | `RecordingRepo.mark_uploaded_deleted` | `(file_path)` | 按路径把状态改为 `uploaded_deleted` | 受影响行数 `int` |
 

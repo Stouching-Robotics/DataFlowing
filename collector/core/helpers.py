@@ -884,8 +884,39 @@ def _rmdir_empty(path: str) -> bool:
         return False
 
 
+def pooled_episode_leftovers(task_dir: str, episode_index: int) -> list:
+    """episode N 删除后仍留在磁盘上的文件（空列表 = 真删干净）。
+
+    三处都要查：data/chunk-c/episode-f.parquet、videos/chunk-c/*/episode-f.*、
+    meta/episodes 行（每段一文件；旧分片则在分片里查该行还在不在）。
+    读不出分片内容时按「疑似残留」处理——宁可报未删净也不谎报成功。
+    """
+    left = []
+    dp = pooled_data_parquet_path(task_dir, episode_index)
+    if os.path.isfile(dp):
+        left.append(dp)
+    for _key, p in episode_video_files(task_dir, episode_index).items():
+        if os.path.isfile(p):
+            left.append(p)
+    cidx, _f = episode_chunk_file(episode_index)
+    ep_candidates = [pooled_episodes_path(task_dir, episode_index),
+                     _legacy_episodes_shard_path(task_dir, cidx)]
+    import pyarrow.parquet as pq
+    for ep_file in ep_candidates:
+        if not os.path.isfile(ep_file):
+            continue
+        try:
+            rows = pq.read_table(ep_file).to_pylist()
+        except Exception:
+            left.append(ep_file)   # 读不出来 → 无法确认该行还在不在，按残留算
+            continue
+        if any(r.get("episode_index") == episode_index for r in rows):
+            left.append(ep_file)
+    return left
+
+
 def delete_pooled_episode(task_dir: str, episode_index: int) -> bool:
-    """彻底删除 episode N 的文件组（用户裁决：GUI 删除不走回收区）。
+    """彻底删除 episode N 的文件组（用户裁决：GUI 删除不走回收区），并校验。
 
     - videos/<key>/episode-{f}.{ext} 各流文件
     - data/chunk-{c}/episode-{f}.parquet
@@ -893,7 +924,11 @@ def delete_pooled_episode(task_dir: str, episode_index: int) -> bool:
       同口径）
     统计不回退（stats/total_episodes 保持，与进度语义一致）。
 
-    幂等：文件组已不存在也返回 True（视为已删）。
+    幂等：文件组已不存在返回 True（视为已删）。
+
+    返回 True **仅当三处都确认没了**（pooled_episode_leftovers 为空）；
+    os.remove 失败/权限/读不出分片 → 返回 False，由调用方如实报错——
+    不许再出现「界面报已删除、文件还在」。
     """
     files = episode_video_files(task_dir, episode_index)
     for key, src in files.items():
@@ -950,7 +985,39 @@ def delete_pooled_episode(task_dir: str, episode_index: int) -> bool:
                 if _fcntl is not None:
                     _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
                 fh.close()
-    return True
+    return not pooled_episode_leftovers(task_dir, episode_index)
+
+
+def delete_local_session(session_path: str, episode_index: int = 0) -> tuple:
+    """本地删除统一入口（真删除）——播放页手动删除与上传后删除共用同一口径。
+
+    池化布局（episode_index > 0）删该 episode 文件组（数据 + 视频 + meta 行）；
+    旧格式会话目录（episode_index == 0）整目录删除。两处都做删除后校验。
+
+    返回 (ok, err)：ok=True 时 err 为空串；否则 err 是给界面显示的原因
+    （残留文件路径 / OSError 文本 / 目录不存在）。绝不吞错——报成功必须
+    真的是文件已不在。
+    """
+    if not session_path:
+        return False, "会话路径为空"
+    if episode_index > 0:
+        if delete_pooled_episode(session_path, episode_index):
+            return True, ""
+        left = pooled_episode_leftovers(session_path, episode_index)
+        if left:
+            return False, "删除后仍有 {} 个文件残留（如 {}）".format(
+                len(left), left[0])
+        return False, "删除未完成"
+    import shutil
+    if not os.path.isdir(session_path):
+        return False, "会话目录不存在"
+    try:
+        shutil.rmtree(session_path)
+    except OSError as e:
+        return False, str(e)
+    if os.path.isdir(session_path):
+        return False, "删除后目录仍存在"
+    return True, ""
 
 
 # ═══════════════════════════════════════════════════════════

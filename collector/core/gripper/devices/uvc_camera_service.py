@@ -585,6 +585,18 @@ class UvcCameraServiceManager:
                 "libusb/libuvc 动态发现失败 "
                 f"rc={completed.returncode}: {details or '<no detail>'}"
             )
+        # 发现程序那行逐台相机的现场（stderr 的 `[DISCOVERY] …`）在 rc==0
+        # 时同样是唯一线索。注意它**不是**唯一的载体：JSON 里也有 `error`
+        # 字段（"XU unit: …" / "XU6 prepare: …" 就是写进去再回显到 stderr
+        # 的）。JSON 丢掉的是**三态**——`mode` 的 ok/unknown/failed 被压成
+        # `mode_ok` 布尔，flash/calibration 的 ok|failed|skipped 只剩两个布尔
+        # ——而认不认得出「模式协商失败」还是「Flash 读出来是空串」就靠它。
+        # 过去这里只在 rc!=0 时读 stderr，rc==0 那次的现场就整份不进日志，
+        # 只剩一句 side=''。
+        stderr_text = (completed.stderr or "").strip()
+        if stderr_text:
+            for line in stderr_text.splitlines():
+                self._logger(f"[UVC-DISCOVER] {line}")
         try:
             report = json.loads(completed.stdout)
         except json.JSONDecodeError as exc:
@@ -650,13 +662,32 @@ class UvcCameraServiceManager:
             raise UvcCameraServiceError(
                 "UVC 组 Sightac 数量不是 2"
             )
-        for candidate in sightac:
+        for index, candidate in enumerate(sightac):
             side = str(candidate.get("side") or "").strip().lower()
-            if side not in {"left", "right"} or side in normalized[
-                "sightac"
-            ]:
+            # 两种故障分开报：①这台相机**没报出** left/right（Flash 的 side
+            # 字段读不出来 / 是空串 / 值不认识）；②两台报了同一个左右。
+            # 挤在一句「身份不唯一」下会把①指成「拓扑/端口重复」——那台相机
+            # 的 side 得由厂商产线补写（仓库无写路径），照"重复"去查只会在
+            # 拓扑上白转一圈。现场原文见 docs/data.md / memory
+            # `uvc-pairing-side-empty`。
+            if side not in {"left", "right"}:
                 raise UvcCameraServiceError(
-                    f"UVC 组 left/right Flash 身份不唯一: side={side!r}"
+                    "UVC 组 Sightac 未报出有效左右（Flash 的 side 为空/"
+                    "无效，非左右重复）: "
+                    f"sightac[{index}] side={side!r} "
+                    f"flash_ok={candidate.get('flash_ok')!r} "
+                    f"device_type={candidate.get('device_type')!r} "
+                    f"serial={candidate.get('flash_serial')!r} "
+                    f"error={candidate.get('error')!r}"
+                )
+            if side in normalized["sightac"]:
+                raise UvcCameraServiceError(
+                    f"UVC 组 left/right Flash 身份不唯一: "
+                    f"sightac[{index}] side={side!r} "
+                    f"flash_ok={candidate.get('flash_ok')!r} "
+                    f"device_type={candidate.get('device_type')!r} "
+                    f"serial={candidate.get('flash_serial')!r} "
+                    f"error={candidate.get('error')!r}"
                 )
             normalized["sightac"][side] = candidate
         if set(normalized["sightac"]) != {"left", "right"}:
@@ -708,7 +739,7 @@ class UvcCameraServiceManager:
                 # 逐组记下拒绝原因：这里吞掉的往往才是真因（触觉相机
                 # mode 探测失败、Flash 身份缺失…），只报 matches/groups
                 # 计数会让人去猜拓扑，等于把现场丢掉一次。
-                label = group.get("physical_usb_path") or "group#{}".format(index)
+                label = group.get("outer_path") or "group#{}".format(index)
                 rejections.append("{}: {}".format(label, exc))
                 continue
         if len(matches) != 1:

@@ -1,6 +1,6 @@
 # collector — Multimodal Data Acquisition SDK · 多模态数据采集 SDK
 
-![Version](https://img.shields.io/badge/version-1.3.13-blue)
+![Version](https://img.shields.io/badge/version-1.3.15-blue)
 ![Python](https://img.shields.io/badge/python-3.10-blue)
 ![License](https://img.shields.io/badge/license-TBD-lightgrey)
 
@@ -339,13 +339,17 @@ venv/bin/python tools/tests/test_sdk_python_version.py
 # gripper pairing / ESP32 port diagnostics in the main GUI (v1.3.12)
 venv/bin/python tools/tests/test_gripper_fays_pairing.py
 venv/bin/python tools/tests/test_gripper_esp_binding.py
-# published pose frame + pose view (v1.3.13) — run all five after touching
-# either side of the frame contract (protocol/ vs ui/pose_view_qt.py)
+# published pose frame + pose view + publish-exit deadband / jump gate
+# (v1.3.13-v1.3.14) — run all eight after touching either side of the
+# frame or publish contract (protocol/ vs ui/pose_view_qt.py)
 venv/bin/python tools/tests/test_gripper_pose_axes.py
 venv/bin/python tools/tests/test_gripper_pose_host_stamp.py
 venv/bin/python tools/tests/test_gripper_slam_columns.py
 venv/bin/python tools/tests/test_gripper_latest_pose_frame.py
 venv/bin/python tools/tests/test_pose_view_qt.py
+venv/bin/python tools/tests/test_pose_publish_deadband.py
+venv/bin/python tools/tests/test_gripper_pose_deadband_publish.py
+venv/bin/python tools/tests/test_pose_guard_limits.py
 # hardware tests require the corresponding device attached: d405_worker_test,
 # d435_e2e_test, d435_gui_smoke_test, mono_regression, d435_playback_test, etc.
 ```
@@ -407,6 +411,49 @@ are documented in [docs/index.md](docs/index.md#开发约定).
 
 ### Changelog
 
+- **v1.3.15** — pose-semantics documentation/comment corrections, a gripper
+  pairing error-message split, and a chunk-aware episode-number fix in lite.
+  **Fixed a false equation**: `finish_publish_pose`'s docstring asserted
+  `M·(R0ᵀ·R)·Mᵀ = (M·R0ᵀ·Mᵀ)(M·R·Mᵀ)(M·R0ᵀ·Mᵀ)ᵀ`, which is wrong by O(1); the
+  correct two-factor form is `(M·R0ᵀ·Mᵀ)(M·R·Mᵀ)`, and the left/right branches
+  relate by **conjugation** (`left = P·right·Pᵀ`, `P = M·R0·Mᵀ`). The "order
+  isn't a contract" argument in `process_controller`/README now cites the
+  **right**-multiply identity (`(M·R·Mᵀ)(M·R0·Mᵀ)ᵀ = M·R·R0ᵀ·Mᵀ`), matching
+  protocol.py and test section 5. **Removed unsourced numbers**: the "5000
+  random poses / max deviation 2.2e-16 m" in `docs/ui.md` and `pose_view_qt.py`
+  had no artifact behind it (one hand-written line each); the real regression is
+  `check_gripper_model_frame_invariant` — a **per-pixel** assertion (2 fixed
+  poses, `mismatch == 0`) — and the identity is algebraically exact for any R, v
+  (`MᵀM = I`). `test_pose_publish_deadband.py` no longer quotes the 7.2 mm
+  *false value* as the measured limit (back to 1.39–4.98 mm); `process_controller`'s
+  sourceless "≈1.4°" now cites protocol.py's p50 0.25°/max 1.80°; the
+  guard-interval comment reads "capped at 1.5× the nominal frame period (= 30 ms)".
+  **Gripper pairing**: the single "identity not unique" error conflated "this
+  camera reported no side (empty Flash)" with "both cameras reported the same
+  side"; split into two headlines, the former carrying
+  `sightac[i]/side/flash_ok/device_type/serial/error`. **lite**: `_episode_max`
+  took "largest filename `f` + 1", but `f` wraps every 1000, so once chunk-001
+  exists it returned a *real but wrong* episode in chunk-000 (N=1001 → 1); now
+  uses `list_task_episodes` (`N = c*1000 + f + 1`).
+- **v1.3.14** — a publish-exit **deadband (3 mm)** keeps the estimator's
+  millimetre rest wander out of the trail, the end point, the pose view
+  and `orb_pose.json`. Below the deadband the **previously published
+  value** is published — a substitution, not a suppression, so the sample
+  cadence, timestamps, `lost_count` and the `slam_trajectory` point
+  contract are untouched; only real movement updates it. Rotation is
+  deliberately *not* deadbanded. Measured on strict rest windows (10 s,
+  net displacement <2 mm **and** every point <5 mm from the window
+  median): position wander radius p50 1.06–1.85 mm / max 1.39–4.98 mm per
+  session. The same commit drops the jump gate's constants
+  (`POSE_STEP_ALLOWANCE_M` / `POSE_MAX_LINEAR_SPEED_MPS` /
+  `POSE_MAX_GUARD_INTERVAL_S`) from 0.05 / 3.0 / 0.1 to 0.03 / 2.0 / 0.03
+  — not "stricter" but **no longer inflated by decimation**: stereo frames
+  are decimated 3-of-5, so every third frame arrives after 60 ms, and
+  charging the speed term for that 60 ms tripled the limit exactly on the
+  frames a re-placed pose lands on, letting 0.107–0.224 m of estimator
+  excursion through verbatim (genuine single-sample steps peak at
+  0.0601 m). Mirrored verbatim in the native guard
+  (`fayssense_orb_slam.cc`, `kPose*`).
 - **v1.3.13** — the published gripper SLAM frame changes to **+X=down /
   +Y=left / +Z=forward** (was +X=right / +Y=forward / +Z=up). The same
   numbers feed the pose view, `observation.*slam_trajectory` and
@@ -421,7 +468,7 @@ are documented in [docs/index.md](docs/index.md#开发约定).
   multiply alone would leave it at the constant `M` — two triads ~120°
   apart, which is exactly what the user rejected; the earlier "order is
   a contract" hazard is gone too, since the conjugating `M` now cancels:
-  `(M·R0·Mᵀ)ᵀ(M·R·Mᵀ) == M·R0ᵀ·R·Mᵀ`.) The gripper's *physical*
+  `(M·R·Mᵀ)(M·R0·Mᵀ)ᵀ == M·R·R0ᵀ·Mᵀ`.) The gripper's *physical*
   orientation is untouched: the view moves the model's local vertices by
   the same `M` before rotating them, so the drawn model is pixel-identical
   to before — the two halves must change together, or the gripper renders
@@ -446,9 +493,11 @@ are documented in [docs/index.md](docs/index.md#开发约定).
   Caveat: that tag is **task-level** — a task directory spanning the
   switch can only attest to the last frame written. The cutover is the
   **release**, not a calendar day: episodes recorded by v1.3.12 or
-  earlier (which includes everything currently on disk — the newest
-  episode is from 2026-09-21 21:01) are the old convention and carry no
-  `frame` key at all, so "key absent" means old frame.
+  earlier carry no `frame` key at all, so "key absent" means old frame.
+  The oldest data on disk is all on that side (newest legacy episode
+  2026-09-21 21:01), but the line has since been crossed —
+  `UMI_9_29` (recorded 2026-09-29, 204 episodes) is v1.3.13 and does
+  carry the key, so both conventions now coexist under `data/recordings`.
 - **v1.3.12** — pairing a new gripper no longer needs the vendor toolkit GUI.
   When the app refused to connect a fresh gripper
   (`串口连接失败，无法查询绑定的 Fays 序列号: serial open/handshake failed: Write
@@ -1255,6 +1304,10 @@ venv/bin/python tools/tests/test_sdk_python_version.py
 # 主程序内的夹爪配对与 ESP32 串口诊断（v1.3.12）
 venv/bin/python tools/tests/test_gripper_fays_pairing.py
 venv/bin/python tools/tests/test_gripper_esp_binding.py
+# 删除即真删除（文件 + 录制行；含 lite 上传后删除的编号回归、任务页删除）
+venv/bin/python tools/tests/test_local_delete.py
+venv/bin/python tools/tests/test_task_delete.py
+venv/bin/python tools/tests/lite_delete_test.py
 # 真机相关测试需连接对应设备：d405_worker_test、d435_e2e_test、
 # d435_gui_smoke_test、mono_regression、d435_playback_test 等
 ```
@@ -1306,6 +1359,40 @@ i18n 文案经 `tr()` 翻译、PyQt5 信号参数用 `object` 封送大整数、
 
 ### 更新记录
 
+- **v1.3.15** —— 姿态语义的文档/注释校正 + 夹爪配对报错分型 + lite 取号跨 chunk。
+  **修一处数学错误**：`finish_publish_pose` 的 docstring 把
+  `M·(R0ᵀ·R)·Mᵀ = (M·R0ᵀ·Mᵀ)·(M·R·Mᵀ)·(M·R0ᵀ·Mᵀ)ᵀ` 写成恒等式，代数上不成立
+  （差 O(1)）；正确的两因子式是 `(M·R0ᵀ·Mᵀ)(M·R·Mᵀ)`，左乘/右乘两支的关系是
+  **共轭**（左乘版 = `P·右乘版·Pᵀ`，`P = M·R0·Mᵀ`）。`process_controller`/README
+  论证「顺序不敏感」的左乘支恒等式换成**右乘支**
+  （`(M·R·Mᵀ)(M·R0·Mᵀ)ᵀ = M·R·R0ᵀ·Mᵀ`），与 protocol.py、测试第 5 节一致。
+  **删无出处数字**：`docs/ui.md` 与 `pose_view_qt.py` 的「实测 5000 组随机
+  姿态/最大偏差 2.2e-16 m」背后没有任何产出物（全仓各一行手写），真回归是
+  `check_gripper_model_frame_invariant` 的**逐像素**断言（2 个固定姿态、
+  `mismatch == 0`），而该恒等式对任意 R、v 代数上精确成立（`MᵀM = I`）；
+  `test_pose_publish_deadband.py` 不再把 7.2mm 那个**假值**当实测上限（改回
+  1.39–4.98mm）；`process_controller` 无出处的「≈1.4°」改用 protocol.py 的
+  p50 0.25°/max 1.80°；guard-interval 注释改写成「封顶在 1.5× 名义帧周期
+  （= 30ms）」。**夹爪配对**：原来那句「身份不唯一」把「这台没报出 side
+  （Flash 空/无效）」与「两台报了同一个左右」压在一起（前者会被指成拓扑重复，
+  真因是厂商产线没写 side），拆成两条抬头，前者带
+  `sightac[i]/side/flash_ok/device_type/serial/error`。**lite**：`_episode_max`
+  原来取「最大文件名 `f` + 1」，而 `f` 每 1000 回绕 ⇒ chunk-001 出现后返回
+  chunk-000 里**真实存在**的错段（N=1001 → 1），上传/删除静默操作错段；改走
+  `list_task_episodes`（`N = c*1000 + f + 1`）。
+- **v1.3.14** —— 发布出口加 **3mm 死区**：估计器静止时的毫米级游走不再进
+  轨迹线/末端点/位姿视图/`orb_pose.json`。不足死区时**发布上次的值**（替换，
+  不是抑制 ⇒ 采样节拍、时间戳、`lost_count`、`slam_trajectory` 的逐点契约
+  都不变），只有真实移动才更新它；旋转**故意不做**死区（姿态游走峰峰
+  p50 0.25°/max 1.80°，视觉上不可见，而死区会给真实转动引入手感延迟）。
+  严格静止窗（10s、净位移<2mm **且**窗内每点距窗中位<5mm）实测位置游走半径
+  逐会话 p50 1.06-1.85mm / max 1.39-4.98mm。同一笔把跳变门常量
+  （`POSE_STEP_ALLOWANCE_M` / `POSE_MAX_LINEAR_SPEED_MPS` /
+  `POSE_MAX_GUARD_INTERVAL_S`）从 0.05 / 3.0 / 0.1 收到 0.03 / 2.0 / 0.03
+  —— 不是"更严"，是**不再随抽帧膨胀**：立体帧 3-of-5 抽帧，每三帧有一帧是
+  60ms，把速度项按 60ms 计会把限值在那批帧上抬到 3×，而重定位后的位姿恰好
+  落在那种帧上，于是 0.107-0.224m 的估计器跳变被原样放过去（真实单步峰值
+  0.0601m）。native 侧 `kPose*` 逐字对齐。
 - **v1.3.13** — 夹爪 SLAM 的发布坐标帧改为 **+X=下 / +Y=左 / +Z=前**
   （原 +X=右 / +Y=正对 / +Z=上）。位姿视图、`observation.*slam_trajectory`、
   `orb_pose.json` 是同一份数值，帧也就只有一处 —— 发布入口，形态是
@@ -1315,7 +1402,7 @@ i18n 文案经 `tr()` 翻译、PyQt5 信号参数用 `object` 封送大整数、
   发布姿态 = `M·Mᵀ` = **单位矩阵**，跟随夹爪的三支箭头与世界三箭头在原点
   那一瞬**重合**。只左乘不右乘时它是常数 `M`，两套箭头差约 120° —— 那正是
   被否掉的一版；而且左右都乘之后 `M` 在两边相遇处整个约掉，
-  `(M·R0·Mᵀ)ᵀ(M·R·Mᵀ) == M·R0ᵀ·R·Mᵀ`，原先"顺序是契约"的隐患也一并消失。
+  `(M·R·Mᵀ)(M·R0·Mᵀ)ᵀ == M·R·R0ᵀ·Mᵀ`，原先"顺序是契约"的隐患也一并消失。
   夹爪的**物理朝向一点没变**：视图按同一张 `M` 把模型顶点从旧体轴坐标搬到
   新体轴坐标再旋转，画出来逐像素与改前相同 —— ★这两处必须同进同退，
   只改一处夹爪会被画歪 120°，且两种改法各自都"看起来自洽"。
@@ -1332,8 +1419,9 @@ i18n 文案经 `tr()` 翻译、PyQt5 信号参数用 `object` 封送大整数、
   `frame_axes` 与顶层 `gripper_slam_frame`），读端据此分辨新旧。
   注意该标注是**任务级**的：一个任务目录若跨了这次改帧，只能记住最后写入
   的帧。分界是**发布版本**不是日历日 —— v1.3.12 及更早录的一律旧约定
-  （现存数据最新一段录于 2026-09-21 21:01，全在旧帧那侧），且那些 episode
-  **没有** `frame` 键：键不在就按旧帧读。
+  （老数据最新一段录于 2026-09-21 21:01），且那些 episode **没有** `frame`
+  键：键不在就按旧帧读。这条线**已经跨过去了**：`UMI_9_29`（2026-09-29 录、
+  204 段）是 v1.3.13、带键，两种帧现在并存于 `data/recordings`。
 - **v1.3.12** — 接新夹爪不再需要开厂商工具包 GUI。新板子连不上时报的那句
   `串口连接失败，无法查询绑定的 Fays 序列号: serial open/handshake failed: Write
   timeout` 里，最要紧的问题是「板子到底在不在说话」，而主程序原本答不了。夹爪

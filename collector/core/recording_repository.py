@@ -2,6 +2,7 @@
 数据仓库层 —— 录制记录的增删改查操作。
 """
 
+import os
 from typing import List, Optional
 from core.database import db
 from core.recording_record import RecordingRecord
@@ -48,6 +49,37 @@ class RecordingRepo:
         """删除指定记录。"""
         db.conn.execute("DELETE FROM recording WHERE id=?", (record_id,))
         db.conn.commit()
+
+    @staticmethod
+    def delete_local_episode(file_path: str, episode_index=None) -> int:
+        """真删除：本地文件已删净后，把该 episode 的录制行从库里删掉。
+
+        与 mark_deleted / mark_uploaded_deleted 的区别就是不受「行保留」约束——
+        删除 = 真删除（文件 + 记录一起消失），返回删除行数。
+        """
+        cond, args = RecordingRepo._where(file_path, episode_index)
+        cur = db.conn.execute(f"DELETE FROM recording WHERE {cond}", args)
+        db.conn.commit()
+        return cur.rowcount
+
+    @staticmethod
+    def delete_local_dir(dir_path: str) -> int:
+        """真删除：某个录制目录（整个任务/旧格式会话目录）下的全部录制行。
+
+        路径按 abspath+normpath 归一化后比较——库里历史行可能带尾斜杠或用
+        了不同的相对写法，不能只靠字符串等值。
+        """
+        if not dir_path:
+            return 0
+        target = os.path.normpath(os.path.abspath(dir_path))
+        rows = db.conn.execute("SELECT id, file_path FROM recording").fetchall()
+        ids = [r[0] for r in rows
+               if r[1] and os.path.normpath(os.path.abspath(r[1])) == target]
+        if not ids:
+            return 0
+        db.conn.executemany("DELETE FROM recording WHERE id=?", [(i,) for i in ids])
+        db.conn.commit()
+        return len(ids)
 
     @staticmethod
     def _where(file_path: str, episode_index):

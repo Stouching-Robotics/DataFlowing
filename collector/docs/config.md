@@ -47,6 +47,7 @@ config/ 是应用全局配置、国际化与版本号所在的配置包。版本
 | `load_server_url` / `save_server_url` | `() -> str` / `(url: str)` | 读 / 存用户服务器地址 | 无保存值或空串时返回出厂默认 `SERVER_URL` |
 | `load_credentials` / `save_credentials` | `() -> tuple[str, str]` / `(username, password)` | 读 / 存登录凭据 | 返回 `(username, password)` |
 | `load_upload_auto_sync` / `save_upload_auto_sync` | `() -> bool` / `(on: bool)` | 读 / 存"录制完成后自动上传"开关 | 缺省默认 `True`（沿用历史行为） |
+| `load_device_dock_prefs` / `save_device_dock_prefs` | `() -> dict` / `(visible: bool, width: int)` | 读 / 存左侧设备检测栏的显示偏好 `{"visible": bool, "width": int}` | 缺字段/类型不对回默认（可见、`DEVICE_DOCK_DEFAULT_WIDTH`）；宽度夹在 `[DEVICE_DOCK_MIN_WIDTH, 1200]` |
 | `load_upload_delete_after` / `save_upload_delete_after` | `() -> bool` / `(on: bool)` | 读 / 存"上传成功后自动删除本地文件"开关 | 缺省默认 `False` |
 | `load_device_names` / `save_device_name` / `remove_device_name` | `() -> dict` / `(key, name, sensor="")` / `(key)` | 设备命名表读 / merge-write / 删除 | `sensor` 仅 `data_ble` 用，绑定 parquet 列名；`""` 表示不动原值 |
 | `device_name` / `device_sensor_role` | `(key: str) -> str` | 读单个设备名 / 读绑定列名 | 兼容 `{"name": …}` 结构与旧版纯字符串；无则空串 |
@@ -85,6 +86,7 @@ config/ 是应用全局配置、国际化与版本号所在的配置包。版本
 | RealSense | `REALSENSE_PROFILES["D405"]` | dict | `depth_resolution`/`rgb_resolution` `(1280,720)`、`fps` 30、`depth_near_mm` 100、`depth_far_mm` 1000、`heatmap_smooth_k` 3、`heatmap_temporal_alpha` 0.5 | D405 短距近景配置 |
 | 设备检测 | `DEVICE_SCAN_MAX_INDEX` / `DEVICE_POLL_INTERVAL_MS` | int | 16 / 2000 | V4L2 枚举上限 / 轮询间隔（毫秒） |
 | 设备检测 | `REALSENSE_VID` / `REALSENSE_PID` | str | `"8086"` / `"0b07"` | Intel vendor ID / D435 product ID（其他型号靠驱动 name 兜底） |
+| 设备检测 | `DEVICE_DOCK_DEFAULT_WIDTH` / `DEVICE_DOCK_MIN_WIDTH` | int | 240 / 96 | 左侧设备检测栏首启宽度 / 允许拖到的最窄（面板内提示文案必须自动换行，否则单行 label 会把栏宽地板顶宽 —— 见 `docs/ui.md` DevicePanel 段） |
 | 传感器 | `SENSOR_NAMES` | list | `["right_glove", "left_glove"]` | 写入 parquet observation 列名 |
 | 手部 | `HAND_POSE_LEFT` / `HAND_POSE_RIGHT` / `HAND_POSE_DIM` / `SENSOR_DIM` | str / str / int / int | `"left_hand_pose"` / `"right_hand_pose"` / 63（21×3）/ 256 | 手部 63 维、触觉 16×16 展平 |
 | 显示 | `CAMERA_MIRROR_HORIZONTAL` / `DISPLAY_FPS_LIMIT` / `FEED_MIN_WIDTH` / `FEED_MIN_HEIGHT` | bool / int / int / int | `True` / 30 / 320 / 240 | 镜像翻转（显示+录制）、GUI 帧率上限、最小画面 |
@@ -119,7 +121,7 @@ config/ 是应用全局配置、国际化与版本号所在的配置包。版本
 
 **JSON 字段约定**（由本模块的读写函数定义）：
 
-- `data/server_config.json`：`server_url`（str）、`username`（str）、`password`（str）、`upload_auto_sync`（bool，缺省 `True`）、`upload_delete_after`（bool，缺省 `False`）。
+- `data/server_config.json`：`server_url`（str）、`username`（str）、`password`（str）、`upload_auto_sync`（bool，缺省 `True`）、`upload_delete_after`（bool，缺省 `False`）、`device_dock`（dict，设备检测栏的 `{"visible": bool, "width": int}`，缺省 `{"visible": True, "width": 240}`）。
 - `data/device_names.json`：key = `DeviceInfo.stable_key`（形如 `"uvc:{by-id前缀}"` / `"uvc:usb-1-5"`（无 by-id 链接、或该前缀被同型号多台共用而归属会翻转时，退到 USB 拓扑路径）/ `"d435:{serial}"` / `"ble:{MAC}"` 等），value = `{"name": str, "sensor"?: str}`（`sensor` 仅 `data_ble` 设备用，绑定 parquet 列名 `right_glove`/`left_glove`，按 MAC 持久化）；旧版纯字符串自动升级为 `{"name": …}`。
 - `data/device_params.json`：key 同 `stable_key`，value = `{"exposure": {"auto": bool, "value": float}, "original": {同结构}}`；`auto=True` 时 `value` 忽略；`original` 首次看到才写入、之后永不覆盖，供"恢复默认"回到开机原厂曝光。
 

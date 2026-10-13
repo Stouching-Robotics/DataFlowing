@@ -176,6 +176,14 @@ DEVICE_POLL_INTERVAL_MS = 2000     # 设备列表轮询间隔（毫秒，sysfs �
 REALSENSE_VID = "8086"             # Intel vendor ID（排除 RealSense UVC 节点用）
 REALSENSE_PID = "0b07"             # D435 的 product ID；其它型号（如 D435i=0b3a）靠驱动 name 含 "RealSense" 兜底
 
+# 左侧设备检测栏（QDockWidget）的尺寸口径：默认宽度 = 首次启动时的栏宽；
+# 下限 = 允许拖到的最窄（一行「图标 + 勾选框 + 省略号」仍认得出设备）。
+# 栏宽与「是否收起」由用户操作决定并持久化（见 load_device_dock_prefs）。
+# 注：面板内的长提示文案必须自动换行，否则单行 label 的 minimumSizeHint
+# 会成为栏宽的硬地板，把栏顶宽到拖不小（2026-10-13 修的就是这个）。
+DEVICE_DOCK_DEFAULT_WIDTH = 240
+DEVICE_DOCK_MIN_WIDTH = 96
+
 # 传感器命名（写入 parquet observation.<name> 列）
 SENSOR_NAMES = [
     "right_glove",     # 右手手套传感器（16×16 压力矩阵）
@@ -292,6 +300,27 @@ def load_upload_delete_after() -> bool:
 def save_upload_delete_after(on: bool):
     """持久化"上传成功后自动删除本地文件"开关。"""
     _save_server_config({"upload_delete_after": bool(on)})
+
+def load_device_dock_prefs() -> dict:
+    """读取左侧设备检测栏的显示偏好 {"visible": bool, "width": int}。
+
+    缺字段 / 类型不对 / 越界一律回默认（可见、DEVICE_DOCK_DEFAULT_WIDTH）；
+    宽度夹在 [DEVICE_DOCK_MIN_WIDTH, 1200]（上限防手改配置把画面挤没）。
+    """
+    raw = _load_server_config().get("device_dock")
+    if not isinstance(raw, dict):
+        raw = {}
+    try:
+        width = int(raw.get("width", DEVICE_DOCK_DEFAULT_WIDTH))
+    except (TypeError, ValueError):
+        width = DEVICE_DOCK_DEFAULT_WIDTH
+    width = min(max(width, DEVICE_DOCK_MIN_WIDTH), 1200)
+    return {"visible": bool(raw.get("visible", True)), "width": width}
+
+def save_device_dock_prefs(visible: bool, width: int):
+    """持久化设备检测栏的可见性与宽度（收起或拖窄后重启保持）。"""
+    _save_server_config({"device_dock": {"visible": bool(visible),
+                                         "width": int(width)}})
 
 def load_gripper_force_matrix_spec() -> str:
     """读取力矩阵落盘规格（server_config.json，默认 "int16x100"）。
@@ -562,12 +591,20 @@ GRIPPER_SLAM_READY_TIMEOUT_S = 45.0             # wait_sdk_ready 上限（SDK �
 # ★ 分界是**发布版本**，不是日历日：v1.3.13（2026-09-28）起录的才是本值，
 #   v1.3.12 及更早录的一律旧约定、而且那时**根本不写**这个键 —— 所以
 #   旧 episode 里 frame 键**不存在**，"键不在"就是"旧帧"，别去 lookup 默认。
-#   （2026-09-22..09-27 用 v1.3.12 录的也一样：没有键、旧帧。现存
-#   data/recordings 最新一段录于 2026-09-21 21:01，尚未跨到这条线。）
+#   （2026-09-22..09-27 用 v1.3.12 录的也一样：没有键、旧帧。老数据最新一段
+#   录于 2026-09-21 21:01；新帧那边 `data/recordings/UMI_9_29`（2026-09-29
+#   录、204 段）已经带着这个键 —— 这条线**已经跨过去了**，别再说"尚未跨到"。）
 # ★ 标注还是**任务级**的：features 按并集/后写覆盖合并，一个任务目录若跨了
 #   这次改帧，info.json 只能记住最后写入的帧，早期 episode 会被标错。要按
 #   episode 精确区分得往 meta/episodes 加列（本次未加）；跨线的任务目录请按
 #   录制日期切开，切点用"哪一天升到 v1.3.13"而不是写死的日期。
+# ⚠ 帧是**一套**含义、姿态**相对化**是另一套：相对化从 ≤1.3.12 起一直是**左乘**
+#   （`R0ᵀ·R`，先在 process_controller、v1.3.13 起搬到 protocol），v1.3.14 才改成
+#   正确的**右乘**（`R·R0ᵀ`）。两者只差一个常数共轭，而 frame 与 app_version
+#   **都分不出**（都写 "1.3.13"）⇒ 别按版本猜。**新帧**数据已按右乘回填
+#   （UMI_9_29，逐文件 sha256 见 MIGRATION.json）；**旧帧**数据（无 frame 键）
+#   同样是左乘、本次**没动**，要不要重解释待判定 —— 详见 docs/data.md 的
+#   「⚠ 姿态相对化的语义改过一次」。
 GRIPPER_SLAM_FRAME_ENV = "KSQ_GRIPPER_SLAM_FRAME"
 GRIPPER_SLAM_FRAME_NEW = "down_left_forward"
 GRIPPER_SLAM_FRAME_LEGACY = "right_forward_up"
@@ -580,8 +617,11 @@ GRIPPER_SLAM_FRAME_AXES = {
 # 同上，给界面用的中文。**只此一份** —— ui/pose_view_qt.py 直接读这张表，
 # 不自己抄：屏幕上写的字和上面落进 info.json 的 frame_axes 必须同源，否则
 # 改词只剩一边动，界面和落盘各说各话。
-# 旧约定的 +Y 写"正对"不是"前"：用户自己的叫法就是「X=右 / Y=正对 / Z=上」；
-# 两个帧的 forward 混用同一个中文字，会让人以为它们的 Y 是同一个物理方向。
+# 旧约定的 +Y 写"正对"而不是"前"，理由只有一条：用户自己的叫法就是
+# 「X=右 / Y=正对 / Z=上」，照抄。（**不是**因为两个 forward 指向不同的物理
+# 方向 —— 它们其实是同一个方向：M 把中间帧 +Y 映到发布帧 +Z，所以旧 +Y
+# 「正对」和新 +Z「前」指的是同一处。真正会骗人的是**轴字母**：旧 +Y 与新
+# +Y 差 90°（正对 vs 左），跨帧对齐要看方向词，不能看字母。）
 GRIPPER_SLAM_FRAME_AXES_CN = {
     GRIPPER_SLAM_FRAME_NEW: {"+X": "下", "+Y": "左", "+Z": "前"},
     GRIPPER_SLAM_FRAME_LEGACY: {"+X": "右", "+Y": "正对", "+Z": "上"},

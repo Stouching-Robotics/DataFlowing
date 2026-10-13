@@ -103,9 +103,22 @@ static constexpr double kInactiveCleanupRetryS = 1.0;
 // may nevertheless change its world frame after VIBA/loop correction; that
 // coordinate-frame jump is rebased below instead of being published as
 // motion.  The same limits are independently enforced at the Python boundary.
-static constexpr float kPoseStepAllowanceM = 0.05f;
-static constexpr float kPoseMaxLinearSpeedMps = 3.0f;
-static constexpr double kPoseMaxGuardIntervalS = 0.1;
+//
+// The interval is capped at the *nominal* frame period, not the largest one
+// seen: stereo frames are decimated 3-of-5, so one frame in every three
+// arrives after 60 ms instead of 20 ms.  Charging the speed term for that
+// 60 ms triples the limit exactly on the frames a re-placed pose lands on
+// (0.05 + 3.0*0.06 = 0.23 m), which let 0.107-0.224 m of estimator excursion
+// through verbatim instead of being rebased -- the visible 抖/飘.
+// Measured over 69061 published samples in 20 sessions (2026-10-10..13):
+// genuine single-sample steps peak at 0.0601 m (p99 0.043) and the smallest
+// excursion is 0.1075 m, so 0.03 + 2.0*0.03 = 0.09 m at dt>=30 ms separates
+// them with margin on both sides and is a no-op on every clean session.
+// (Rotation keeps 20 deg + 1080 deg/s; with the same cap the 30 ms limit is
+// 52.4 deg against a largest genuine step of 15.75 deg.)
+static constexpr float kPoseStepAllowanceM = 0.03f;
+static constexpr float kPoseMaxLinearSpeedMps = 2.0f;
+static constexpr double kPoseMaxGuardIntervalS = 0.03;
 static constexpr float kPoseAngleAllowanceRad =
     20.0f * static_cast<float>(M_PI) / 180.0f;
 static constexpr float kPoseMaxAngularSpeedRadS =

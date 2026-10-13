@@ -12,7 +12,6 @@
 import os
 import json
 import time
-import shutil
 import numpy as np
 import cv2
 from PyQt5.QtCore import Qt, QTimer, QPointF, QRectF
@@ -28,7 +27,7 @@ from config import settings
 from config.i18n import tr
 from core.helpers import (video_mp4_path, hand_kpts_parquet_path,
                           egodata_video_path, episode_video_files,
-                          episode_file_suffix, delete_pooled_episode)
+                          episode_file_suffix, delete_local_session)
 from ui.camera_widget import ZoomableVideoWidget
 from ui.camera_grid import CameraGrid, SPLITTER_HANDLE_WIDTH, SPLITTER_HANDLE_QSS
 from core.render_engine import (
@@ -607,36 +606,37 @@ class PlaybackDialog(QDialog):
             return
 
         from core.recording_repository import RecordingRepo
-        from core.uploader import UploadManager
         deleted = 0
+        failures = []
         for s in selected:
             episode_index = s.get("episode_index", 0)
-            if episode_index > 0:
-                # 池化布局：彻底删除该 episode 文件组
-                # （不触碰其他 episode 与任务级 meta）
-                ok = delete_pooled_episode(s["path"], episode_index)
-            else:
-                try:
-                    shutil.rmtree(s["path"])
-                    ok = True
-                except OSError:
-                    ok = False
-            if ok:
-                deleted += 1
-                # 成功上传过的会话 → 历史标「已上传，本地已删」（与自动上传
-                # 后删除口径一致）；未上传/上传失败 → 标「已删除，未上传」
-                try:
-                    if UploadManager.get_upload_status(
-                            s["path"], episode_index) == "completed":
-                        RecordingRepo.mark_uploaded_deleted(
-                            s["path"], episode_index=episode_index)
-                    else:
-                        RecordingRepo.mark_deleted(
-                            s["path"], episode_index=episode_index)
-                except Exception:
-                    pass
+            # 真删除：删净（含校验）后再删录制行；失败则原样列出，不谎报成功
+            ok, err = delete_local_session(s["path"], episode_index)
+            if not ok:
+                # episode_index == 0 是旧格式会话目录（整目录删除），别写成
+                # episode-000 那段
+                target = (f'episode-{episode_file_suffix(episode_index):03d}'
+                          if episode_index > 0 else tr("整个会话目录"))
+                failures.append(
+                    f'  {os.path.basename(s["path"])}/{target}: {err}')
+                continue
+            deleted += 1
+            try:
+                RecordingRepo.delete_local_episode(
+                    s["path"], episode_index=episode_index)
+            except Exception as e:   # noqa: BLE001 — 文件已删净，记录删失败只提示
+                failures.append(
+                    f'  {os.path.basename(s["path"])}: '
+                    f'{tr("文件已删除，录制记录删除失败")} ({e})')
 
         self._refresh_list()
+        if failures:
+            QMessageBox.warning(
+                self, tr("部分失败"),
+                tr("已删除 {}/{} 个会话，以下未能删净：\n\n{}",
+                   deleted, len(selected), "\n".join(failures)),
+            )
+            return
         QMessageBox.information(
             self, tr("完成"),
             tr("已永久删除 {}/{} 个会话。", deleted, len(selected)),

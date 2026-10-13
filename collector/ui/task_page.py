@@ -464,27 +464,71 @@ class TaskSelectionPage(QWidget):
             self.task_selected.emit(task)
 
     def _do_delete_task(self):
-        """Execute task deletion (called by both button and right-click)."""
+        """Execute task deletion (called by both button and right-click).
+
+        真删除：删掉该任务在本机的全部录制数据（<RECORDING_DIR>/<task_tag>/
+        整个目录）连同库里的录制行；tasks.json 只保留 hidden 墓碑（后端再次
+        推送时据此识别为已删除，否则任务会死而复生）。目录没删净就如实报错，
+        并且不隐藏任务（留给用户重试）。
+        """
         row = self._table.currentRow()
         if row < 0 or row >= len(self._tasks):
             return
         task = self._tasks[row]
         name = task.get("name", task.get("task_name", ""))
         tid = _tid(task)
-        reply = QMessageBox.question(
-            self, tr("确认"),
-            tr("确定要删除任务 \"{}\" 吗？\n删除后可在 tasks.json 中恢复。", name),
-        )
-        if reply == QMessageBox.Yes:
-            mark_hidden(tid)
-            self._tasks = filter_by_identity(load_tasks(), self._identity_scope())
-            for t in self._tasks:
-                t["status"] = _compute_status(t)
-            self._rebuild_table()
-            self._current_row = -1
-            self._enter_btn.setEnabled(False)
-            self._delete_btn.setEnabled(False)
-            self._selection_summary.setText("")
+        from core.helpers import (delete_local_session, list_task_episodes,
+                                  task_dir_of)
+        task_dir = task_dir_of(settings.RECORDING_DIR, name)
+        # 兜底：task_dir_of 走 _sanitize_tag 清洗，纯空白任务名会清洗成空串、
+        # 于是 task_dir 退化成 RECORDING_DIR 本身 —— 那样下面的 rmtree 会把
+        # **所有任务**的录制一起删掉。要求它确实是 RECORDING_DIR 的直接子目录。
+        ground = _os.path.normpath(_os.path.abspath(settings.RECORDING_DIR))
+        target = _os.path.normpath(_os.path.abspath(task_dir))
+        if _os.path.dirname(target) != ground:
+            QMessageBox.warning(
+                self, tr("删除失败"),
+                tr("任务名 \"{}\" 无法映射到本机录制目录下的子目录，已拒绝删除：\n{}",
+                   name, task_dir),
+            )
+            return
+        has_dir = _os.path.isdir(task_dir)
+        n_eps = len(list_task_episodes(task_dir)) if has_dir else 0
+        if has_dir:
+            ask = tr("确定要删除任务 \"{}\" 吗？\n\n将永久删除本地目录：\n{}\n"
+                     "（含 {} 个片段的全部文件与录制记录，不可恢复）",
+                     name, task_dir, n_eps)
+        else:
+            ask = tr("确定要删除任务 \"{}\" 吗？\n\n本机没有该任务的录制数据。",
+                     name)
+        reply = QMessageBox.question(self, tr("确认"), ask)
+        if reply != QMessageBox.Yes:
+            return
+        if has_dir:
+            ok, err = delete_local_session(task_dir, 0)
+            if not ok:      # 目录没删净：不隐藏任务，让用户能重试
+                QMessageBox.warning(
+                    self, tr("删除失败"),
+                    tr("本地数据删除失败，任务未删除：\n{}", f"{task_dir} ({err})"),
+                )
+                return
+        try:
+            from core.recording_repository import RecordingRepo
+            RecordingRepo.delete_local_dir(task_dir)
+        except Exception as e:   # noqa: BLE001 — 数据已删净，记录删失败只提示
+            QMessageBox.warning(
+                self, tr("提示"),
+                tr("录制记录删除失败：\n{}", str(e)),
+            )
+        mark_hidden(tid)
+        self._tasks = filter_by_identity(load_tasks(), self._identity_scope())
+        for t in self._tasks:
+            t["status"] = _compute_status(t)
+        self._rebuild_table()
+        self._current_row = -1
+        self._enter_btn.setEnabled(False)
+        self._delete_btn.setEnabled(False)
+        self._selection_summary.setText("")
 
     def _on_delete_clicked(self):
         self._do_delete_task()

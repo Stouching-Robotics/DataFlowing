@@ -34,7 +34,7 @@
 
 ### ui/main_window.py
 
-**作用**：应用程序主窗口，界面层中枢。组合页面栈（任务选择页 + 数据采集页）、`CameraGrid` 主网格、左侧 `DevicePanel` 设备面板、底部日志 dock、右侧录制历史 dock、工具栏与菜单；启动时经 `_show_login_flow` 弹 `LoginDialog` 确定账号/游客身份，首次启动经 `_show_guide` 弹 `GuideDialog` 使用说明；持有 `CameraPipeline`、`DeviceScanner`、`TaskService`、`UploadManager` 与 `core.device_manager.DeviceManager` 注册表（`_workers` 为其 `entries` 别名）等核心对象并负责信号接线。所有设备的开启/关闭都经左侧面板开关按 `core.device_manager.dispatch_toggle` 分派到 `_open_*`/`_close_*` 系列方法：S80M 双目子进程 + 管道解析在 `core.s80m_manager.S80MDeviceManager`，D435 worker 生命周期与帧口径在 `core.d435_manager.D435DeviceManager`，手套以 BLE 引擎 + 渲染定时器运行。
+**作用**：应用程序主窗口，界面层中枢。组合页面栈（任务选择页 + 数据采集页）、`CameraGrid` 主网格、左侧 `DevicePanel` 设备面板（`_device_dock`：可拖宽/拖窄，带 Closable 故标题栏有 × 可收起；宽度与收起状态经 `server_config.json` 的 `device_dock` 段跨启动保持，恢复入口为「视图 ▸ 设备检测栏」/ Ctrl+D）、底部日志 dock、右侧录制历史 dock、工具栏与菜单；启动时经 `_show_login_flow` 弹 `LoginDialog` 确定账号/游客身份，首次启动经 `_show_guide` 弹 `GuideDialog` 使用说明；持有 `CameraPipeline`、`DeviceScanner`、`TaskService`、`UploadManager` 与 `core.device_manager.DeviceManager` 注册表（`_workers` 为其 `entries` 别名）等核心对象并负责信号接线。所有设备的开启/关闭都经左侧面板开关按 `core.device_manager.dispatch_toggle` 分派到 `_open_*`/`_close_*` 系列方法：S80M 双目子进程 + 管道解析在 `core.s80m_manager.S80MDeviceManager`，D435 worker 生命周期与帧口径在 `core.d435_manager.D435DeviceManager`，手套以 BLE 引擎 + 渲染定时器运行。
 
 **模块级辅助与常量**（v1.0.3 后多为 core 模块的兼容 re-export，离线测试直接 patch 这些名字）：
 
@@ -129,8 +129,8 @@
 | `_open_playback` | `()` | 「📂 回放」：`PlaybackDialog(self, settings.RECORDING_DIR)` 模态打开 | — |
 | `_open_upload` | `()` | 「☁ 上传」：`UploadDialog(self, settings.RECORDING_DIR, session=TaskService._session)` 模态打开 | — |
 | `_on_upload_task_done` | `(task_id)` | 自动上传完成：记日志；`UPLOAD_DELETE_AFTER` 开启时后台线程删本地目录，否则 `RecordingRepo.mark_uploaded` 标「已上传（本地保留）」并刷新历史 | — |
-| `_delete_session_after_upload` | `(session_path)` | 后台线程 `shutil.rmtree`（防大目录阻塞 UI），结果经 `_upload_session_deleted` 回主线程 | — |
-| `_on_upload_session_deleted` | `(session_path, err)` | 删除收尾：失败记日志；成功 `RecordingRepo.mark_uploaded_deleted` 保留历史行（状态「已上传，本地已删」）并刷新 | — |
+| `_delete_session_after_upload` | `(session_path, episode_index=0)` | 后台线程 `delete_local_session`（真删除 + 删除后校验，防大目录阻塞 UI），结果经 `_upload_session_deleted` 回主线程 | — |
+| `_on_upload_session_deleted` | `(session_path, err)` | 删除收尾：失败（含校验残留）记日志；成功 `RecordingRepo.delete_local_episode` 真删录制行并刷新 | — |
 | `_on_upload_task_failed` | `(task_id, error)` | 自动上传失败（重试 3 次后仍失败才触发）→ 日志 | — |
 | `_on_upload_auto_toggled` / `_on_upload_delete_toggled` | `(on)` | 两个工具栏开关：`settings.save_upload_auto_sync` / `save_upload_delete_after` 持久化 + 运行时立即生效 + 按钮文字/样式刷新 | — |
 | `_style_toolbar_toggle` | `(action)` | 开关类 QAction 按钮高亮样式（开启绿底白字加粗） | — |
@@ -144,7 +144,7 @@
 | `_on_switch_account` | `()` | 任务页「切换账号」按钮 → 重开登录对话框 | — |
 | `_on_identity_expired` | `()` | 登录态轮询遇 401/403 → 提示重登；关闭对话框（Esc）自动降级游客 | — |
 | `_on_task_confirmed` | `(task)` | 选中任务进入采集页（index 1），更新窗口标题；不自动扫描，提示先选模式再点扫描 | — |
-| `_on_page_changed` | `(index)` | 页面切换控制工具栏/dock 可见性；任务页停设备轮询，采集页立即扫描 + 启动 `_device_timer`（2s 轮询） | — |
+| `_on_page_changed` | `(index)` | 页面切换控制工具栏/dock 可见性；任务页停设备轮询，采集页立即扫描 + 启动 `_device_timer`（2s 轮询）；末尾统一调 `_apply_device_dock_visibility`（设备栏：任务页隐藏、采集页显示，但用户收起过就保持收起） | — |
 | `_go_back_to_task_selection` | `()` | 返回任务选择：录制中先确认（同意则 abort）；取消手部后处理/标注；`_teardown_all_workers` + 清网格 + 清面板状态；切回 index 0 并 `poll_now()` 刷新任务列表 | — |
 
 **其余（语言/视图/手部后处理/日志/退出）**：
@@ -153,6 +153,12 @@
 | --- | --- | --- | --- |
 | `_on_language_changed` | `(lang)` | 中英文切换：菜单/工具栏/dock 标题/历史表头/手部模式下拉全部 `tr()` 重刷，并调 `_task_page._on_language_changed` | — |
 | `_reset_camera_sizes` | `()` | 视图菜单「重置画面大小」：`grid._rebuild_layout()` 等分 | — |
+| `_apply_device_dock_visibility` | `()` | 设备栏可见性的唯一口径：`当前页==1 且 用户未收起` → `setVisible` + `resizeDocks` 复原宽度；期间置 `_device_dock_syncing` 挡「程序化改动被当成用户收起」 | 末尾同步菜单勾选 |
+| `_toggle_device_dock` | `(checked)` | 视图菜单「设备检测栏」/ Ctrl+D：置 `_device_dock_user_hidden` → 应用可见性 → 落盘 | 任务页只记偏好不显示 |
+| `_on_device_dock_visibility` | `(visible)` | 设备栏可见性变化（标题栏 × 收起）：`_device_dock_syncing` 置位或不在采集页时直接返回；否则记用户收起 + 同步菜单 + 落盘 | — |
+| `_sync_device_dock_action` | `()` | 菜单勾选 = 用户是否想看设备栏（与当前页是否显示无关；`blockSignals` 防递归） | — |
+| `_save_device_dock_prefs` | `()` | `settings.save_device_dock_prefs(未收起, 栏宽)`；宽度由 `eventFilter`(Resize) 持续跟随 | closeEvent 也调一次 |
+| `eventFilter` | `(obj, event)` | 仅拦 `_device_dock` 的 `QEvent.Resize` → 记 `_device_dock_width`（拖窄/拖宽后收起或退出时才能落盘正确宽度） | 其余事件走 `super()` |
 | `_update_status` | `()` | 状态栏：摄像机数（排除 `sensor:`/`ble:` 占位槽）+ 录制中标记与颜色 | — |
 | `_process_hand_keypoints` | `(session_path="", silent=False)` | 后台提取手部关键点（`SessionHandProcessor.process_session`，mode 由手套/裸手下拉决定）；已有结果时弹确认（silent 模式跳过）；无路径用最近一条录制 | — |
 | `_on_hand_proc_progress` / `_on_hand_proc_finished` | `(current, total)` / `(session_path, error)` | 进度 → 状态栏+按钮；完成后 300ms 自动触发 `_auto_label`（silent） | — |
@@ -270,6 +276,7 @@
 
 - `_ICON = {"uvc": "📹", "d435": "🔭", "s80m": "👁", "data_ble": "🧤", "usb_glove": "🧤", "ble": "🎧", "gripper": "🤖"}`；`_GROUP_ORDER = ["camera", "glove", "gripper", "other_ble"]`；`_GROUP_TITLE` 对应中文组标题。
 - `_items`：device key → `QTreeWidgetItem`；`_last_check`：key → 上次勾选状态（防 `itemChanged` 误触发）；`_group_expanded`：组展开状态（初始 camera/glove 展开、other_ble 折叠）；`_has_gripper`：列表里是否有夹爪（决定底部提示是否提右键入口，两个分支都要更新，空设备分支需重置）。
+- ⚠️ 面板内**所有 QLabel 提示都必须 `setWordWrap(True)`**：不换行的 QLabel，其 `minimumSizeHint().width()` 就是整行文字宽，会成为面板与停靠栏的硬地板。底部提示那句中文（「双击设备可重命名；右键夹爪可重读标定 / 配对序列号 / 串口诊断」）曾在夹爪在场时把栏宽地板顶到 289px，导致设备栏**只能拖宽、拖不窄**（2026-10-13 修）；面板另设 `setMinimumWidth(settings.DEVICE_DOCK_MIN_WIDTH)` 作为可拖到的最窄。回归哨兵见 `tools/tests/device_dock_collapse_test.py`。
 - 命名持久化：`config.settings.save_device_name`（device_names.json）。
 
 **调用关系**：由 `ui/main_window.py` 构造并连接 `device_toggled`/`device_renamed`/`gripper_recalibration_requested`/`gripper_binding_requested`/`gripper_diagnostics_requested`（信号名按字符串 connect，写错不会报错、只是永远不触发 —— `tools/tests/test_gripper_esp_binding.py` §9 静态比对两处名字）；`tools/tests/device_panel_gui_smoke_test.py` 直接构造。依赖 `config.settings.save_device_name`、`config.i18n.tr`。夹爪右键三条链路的完整链路（关夹爪 → 后台线程 → 完成后按原样开回）见 `docs/core.md`「夹爪」节与 `ui/main_window.py` 的 `_on_gripper_recalibration` / `_on_gripper_binding` / `_on_gripper_diagnostics`；三条共用 `_gripper_offline_guard`（序列号+录制检查）、`_gripper_offline_take_over`（让出串口）、`_reopen_after_offline`（善后）三件骨架。
@@ -423,7 +430,7 @@
 **★ 坐标帧契约（v1.3.13）**：发布侧 `core/gripper/slam/protocol.py` 给位姿做了两次左乘 + 一次右乘（右乘 = **体轴改名**），本控件是那个契约的另一半：
 
 - `_draw_frame_axes` 画的是 `rotation` 的**三列**（= 夹爪体轴），不是三行。同一张 `M` 也在发布侧给体轴改了名，所以重新锚定那一瞬发布姿态 = `M·Mᵀ` = 单位矩阵，**跟随夹爪的三箭头与世界三箭头重合**，标签同写 下/左/前。
-- `_draw_gripper` 用 `_BODY_RELABEL`（与发布侧同一张 `M`）把模型顶点从旧体轴坐标搬到新体轴坐标，于是 `position + R·(M·v) == position + R_旧·v`，**夹爪的物理朝向与画面逐像素与改前相同**。
+- `_draw_gripper` 用 `_BODY_RELABEL`（与发布侧同一张 `M`）把模型顶点从旧体轴坐标搬到新体轴坐标，于是 `position + R·(M·v) == position + R_旧·v`，**夹爪的物理朝向与画面逐像素与改前相同**（该恒等式对任意 `R`、`v` 代数上精确成立 —— `M·R·Mᵀ·M·v = M·R·v`，因为 `MᵀM = I`；渲染侧由 `test_pose_view_qt.py::check_gripper_model_frame_invariant` 逐像素钉住）。★式中的 `R_旧` 是**改前那次发布的姿态**（已含发布侧左乘的 `M`），不是夹爪自己的相对姿态 `R_rel` —— 拿 `R_rel` 代进去会差一个 `M`，算出"夹爪歪了 0.3–0.4 m"的假警报；对照：两处都改时残差只在浮点噪声量级，只改一半就是 0.3–0.4 m 的实偏差。
 - 后果：**只改发布侧不改这里（或反过来）夹爪会被画歪 120°**，而两种改法各自都"看起来自洽"——别只动一处。测试见 `tools/tests/test_pose_view_qt.py`。
 - 三箭头的轴名来自 `config.settings.GRIPPER_SLAM_FRAME_AXES_CN`，**不自己抄**（屏幕上的字与落进 `info.json` 的 `frame_axes` 必须同源）。
 
@@ -464,7 +471,7 @@
 | `current_task` | `() -> dict \| None` | 当前选中行任务 | dict 或 None |
 | `_on_cell_changed` | `(row, _col, _pr, _pc)` | 选行联动：completed 任务禁用「进入采集」（tooltip 提示换任务） | — |
 | `_on_double_clicked` / `_on_enter_clicked` | `()` | 双击行=快捷进入；进入前 completed 任务弹警告 | 发射 `task_selected` |
-| `_do_delete_task` | `()` | 删除任务（按钮与右键菜单共用）：确认后 `mark_hidden`（可在 tasks.json 中恢复）→ 重载列表 | — |
+| `_do_delete_task` | `()` | 删除任务（按钮与右键菜单共用）：二次确认后 `delete_local_session` 真删该任务录制目录 + `RecordingRepo.delete_local_dir` 删录制行，再 `mark_hidden` 留墓碑 → 重载列表；目录没删净则弹错并**不隐藏**任务。删除目标先做兜底校验（必须是 `RECORDING_DIR` 的**直接子目录**）——`_sanitize_tag` 把纯空白任务名清洗成空串后 `task_dir_of` 会退化成 `RECORDING_DIR` 本身，不拦就会把**所有任务**的录制整根 rmtree | — |
 | `_on_context_menu` | `(pos)` | 右键菜单「🗑 删除任务」 | — |
 | `_on_refresh_clicked` | `()` | 发射 `refresh_requested`，按钮 1.5s 内显示「刷新中…」禁用 | — |
 | `_on_language_changed` | `(lang)` | 表头/占位符/按钮文字刷新并重建表 | — |
@@ -501,8 +508,8 @@
 | `_on_status` | `(task_id, msg)` | 串行处理时状态栏显示「第 x/y 条 [会话名] 当前动作」 | — |
 | `_on_progress` | `(task_id, ratio)` | 总进度 =（已完成数 + 当前比例）/ 总数 | 进度条 |
 | `_on_task_done` | `(task_id)` | 单条完成：刷新列表；`UPLOAD_DELETE_AFTER` 开启时 `_delete_after_upload`（与主窗口自动上传同规则），否则 `RecordingRepo.mark_uploaded` + 主窗口日志「☁ 上传完成（本地保留）」 | — |
-| `_delete_after_upload` | `(session_path)` | 后台线程 `shutil.rmtree`，结果经 `_session_deleted` 回主线程 | — |
-| `_on_session_deleted` | `(session_path, err)` | 删除收尾：失败仅提示；成功 `RecordingRepo.mark_uploaded_deleted` + 刷新列表 + 主窗口日志「☁ 上传完成，本地文件已删除」 | — |
+| `_delete_after_upload` | `(session_path, episode_index)` | 后台线程 `delete_local_session`（真删除 + 删除后校验），结果经 `_session_deleted` 回主线程 | — |
+| `_on_session_deleted` | `(session_path, err)` | 删除收尾：失败仅提示（含校验残留）；成功 `RecordingRepo.delete_local_episode` 真删录制行 + 刷新列表 + 主窗口日志「☁ 上传完成，本地文件已删除」 | — |
 | `_on_task_failed` / `_on_all_done` | `(task_id, error)` / `()` | 失败：状态栏「❌ 上传失败」+ 主窗口日志 + 刷新列表 / 全部完成：恢复按钮、进度条 100、状态「全部完成」 | — |
 | `closeEvent` | `(event)` | 停止 `_manager` | — |
 

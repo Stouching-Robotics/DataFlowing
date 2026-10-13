@@ -16,7 +16,7 @@ from datetime import datetime
 import cv2
 import numpy as np
 
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QSettings
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QSettings, QEvent
 from PyQt5.QtGui import QFont, QColor, QPixmap
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QDockWidget, QTextEdit,
@@ -58,7 +58,6 @@ _RESUME_SKIP_TEXT = {
 
 # 双目相机 —— 子进程/管道/曝光/抽帧口径已入 core/s80m_manager；
 # 路径常量 re-export 供本窗口可用性检查与离线测试 patch
-import shutil
 from core.s80m_manager import (
     S80MDeviceManager, frame_record_decision, s80m_depth_available,
     s80m_drop_watch, STEREO_DROP_ALERT_RATE,
@@ -200,6 +199,14 @@ class MainWindow(QMainWindow):
         self._lost_device_keys: set = set()     # 录制中拔线暂存 key（重插恢复勾选）
         self._last_device_keys: dict = {}       # key → 标签（插拔 diff 日志）
         self._last_device_kinds: dict = {}      # key → kind（蓝牙刷屏过滤）
+
+        # ── 设备检测栏（左侧停靠面板）显示偏好 ────────
+        # user_hidden：用户主动收起（标题栏 × / 视图▸设备检测栏）；任务选择页
+        # 隐藏是页面行为，不算收起。width：栏宽，由 eventFilter 跟随实际 resize。
+        # 二者随 closeEvent / 收起动作持久化到 server_config.json。
+        self._device_dock_user_hidden = False
+        self._device_dock_width = settings.DEVICE_DOCK_DEFAULT_WIDTH
+        self._device_dock_syncing = False        # 程序化改可见性时置位（挡误判为用户收起）
 
         # ── 实时 FPS 显示（D435/S80M 无 CameraWorker 测量，主窗口统一计数）──
         self._fps_ring: dict = {}   # slot_id → deque(帧到达时刻, monotonic 秒)
@@ -379,11 +386,20 @@ class MainWindow(QMainWindow):
             self._on_gripper_diagnostics_done)
         self._device_dock = QDockWidget(tr("📷 设备检测"), self)
         self._device_dock.setWidget(self._device_panel)
+        # Closable = 标题栏出 × 按钮，点它就是「隐藏设备栏」；恢复入口是
+        # 视图▸设备检测栏 / Ctrl+D（见 _on_device_dock_visibility）。
         self._device_dock.setFeatures(
             QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable
+            | QDockWidget.DockWidgetClosable
         )
         self.addDockWidget(Qt.LeftDockWidgetArea, self._device_dock)
-        self.resizeDocks([self._device_dock], [240], Qt.Horizontal)
+        # 栏宽与收起状态沿用上次（server_config.json），首次启动用默认宽度
+        prefs = settings.load_device_dock_prefs()
+        self._device_dock_width = prefs["width"]
+        self._device_dock_user_hidden = not prefs["visible"]
+        self._device_dock.installEventFilter(self)   # 跟随实际宽度（拖窄后落盘）
+        self.resizeDocks([self._device_dock], [self._device_dock_width],
+                         Qt.Horizontal)
 
         # ── 状态栏 ────────────────────────────────────
         self._status_label = QLabel(tr("就绪"))
@@ -416,6 +432,19 @@ class MainWindow(QMainWindow):
         self._view_menu.addSeparator()
         self._reset_size_action = self._view_menu.addAction(
             tr("重置画面大小"), self._reset_camera_sizes)
+        # 设备检测栏（左侧停靠面板）显示开关：标题栏的 × 也能收起，收起后
+        # 只有这里 / Ctrl+D 能恢复，所以勾选状态要与实际可见性同步。
+        self._device_dock_action = self._view_menu.addAction(
+            tr("设备检测栏"))
+        self._device_dock_action.setCheckable(True)
+        self._device_dock_action.setChecked(not self._device_dock_user_hidden)
+        self._device_dock_action.setShortcut("Ctrl+D")
+        self._device_dock_action.setToolTip(tr(
+            "显示/收起左侧设备检测栏（也可点它标题栏的 × 收起）"))
+        self._device_dock_action.triggered.connect(self._toggle_device_dock)
+        # 接线放在动作建好之后：× 收起时要同步勾选状态
+        self._device_dock.visibilityChanged.connect(
+            self._on_device_dock_visibility)
 
         # ── 语言菜单 ───────────────────────────────────
         self._lang_menu = mb.addMenu(tr("语言(&L)"))
@@ -767,7 +796,6 @@ class MainWindow(QMainWindow):
             self._log_dock.setVisible(False)
             self._history_dock.setVisible(False)
             # 设备检测面板：任务选择页隐藏 + 停轮询
-            self._device_dock.setVisible(False)
             self._device_timer.stop()
         else:
             # 数据采集页面 — 显示全部 UI
@@ -777,9 +805,11 @@ class MainWindow(QMainWindow):
             self._log_dock.setVisible(True)
             self._history_dock.setVisible(True)
             # 设备检测面板：采集页显示 + 立即扫描 + 周期轮询
-            self._device_dock.setVisible(True)
             self._device_scanner.request_scan()
             self._device_timer.start()
+        # 设备检测面板可见性：采集页显示、任务页隐藏，但用户主动收起过就保持
+        # 收起（否则每次切页都把用户收起来的栏弹回来）
+        self._apply_device_dock_visibility()
 
     def _go_back_to_task_selection(self):
         """从数据采集页面返回任务选择页面。"""
@@ -2973,6 +3003,9 @@ class MainWindow(QMainWindow):
         self._clear_log_action.setText(tr("清空日志"))
         self._refresh_history_action.setText(tr("刷新历史记录"))
         self._reset_size_action.setText(tr("重置画面大小"))
+        self._device_dock_action.setText(tr("设备检测栏"))
+        self._device_dock_action.setToolTip(tr(
+            "显示/收起左侧设备检测栏（也可点它标题栏的 × 收起）"))
 
         # ── 返回任务选择 ──────────────────────────
         self._back_to_task_action.setText(tr("返回任务选择"))
@@ -3047,6 +3080,74 @@ class MainWindow(QMainWindow):
     def _reset_camera_sizes(self):
         """重置所有分割条到等分状态。"""
         self.grid._rebuild_layout()
+
+    # ── 设备检测栏：显示 / 收起 / 宽度落盘 ───────────────
+
+    def eventFilter(self, obj, event):
+        """跟随设备栏的实际宽度（拖动分割条 → 记住，收起/退出时落盘）。"""
+        if obj is self._device_dock and event.type() == QEvent.Resize:
+            w = self._device_dock.width()
+            if w > 0:
+                self._device_dock_width = w
+        return super().eventFilter(obj, event)
+
+    def _apply_device_dock_visibility(self):
+        """按「当前页 + 用户是否收起」刷新设备栏可见性。
+
+        页面切换、菜单与 × 收起都走这一个入口，避免两处口径打架。
+        """
+        show = (self._page_stack.currentIndex() == 1
+                and not self._device_dock_user_hidden)
+        self._device_dock_syncing = True   # 程序化改动 → 不当作用户收起
+        try:
+            self._device_dock.setVisible(show)
+            if show:
+                # 隐藏期间改过窗口大小 / 首次显示时，Qt 给的宽度未必是保存值
+                self.resizeDocks([self._device_dock], [self._device_dock_width],
+                                 Qt.Horizontal)
+        finally:
+            self._device_dock_syncing = False
+        self._sync_device_dock_action()
+
+    def _toggle_device_dock(self, checked: bool):
+        """视图▸设备检测栏 / Ctrl+D：显示或收起设备栏（收起状态持久化）。
+
+        任务选择页收起只记偏好，回采集页才真正生效；反之在任务页点「显示」
+        也不会把设备栏拉到任务页上（那页本来就不显示采集专属 UI）。
+        """
+        self._device_dock_user_hidden = not checked
+        self._apply_device_dock_visibility()
+        self._save_device_dock_prefs()
+
+    def _on_device_dock_visibility(self, visible: bool):
+        """设备栏可见性变化（点标题栏 × 收起）→ 同步菜单勾选 + 记偏好。
+
+        页面切换与程序化改动期间 _device_dock_syncing=True，任务选择页的
+        隐藏也只是页面行为 —— 两者都不代表用户收起栏，直接返回。
+        """
+        if self._device_dock_syncing or self._page_stack.currentIndex() != 1:
+            return
+        self._device_dock_user_hidden = not visible
+        self._sync_device_dock_action()
+        self._save_device_dock_prefs()
+
+    def _sync_device_dock_action(self):
+        """菜单勾选 = 用户是否想看到设备栏（与当前页是否显示无关）。"""
+        action = getattr(self, "_device_dock_action", None)
+        if action is None:      # _setup_menu 之前的调用（构建期）
+            return
+        action.blockSignals(True)
+        action.setChecked(not self._device_dock_user_hidden)
+        action.blockSignals(False)
+
+    def _save_device_dock_prefs(self):
+        """把设备栏的收起状态与宽度写回 server_config.json。
+
+        宽度取 `_device_dock_width`（由 eventFilter 跟随每次 Resize），不用
+        `self._device_dock.width()` —— 收起瞬间读到的是收起前的旧几何。
+        """
+        settings.save_device_dock_prefs(not self._device_dock_user_hidden,
+                                        self._device_dock_width)
 
     # ═══════════════════════════════════════════════════
     #  状态栏刷新
@@ -3341,40 +3442,36 @@ class MainWindow(QMainWindow):
         """上传成功后删除本地会话目录（后台线程，防大目录阻塞 UI）。
 
         池化布局（episode_index > 0）只删该 episode 文件组
-        （delete_pooled_episode → 彻底删除，不走 _trash）。
-        结果经 _upload_session_deleted 信号回主线程：标记 recording 行、
+        （delete_local_session → 彻底删除 + 删除校验，不走 _trash）。
+        结果经 _upload_session_deleted 信号回主线程：真删 recording 行、
         刷新历史面板并记日志。手部关键点后处理持有的已打开视频句柄在
         Linux 下不受 unlink 影响，输出镜像在 keypoints_output/ 不受牵连。
         """
         def _worker():
-            err = ""
-            if episode_index > 0:
-                from core.helpers import delete_pooled_episode
-                delete_pooled_episode(session_path, episode_index)
-            elif not os.path.isdir(session_path):
-                err = "会话目录不存在"
-            else:
-                try:
-                    shutil.rmtree(session_path)
-                except OSError as e:
-                    err = str(e)
-            self._upload_session_deleted.emit(session_path, err,
+            from core.helpers import delete_local_session
+            ok, err = delete_local_session(session_path, episode_index)
+            self._upload_session_deleted.emit(session_path,
+                                              "" if ok else err,
                                               episode_index)
         threading.Thread(target=_worker, daemon=True,
                          name="upload-auto-delete").start()
 
     def _on_upload_session_deleted(self, session_path: str, err: str,
                                    episode_index: int = 0):
-        """后台删除完成（主线程）：recording 行标记已删并刷新历史。"""
+        """后台删除完成（主线程）：真删 recording 行并刷新历史。"""
         name = os.path.basename(session_path)
         if episode_index > 0:
             name = f"{name}_ep{episode_file_suffix(episode_index):06d}"
         if err:
             self._log(tr("[错误] 上传后自动删除失败: {}", f"{name} ({err})"))
             return
-        # 历史行保留（用户要求），状态标记"已上传，本地已删"
-        RecordingRepo.mark_uploaded_deleted(
-            session_path, episode_index=episode_index)
+        # 真删除：本地文件已删净 → 录制行一并删除（不留"已删除"痕迹行）
+        try:
+            RecordingRepo.delete_local_episode(
+                session_path, episode_index=episode_index)
+        except Exception as e:   # noqa: BLE001 — 文件已删净，记录删失败只提示
+            self._log(tr("[错误] 本地文件已删除，录制记录删除失败: {}",
+                         f"{name} ({e})"))
         self._refresh_history()
         self._log(tr("☁ 上传完成，本地文件已删除: {}", name))
 
@@ -3512,6 +3609,8 @@ class MainWindow(QMainWindow):
                 return
         self._shutting_down = True
         self._s80m_manager.shutting_down = True
+        # 记住设备栏的宽度与收起状态（下次启动保持）
+        self._save_device_dock_prefs()
         self._device_timer.stop()
         self._device_scanner.stop()
         if self._pipeline.is_recording:

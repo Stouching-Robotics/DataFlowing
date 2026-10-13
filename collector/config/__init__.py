@@ -3,8 +3,49 @@
 版本号集中定义于此：settings.APP_VERSION 及其他模块均从这里取值。
 """
 
-__version__ = "1.3.13"
+__version__ = "1.3.15"
 
+# v1.3.15 —— 姿态语义的文档/注释校正 + 夹爪配对报错分型 + lite 取号跨 chunk
+#   ①**修一处数学错误**：protocol.finish_publish_pose 的 docstring 把
+#   「M·(R0ᵀ·R)·Mᵀ = (M·R0ᵀ·Mᵀ)·(M·R·Mᵀ)·(M·R0ᵀ·Mᵀ)ᵀ」写成恒等式，代数上不成立
+#   （数值差 O(1)）。正确的两因子式是 M·(R0ᵀ·R)·Mᵀ = (M·R0ᵀ·Mᵀ)(M·R·Mᵀ)；左乘
+#   与右乘两支之间是**共轭**（左乘版 = P·右乘版·Pᵀ，P = M·R0·Mᵀ，R0/M 皆旋转
+#   ⇒ P 正交）。同一主题：README 两处 changelog、process_controller 第 329/857
+#   行论证「顺序不敏感」用的**左乘支**恒等式换成**右乘支**（与 protocol 第 537
+#   行、测试第 5 节一致）；process_controller 第 1018 行记号 R0ᵀ·R 改 R·R0ᵀ。
+#   姿态相对化「新旧数据分开看」的整套说明落在 docs/data.md（新帧已按右乘回填；
+#   旧帧〔无 frame 键〕同样是左乘、本次未动，要不要重解释仍**待判定**）。
+#   ②**无出处数字清理**：docs/ui.md 与 ui/pose_view_qt.py 里「实测 5000 组随机
+#   姿态/顶点，最大偏差 2.2e-16 m」没有任何产出物（全仓只这两行，`git log -S`
+#   指向 0ab64d7c 手写加入），真回归是 test_pose_view_qt.py 的
+#   check_gripper_model_frame_invariant —— **逐像素**断言（2 个固定姿态、
+#   mismatch==0），不是 5000 组、不是米制。该恒等式对任意 R、v 代数上精确成立
+#   （MᵀM = I），只改一半的实偏差是 0.3–0.4 m：删掉那个计数，改成代数事实 +
+#   测试引用。test_pose_publish_deadband.py 把 protocol.py 定性为「假值」的
+#   7.2mm 当成实测上限（同文件 docstring 自相矛盾），改回 1.39–4.98mm；
+#   process_controller 第 898 行的「≈1.4°」无出处，改用 protocol.py 的
+#   p50 0.25°/max 1.80°。protocol.py 的 guard-interval 注释按作者口径写成
+#   「封顶在 1.5× 名义帧周期（= 30ms）」，不再把 cap 本身称作名义周期。
+#   ③**夹爪配对报错分型**：_associate_group 原来把「这台没报出 side（Flash
+#   空/无效）」与「两台报了同一个左右」挤在同一句「身份不唯一」下 —— 前者会被
+#   指成拓扑/端口重复，真因却是厂商产线没写 side（仓库无写路径）。拆成两条
+#   抬头，前者带 sightac[i]/side/flash_ok/device_type/serial/error。
+#   ④**lite 取号跨 chunk**：_episode_max 原来取「最大文件名 f + 1」，而 f
+#   每 1000 回绕 ⇒ chunk-001 出现后返回 chunk-000 里**真实存在**的错段
+#   （N=1001 → 得 1），上传/删除静默操作错段。改走 list_task_episodes
+#   （N = c*1000 + f + 1），顺带删掉随之未用的 import re。
+#   测试：test_device_access_selflock.py 第 8/9/10 节、lite_delete_test.py 第 6 节。
+#
+# v1.3.14 —— 发布位姿死区（最小可报告位移 3mm）：静止时估计器的毫米级游走
+#   （严格静止窗实测：游走半径逐会话 p50 1.06-1.85mm / max 1.39-4.98mm，单帧
+#   步长 p99 只有 0.5mm；"只卡首末"的宽口径会给到 7.2mm 的假值，见
+#   protocol.py 的定义）不再进
+#   轨迹线/末端点/落盘。判据是"距上次**发布**值的累积位移"，与跳变门（比相邻
+#   样本）是两件事；不足死区时**发布上次的值**，所以采样节拍、时间戳、
+#   slam_trajectory 的逐点契约都不变，只是值冻结。详见
+#   core/gripper/slam/protocol.py 的 POSE_PUBLISH_DEADBAND_M 注释与
+#   tools/tests/test_pose_publish_deadband.py / test_gripper_pose_deadband_publish.py。
+#
 # v1.3.13 —— 夹爪 SLAM 的**发布坐标帧**改为 +X=下 / +Y=左 / +Z=前
 #   （原 +X=右 / +Y=正对 / +Z=上）。位姿视图、`observation.*slam_trajectory`、
 #   `orb_pose.json` 是同一份数值 ⇒ 帧只有一处：发布入口，形态是在"姿态相对化
@@ -21,7 +62,17 @@ __version__ = "1.3.13"
 #   各自都"看起来自洽"，从画面上看不出是谁漏了。
 #   左右都乘之后**顺序不再是契约**：M 在两边相遇处整个约掉，
 #   (M·R0·Mᵀ)ᵀ(M·R·Mᵀ) == M·R0ᵀ·R·Mᵀ，"先相对化再重标"与"先重标再相对化"
-#   逐元素相同（有回归钉住）。①位姿视图**不做任何换帧补偿**，发布帧就是它的
+#   逐元素相同（有回归钉住）。⚠这条恒等式写的是**左乘**那一支（`R0ᵀ·R`，锚点体
+#   轴系里的 body delta）—— 相对化从 ≤1.3.12 起一直是左乘（先 process_controller、
+#   v1.3.13 起搬到 protocol），它后来被判定**错**（位置/幅度看着正常，但读端按它
+#   解会让表观旋转轴整体转错），正确口径是**右乘 `R·R0ᵀ`**（世界系相对姿态），修在
+#   v1.3.14。两种乘法只差一个常数共轭，而 `frame` 与 `app_version` **都分不出**
+#   （两个构建都是 `down_left_forward`、`__version__` 都写 "1.3.13"）⇒ 别按版本猜。
+#   **新帧**数据已按右乘回填（UMI_9_29，逐文件 sha256 记在 MIGRATION.json）；
+#   **旧帧**数据（无 frame 键）也是左乘、本次没动，要不要重解释待判定 —— 详见
+#   docs/data.md 的「⚠ 姿态相对化的语义改过一次」。右乘同样与重标可交换
+#   （(M·R·Mᵀ)(M·R0·Mᵀ)ᵀ == M·R·R0ᵀ·Mᵀ），所以「顺序不是契约」的结论不变。
+#   ①位姿视图**不做任何换帧补偿**，发布帧就是它的
 #   数据帧 —— gui 坐标系与轨迹系是同一个，换帧后画面随之整体改变
 #   （场景相对画布转约 120°，世界轴三箭头屏幕位置不动、含义改成下/左/前）。
 #   ⚠v1.3.13 第一版曾在视图入口左乘 V = Mᵀ 求"画面逐像素不变"，那等于把换帧
@@ -47,8 +98,14 @@ __version__ = "1.3.13"
 #   coordinate_frame.json，不是本仓库产的，别混为一谈）。
 #   ⚠它是**任务级**的（features 按并集/后写覆盖合并），一个任务目录跨了改帧时
 #   早期 episode 会被标错。★分界是**发布版本**不是日历日：v1.3.12 及更早录的
-#   （现存 153 个 episode，一律是旧约定、本次原样留着没动；最新一段录于
-#   2026-09-21 21:01）**不写这个键** —— 键不在就等于旧帧，别当默认值读。
+#   **不写这个键** —— 键不在就等于旧帧，别当默认值读。
+#   （老数据一律是旧约定、本次原样留着没动：`data/recordings/UMIGripper_Action_AI`
+#   一个任务就 153 个 episode（另有 `9_21_Test` 15 / `D435-裸手…` 6 /
+#   `S80C-裸手…` 1，都不是 UMI 夹爪的、也不带这个键），最新一段录于
+#   2026-09-21 21:01，**都没有这个键**。新帧那边已有
+#   `data/recordings/UMI_9_29`（2026-09-29 录，204 段，app_version 1.3.13、
+#   gripper_slam_frame=down_left_forward；其姿态已在 2026-10-12 按右乘口径回填）
+#   —— 这条线**已经跨过去了**。）
 #   按 episode 精确区分需要往 meta/episodes 加列（本次未加）。
 #   C++ 侧一字未动（native 帧没变，变的只是 Python 侧 native→发布帧这一映射），
 #   所以无需重编、`libORB_SLAM3.so` 的 md5 也不变。

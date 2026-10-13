@@ -22,8 +22,6 @@ tools/tests/lite_import_guard_test.py 断言守护。
 from __future__ import annotations
 import glob
 import os
-import re
-import shutil
 import threading
 import time
 from typing import List, Optional
@@ -56,7 +54,8 @@ from core.encoder_probe import list_working_ffmpegs
 from core.gripper_codec import (describe_gripper_matrix_spec,
                                encode_gripper_force_matrix,
                                encode_gripper_force_matrix_array)
-from core.helpers import delete_pooled_episode, format_duration
+from core.helpers import (delete_local_session, episode_file_suffix,
+                          format_duration, list_task_episodes)
 from core.pipeline import CameraPipeline, frame_drop_total
 from core.uploader import UploadManager
 
@@ -1485,14 +1484,25 @@ class LiteWindow(QMainWindow):
         settings.UPLOAD_DELETE_AFTER = bool(on)
 
     def _episode_max(self, task_dir: str) -> int:
-        """任务目录内已录制的最大 episode 号（0 = 无 parquet，按整目录上传）。"""
-        best = 0
-        for p in glob.glob(os.path.join(task_dir, "data", "chunk-*",
-                                        "episode-*.parquet")):
-            m = re.search(r"episode-(\d+)\.parquet$", os.path.basename(p))
-            if m:
-                best = max(best, int(m.group(1)))
-        return best
+        """任务目录内最新一段的**全局 episode 号 N（1 基）**（0 = 无 parquet，
+        按整目录上传）。
+
+        文件名是 `episode-<f>.parquet`，f 是 **chunk 内**的 0 基文件号：每
+        chunk 1000 段（`data/chunk-{c:03d}/`），chunk-000 装满 1000 段后开
+        chunk-001 并从 `episode-000` 重新计数（`episode_chunk_file(N)` 给出
+        (c, f)）。所以「最大的文件名 f」既不是 N、也不能靠 +1 换算：**f 每过
+        1000 就回绕**，`int(f)+1` 在 chunk-001 出现后会返回一个**真实存在**的
+        错段（例：N=1001 时 f=000 ⇒ 得 1，指向 chunk-000/episode-000）。
+        全局号统一由 `list_task_episodes` 还原（`chunk*1000 + f + 1`）——它与
+        上传器、`UploadManager` 的 (path, episode_index) 防重键、
+        `delete_local_session` 同一口径，也与本文件自动上传路径传的
+        `pipeline.last_episode_index` 一致。
+        """
+        if not glob.glob(os.path.join(task_dir, "data", "chunk-*",
+                                      "episode-*.parquet")):
+            return 0          # 旧格式/空目录：按整目录上传
+        episodes = list_task_episodes(task_dir)
+        return episodes[-1] if episodes else 0
 
     def _refresh_upload_list(self):
         """待上传列表 = data/recordings 下的任务目录 + 上传状态。"""
@@ -1559,11 +1569,26 @@ class LiteWindow(QMainWindow):
         self._upload_progress.setValue(0)
 
     def _delete_after_upload(self, session_path: str, episode_index: int):
-        """后台删除本地会话（ep>0 只删该 episode 文件组，否则整目录）。"""
+        """后台真删除本地上传件（含删除校验）；失败写日志，不谎报成功。
+
+        episode_index 就是上传时用的那个号（手动列表是 `_episode_max` 的
+        返回值、自动上传是 `pipeline.last_episode_index`，两者都是**全局
+        episode 号 N（1 基）**），原样透传给 delete_local_session —— 删的必须
+        恰好是刚上传的那一段，所以这里**不能再加工**（上传器按 N 取文件，
+        多 +1 会指向 N+1：既删错段，又因为那一段本就不存在而「顺利返回
+        True」，界面报成功、文件还在）。目录里没有池化 parquet 时（旧格式/
+        空目录）按整目录删。
+        """
+        has_parquet = bool(glob.glob(os.path.join(
+            session_path, "data", "chunk-*", "episode-*.parquet")))
+        n = episode_index if has_parquet else 0
+        ok, err = delete_local_session(session_path, n)
+        if ok:
+            return
+        name = os.path.basename(session_path)
         if episode_index > 0:
-            delete_pooled_episode(session_path, episode_index)
-        elif os.path.isdir(session_path):
-            shutil.rmtree(session_path, ignore_errors=True)
+            name = f"{name}_ep{episode_file_suffix(episode_index):06d}"
+        self._log(tr("[错误] 上传后自动删除失败: {}", f"{name} ({err})"))
 
     def _on_upload_failed(self, task_id: str, error: str):
         pair = self._upload_task_map.pop(task_id, ("", 0))

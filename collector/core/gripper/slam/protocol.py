@@ -66,14 +66,39 @@ MP_CLEANUP_SPECS = (
 FAYS_STAGE_KEYS = ("wait_ms", "preprocess_ms", "middle_ms", "post_ms")
 
 # The gripper cannot physically cover these distances between consecutive
-# 25 Hz SLAM samples.  The small fixed allowance absorbs normal estimator
+# SLAM samples.  The small fixed allowance absorbs normal estimator
 # corrections; the speed term keeps the gate independent of the exact FPS.
+#
+# POSE_MAX_GUARD_INTERVAL_S caps the interval at 1.5x the *nominal* frame
+# period (= 30 ms; the nominal is the 20 ms 50 fps input period), not the
+# largest one seen: stereo frames are decimated 3-of-5, so one frame in
+# every three arrives after 60 ms instead of 20 ms.  Charging the speed term
+# for that 60 ms triples the limit exactly on the frames a re-placed pose lands
+# on, which let 0.107-0.224 m of estimator excursion through verbatim instead
+# of being held.  Measured over 69061 published samples in 20 sessions: genuine
+# single-sample steps peak at 0.0601 m (p99 0.043), smallest excursion 0.1075 m.
+# Mirrored verbatim in the native guard (fayssense_orb_slam.cc, kPose*).
 POSE_MAX_ABS_POSITION_M = 10.0
-POSE_STEP_ALLOWANCE_M = 0.05
-POSE_MAX_LINEAR_SPEED_MPS = 3.0
-POSE_MAX_GUARD_INTERVAL_S = 0.1
+POSE_STEP_ALLOWANCE_M = 0.03
+POSE_MAX_LINEAR_SPEED_MPS = 2.0
+POSE_MAX_GUARD_INTERVAL_S = 0.03
 POSE_ANGLE_ALLOWANCE_RAD = math.radians(20.0)
 POSE_MAX_ANGULAR_SPEED_RAD_S = math.radians(1080.0)
+
+# 极小幅度噪声死区：**最小可报告位移**。静止时估计器仍在游走——实测 20 个
+# 会话、69061 条发布位姿。静止段的判据是（10s 窗、净位移<2mm）**且**（窗内
+# 每点距窗中位<5mm）——后半条不能省：只卡首末时，那些"出去又回来"的窗会把
+# 统计量整体抬高（单看首末得到的 max 是 7.2mm 的假值）。按这个严格口径，位置
+# 游走半径（距窗中位）逐会话 p50 1.06-1.85mm、逐会话 max 1.39-4.98mm；姿态
+# 峰峰 p50 0.25°、max 1.80°（另有一会话 3.46°）。默认视野
+# 327px/m（span 0.5m 画在 420px 上）下 1mm≈0.33px 看不出来，但用户放大到
+# 4-10× 检查轨迹时，那就是 3-10px 的连续抖动——「静止时轨迹线/末端点还在
+# 小抖」报的就是它。3mm 死区实测：四个会话的静止窗 99.8-100% 帧被冻结，
+# 全段误差 p50≤1.4mm、max=3.0mm（10× 下 10px，且只出现在真实移动时的量化，
+# 不出现在静止时）。
+# ★ 与上面那组"跳变门"是两件事：跳变门比的是**相邻样本**（毫米级游走远在
+#   限值之下，它管不着），死区比的是**距上次发布值**的累积位移。
+POSE_PUBLISH_DEADBAND_M = 0.003
 
 _POSE_RE = re.compile(
     r"\[([\d.]+)\]\s*XYZ:\(([-\d.e+]+),([-\d.e+]+),([-\d.e+]+)\)\s*"
@@ -207,6 +232,21 @@ def pose_rejection_reason(current, previous=None):
             f"{math.degrees(angle_limit):.1f}deg"
         )
     return None
+
+
+def pose_below_deadband(position, reference, epsilon=POSE_PUBLISH_DEADBAND_M):
+    """当前位置距**上次发布值**是否小于死区（是 → 保持上次发布的值）。
+
+    比的是**累积位移**而不是相邻样本：静止时的毫米级游走单帧远小于任何跳变
+    限值，只有对着"上次真正发出去的那个位置"累计，才分得出游走与真实移动。
+    reference 为 None（会话首帧 / 刚重设原点）时恒为 False —— 首帧必须发。
+    """
+
+    if reference is None:
+        return False
+    return math.sqrt(sum(
+        (position[index] - reference[index]) ** 2 for index in range(3)
+    )) < epsilon
 
 
 @dataclass(frozen=True)
@@ -481,15 +521,28 @@ def relabel_published_frame(pose):
 def finish_publish_pose(pose, rotation_zero=None, relabel=True):
     """发布入口最后一步：原点后姿态相对化 →（可选）世界重标（含体轴改名）。
 
-    顺序：**现在两种顺序等价**，不再有雷。旧版（重标只左乘 M）时反过来做
-    会让 M 整体约掉、发出去的还是中间帧，而位置确实换了帧，于是 GUI 里
-    夹爪体轴模型会画成转了 90° 的姿势；v1.3.13 的重标改成左右各乘一次
-    （M·R·Mᵀ，右乘 = 体轴改名，见 relabel_published_frame）之后，
-        (M·R0·Mᵀ)ᵀ·(M·R·Mᵀ) = M·R0ᵀ·R·Mᵀ
-    与"先相对化再重标"逐元素相同 —— 共轭让 M 在两步里都自消。
-    tools/tests/test_gripper_pose_axes.py 第 5 节把这条等价性钉住了。
-    保留这个函数当唯一入口，是因为它同时管着"锚点相对化"和"要不要重标"
-    两件事，拆开调用迟早有人只做一半。
+    ★ 相对化是**右乘** R0ᵀ（世界系相对姿态 R·R0ᵀ），不是左乘。v1.3.13 里
+    写成了左乘 R0ᵀ·R，那算出来的是"在锚点体轴系里表达的相对转动"（body
+    delta）——数值上只差一个常数共轭，却让人看见的旋转轴整体转错：
+      发布姿态(右乘) = M·(R·R0ᵀ)·Mᵀ = (M·R·Mᵀ)·(M·R0·Mᵀ)ᵀ
+      发布姿态(左乘) = M·(R0ᵀ·R)·Mᵀ = P·[发布姿态(右乘)]·Pᵀ，
+      其中 P = M·R0·Mᵀ（R0、M 都是旋转 ⇒ P 正交，P⁻¹ 就是 Pᵀ）
+    ⚠别把这两支写成"同一个式子多乘一个因子"：左乘支不是右乘支右边再挂一个
+    (M·R0·Mᵀ) 的转置（代数上不成立，数值差 O(1)），而是**共轭**关系。
+    早期注释里那个三因子式是错的，已删。
+    锚点 R0 = R_z(90°)·correction = R_x(−90°) 时，那个常数恰是"绕发布帧
+    Y 轴 ±90°"：Y 正好是不动轴（所以只有绕 Y 的手感是对的），X 与 Z 被
+    对调并翻一个号。用户实测三条（绕 X → 表观绕 Z 同向、绕 Z → 表观绕 X
+    反向、绕 Y → 正常）逐条由此而来。右乘后表观旋转轴 = M·a 与物理一致，
+    锚点那一瞬仍是单位矩阵（画面不变），位置一个字不动。
+    tools/tests/test_gripper_pose_axes.py 第 10 节把"世界系相对姿态"钉住了，
+    第 4 节钉"锚点 = 单位矩阵"。
+
+    顺序：**先相对化再重标 与 先重标再相对化等价**（共轭让 M 在两步里都
+    自消）：
+        (M·R·Mᵀ)·(M·R0·Mᵀ)ᵀ = M·R·R0ᵀ·Mᵀ
+    第 5 节把这条等价性钉住了。保留这个函数当唯一入口，是因为它同时管着
+    "锚点相对化"和"要不要重标"两件事，拆开调用迟早有人只做一半。
 
     pose 必须已处于中间帧（rotate_pose_z90 的输出）。
     rotation_zero = 本锚段的**中间帧**首帧姿态；None → 不做相对化
@@ -500,8 +553,10 @@ def finish_publish_pose(pose, rotation_zero=None, relabel=True):
     if rotation_zero is not None:
         pose = replace(
             pose,
+            # 右乘 R0ᵀ = 世界系相对姿态；写成左乘会把表观旋转轴整体转错
+            # 一个常数（v1.3.13 的 bug，见上面 docstring）
             rotation=quat_product(
-                quat_conjugate(rotation_zero), pose.rotation),
+                pose.rotation, quat_conjugate(rotation_zero)),
         )
     if not relabel:
         return pose

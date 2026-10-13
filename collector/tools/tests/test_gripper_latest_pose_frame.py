@@ -177,9 +177,12 @@ def main() -> int:
               f"{raw_seq}/{lost} vs {controller._pose_raw_seq}/"
               f"{controller._pose_lost_count}")
 
-        # 连续几帧（位姿判据会拒跳变：步长要小）
+        # 连续几帧。步长 20mm：要**同时**满足两个门 —— 大于发布死区
+        # POSE_PUBLISH_DEADBAND_M（3mm，否则发布的是冻结值，这里比的是
+        # 发布出口，不是换算本身）且远小于跳变门限值（dt=1s ⇒ 上限受
+        # POSE_MAX_LINEAR_SPEED_MPS 约束），别再用 1-2mm 的小步。
         for index in range(1, 6):
-            spot = (0.1 + 0.002 * index, 0.2, 0.3 + 0.001 * index)
+            spot = (0.1 + 0.02 * index, 0.2, 0.3 + 0.01 * index)
             feed(controller, counters, 1.0 + index, spot)
             expect = expected_published(spot)
             now = controller.read_latest_pose()[0]

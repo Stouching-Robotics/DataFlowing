@@ -71,7 +71,14 @@ class DevicePanel(QWidget):
         self._refresh_hint = QLabel(tr("双击设备可重命名"))
         self._refresh_hint.setStyleSheet(
             f"color:{settings.COLOR_TEXT_HINT}; font-size:10px;")
+        # 必须换行：不换行的 QLabel 其 minimumSizeHint 就是整行文字宽
+        # （中文 + 夹爪在场时这句长达 289px），会成为面板/停靠栏的硬地板，
+        # 栏宽只能越拖越宽、拖不小（2026-10-13）。
+        self._refresh_hint.setWordWrap(True)
         layout.addWidget(self._refresh_hint)
+
+        # 允许被拖到很窄（一行图标 + 勾选框）；实际下限口径见 settings
+        self.setMinimumWidth(settings.DEVICE_DOCK_MIN_WIDTH)
 
         self._items: dict = {}            # device key → QTreeWidgetItem
         self._last_check: dict = {}       # device key → 上次勾选状态（挡文字类变化）

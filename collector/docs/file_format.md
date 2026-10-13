@@ -63,7 +63,9 @@ fnum  = (N - 1) % 1000      # 三位零起：episode-000 .. episode-999
   写下 `meta/recycled_episode.json` 标记（§7.5），下一次录制优先复用该号
   （即使进度水位已跑在前面也不跳号）；正常完成即清标记。**删除（含上传后
   自动删除）不回退**：已完成的 episode 序号永不复用（服务器已持有该号）。
-  删除即彻底删除（v1.1.2 起无 `_trash/` 回收区）。
+  删除即彻底删除（v1.1.2 起无 `_trash/` 回收区）；2026-10-12 起删完**校验**
+  三处（videos/data/meta 行）确实不在，并真删本地录制记录（`pipeline.db`
+  的 recording 行），删不净如实报错。
 - **旧分片命名残留（读侧 MUST 容忍）**：v1.1.0 早期曾用「每 chunk 一个
   分片」，分片文件名 = chunk 自身编号（chunk-000 → file-000.parquet，
   一个文件装该 chunk 内最多 1000 个 episode 的行）。该布局已废除，新写入
@@ -107,13 +109,18 @@ fnum  = (N - 1) % 1000      # 三位零起：episode-000 .. episode-999
 - **`features["observation.<sn>_slam_trajectory"]` 里的 `frame` / `frame_axes`**：
 
   ```json
-  "observation.gripper_1_slam_trajectory": {
+  "observation.slam_trajectory": {
     "dtype": "float64", "shape": [8],
     "encoding": "flat_points_8_txyz_qxyzw",
     "frame": "down_left_forward",
     "frame_axes": {"+X": "down", "+Y": "left", "+Z": "forward"}
   }
   ```
+
+  ★键名带**夹爪前缀**：第 1 台夹爪前缀是空串（列就叫 `observation.slam_trajectory`，
+  上面的例子就是它），第 2 台起才是 `observation.gripper_2_slam_trajectory`。
+  读端请按 `observation.*slam_trajectory` 配，别写死带 `gripper_1_` 的名字——
+  那个键在磁盘上**不存在**。
 
   `frame` 是帧 id，`frame_axes` 是各轴在现实中指向哪（中文名只在 GUI 上，不落盘）。
   两个已知 id：
@@ -123,8 +130,12 @@ fnum  = (N - 1) % 1000      # 三位零起：episode-000 .. episode-999
   | `down_left_forward` | `{"+X":"down","+Y":"left","+Z":"forward"}` | 新帧，**v1.3.13 起的默认** |
   | `right_forward_up` | `{"+X":"right","+Y":"forward","+Z":"up"}` | 旧帧（`X=右/Y=正对/Z=上`） |
 
-  ★注意旧帧的 `+Y` 是 `forward` 而中文叫「正对」不是「前」：两个帧的 `forward`
-  指的是**不同物理方向**，读端别把两个 id 的 `forward` 当成同一个。
+  ★旧帧的 `+Y` 也叫 `forward`（中文写「正对」不是「前」），而它和新帧 `+Z` 的
+  `forward` **是同一个物理方向** —— M 恰好把中间帧 +Y 映到发布帧 +Z（实测映射：
+  旧+X 右→新−Y **右**、旧+Y 正对→新+Z 前、旧+Z 上→新−X **上**；后两项的方向词
+  读的是**落点那个轴是什么方向**，不是新帧同名字母的含义）。所以：
+  **`forward` 可以跨帧等同，轴字母不行**。旧 `+Y` 与新 `+Y` 差 90°（前者正对、
+  后者左），读端别按轴字母把两个帧对齐，要按 `frame_axes` 里的方向词。
 
 **读侧两条硬规则：**
 
@@ -135,9 +146,20 @@ fnum  = (N - 1) % 1000      # 三位零起：episode-000 .. episode-999
    一个任务目录若跨了这次改帧，`info.json` 只能记住**最后写入**的那个帧，
    该任务早期的 episode 会被标错。要逐 episode 精确区分得往 `meta/episodes`
    加列（v1.3.13 未加）。跨线的任务目录请按录制日期切开。
+3. **帧是一回事、姿态相对化是另一回事**：相对化从 ≤1.3.12 起一直是**左乘**
+   `R0ᵀ·R`（锚点体轴系里的 body delta；先在 `process_controller`，v1.3.13 起搬到
+   `protocol.finish_publish_pose`，乘的侧没变），v1.3.14 才改成正确的**右乘**
+   `R·R0ᵀ`。两者只差一个常数共轭（位置/幅度看着都正常，但读端按错的那支解会让
+   **表观旋转轴整体转错**），而 `frame` 与 `app_version` **都分不出**（两个构建
+   都是 `down_left_forward`、`__version__` 都写 `"1.3.13"`）。
+   **新帧**数据已按右乘回填（`data/recordings/UMI_9_29`，逐文件 sha256 记在其
+   rotfix 备份目录的 `MIGRATION.json`）；**旧帧**数据（无 `frame` 键）同样是左乘、
+   本次**没动**，要不要重解释**待判定**。详见 `docs/data.md`。
 
-坐标约定本身（帧的物理含义、`M` 变换、与相机相对化的关系）见本仓库
-`docs/data.md` 的坐标帧一节。
+坐标约定本身（各轴在现实中指向哪、原点与首帧相对化、两套帧 id、回落开关）
+见本仓库 `docs/data.md` 的「SLAM 轨迹的坐标帧」一节。发布侧那张换基矩阵 `M`
+（`core/gripper/slam/protocol.py` 的 `PUBLISH_RELABEL_QUAT` / `PUBLISH_RELABEL_MATRIX`）
+是**实现细节**，`data.md` 里没有、读端也不需要：按 `frame_axes` 解释数值即可。
 
 ## 4. meta/stats.json（任务级全局统计，v1.1.1 契约）
 
@@ -357,8 +379,33 @@ meta/tasks.jsonl                                 # 任务级
 - 导入器以 `info.json.format == "pooled_episodes_v1"` 识别新格式。
 - **HEVC 预压缩**：zip 内 mp4 可能已被再编码为 HEVC（hvc1, CRF30）以缩小体积，
   与 episodes 行 `video_codec`（描述本机原始编码）**不必一致**；mkv 深度永不再编码。
-- 上传删除 = 删该 episode 文件组（videos/data 各 key 本 episode 文件），
-  episodes 行、stats、total_episodes **不回退**。
+- 上传删除 = 删该 episode 文件组（videos/data 各 key 本 episode 文件 + 本段
+  episodes 行文件），删完**校验三处都真的没了**（`pooled_episode_leftovers`），
+  没删净如实报错；stats、total_episodes **不回退**（total_episodes 由下次录制
+  按 `list_task_episodes` 重算），episode 序号永不复用。
+- **删除入口的编号口径**：`delete_pooled_episode`/`delete_local_session` 收的是
+  全局号 **N（1 基）**，和上传器（`episode_chunk_file(N)`）、`UploadManager` 的
+  `(path, episode_index)` 防重键同一口径。文件名里的 `f` 是 **chunk 内 0 基**
+  文件号，**跨 chunk 后 `f + 1` 不再是 N**：chunk-000 满 1000 段就开 chunk-001
+  并从 `episode-000` 重新计数，所以
+
+  ```
+  N = c * 1000 + f + 1        （c = chunk 号，1000 = POOLED_CHUNK_SIZE）
+  ```
+
+  **统一由 `core.helpers.list_task_episodes(task_dir)` 还原**（它按
+  `chunk*POOLED_CHUNK_SIZE + int(f) + 1` 产出全局号，是权威枚举器），不要自己
+  拿文件名拼 N。少 +1 删错段；多 +1 会指向不存在的 N+1（此时「没找到任何文件」
+  被幂等判为已删净而返回 True，界面报成功、文件一个没动）。
+  **f 回绕尤其危险**：chunk-001 出现后再取「最大文件名 f + 1」，得到的是
+  chunk-000 里**真实存在**的前一段（f=0 → N=1），于是静默上传/删除到错的段。
+  lite 的取号口径历史上错过两次：先是**少 +1**（返回 0 基文件号 f 当 N 用），
+  改成 `max(f) + 1` 后又在跨 chunk 时**回绕**；两处都已修成走
+  `list_task_episodes`（`tools/tests/lite_delete_test.py` 第 1/4/6 节分别钉
+  「ep 是全局 N」「单段目录 ep=1 不是 0」「跨 chunk 的 ep=1001 不是 1」）。
+  `_delete_after_upload` 本身一直是原样透传（没有 +1 可去），变的一直是它上游
+  的取号口径。旧格式（`data/` 下没有任何 `chunk-*/episode-*.parquet`）按整目录
+  处理，取号返回 0。
 
 ## 10. 关键点镜像布局（keypoints_output/）
 

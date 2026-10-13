@@ -23,8 +23,14 @@
   一个常数 M（约 120°）——用户判"跟随夹爪的坐标轴还没改"。
 - **原点那一瞬发布姿态 = M·Mᵀ = 单位矩阵**：夹爪三箭头与世界三箭头
   重合，这是"一眼看出用的是哪一帧"的判据（第 4 节钉住）。
+- 相对化是**右乘** R0⁻¹（世界系相对姿态 R·R0⁻¹），**不是左乘**：左乘
+  R0⁻¹·R 得到的是"锚点体轴系里的相对转动"，两者只差一个常数共轭，却会让
+  视图里看得见的**旋转轴整体转错**（v1.3.13 的 bug，锚点 R0 = R_x(−90°) 时
+  恰好是绕发布帧 Y 轴 90°：Y 是不动轴所以只有它是对的，X 与 Z 被对调并翻号
+  —— 用户实测"绕 X → 表观绕 Z 同向、绕 Z → 表观绕 X 反向、绕 Y 正常"）。
+  第 10 节钉相对化的语义，第 11 节钉用户的验收判据「表观旋转轴 == 显示轴」。
 - 相对化与重标的**顺序不再影响结果**：共轭让 M 在两步里都自消，
-  (M·R0·Mᵀ)ᵀ(M·R·Mᵀ) = M·R0ᵀ·R·Mᵀ 与"先相对化再重标"逐元素相同。
+  (M·R·Mᵀ)(M·R0·Mᵀ)ᵀ = M·R·R0⁻¹·Mᵀ 与"先相对化再重标"逐元素相同。
   第 5 节把这条等价性钉住（旧版顺序是雷，v1.3.13 第二版起不是了）。
 
 物理验收判据（第 1、2 节）：正对→+Z、左→+Y、下→+X、右→−Y、上→−X。
@@ -230,13 +236,13 @@ def main():
     #   而位置已换帧，GUI 的夹爪模型会画成转了 90° 的姿势。）
     mid_t0b = relabel_published_frame(mid_t0)
     mid_t1b = relabel_published_frame(mid_t1)
-    swapped = quat_product(quat_conjugate(mid_t0b.rotation), mid_t1b.rotation)
+    swapped = quat_product(mid_t1b.rotation, quat_conjugate(mid_t0b.rotation))
     if not np.allclose(quat_to_matrix(*swapped), R1, atol=1e-12):
         failures.append("顺序等价性不成立：先重标再相对化给出了不同姿态")
     # 反向钉死两条：①去掉右乘（旧实现只左乘 M）必须给出**不同**的答案，
     # 否则"体轴也改了名"这件事没有回归保护；②旧实现在原点那一瞬是常数 M
     # —— 正是用户看到"跟随夹爪的坐标轴还没改"的原因。
-    rel_q = quat_product(quat_conjugate(mid_t0.rotation), mid_t1.rotation)
+    rel_q = quat_product(mid_t1.rotation, quat_conjugate(mid_t0.rotation))
     left_only = quat_to_matrix(*quat_product(q_M, rel_q))
     if np.allclose(left_only, R1, atol=1e-12):
         failures.append("体轴改名没生效：只左乘 M 与左右各乘一次结果相同")
@@ -337,13 +343,15 @@ def main():
             break
 
     # 10. 原点相对化：首帧姿态 q0（含部署校正/启动朝向的任意常数
-    #     旋转），此后 q0⁻¹⊗q 应还原为相对原点的真实转动；再重标
-    #     之后发布姿态 = M·(相对转动)
+    #     旋转），此后**右乘** q0⁻¹ 应还原为相对原点的真实转动（世界系
+    #     相对姿态 q⊗q0⁻¹）；再重标之后发布姿态 = M·(相对转动)·Mᵀ。
+    #     ⚠左乘 q0⁻¹⊗q 不是"另一种写法"，它是"锚点体轴系里的增量"，
+    #     差一个常数共轭 ⇒ 视图里看得见的旋转轴整体转错（第 11 节）。
     for i in range(200):
         q0r = random_unit_quaternion(rng)
         q_rel = random_unit_quaternion(rng)
-        q = quat_product(q0r, q_rel)
-        recovered = quat_product(quat_conjugate(q0r), q)
+        q = quat_product(q_rel, q0r)          # 世界系：R = R_rel·R0
+        recovered = quat_product(q, quat_conjugate(q0r))
         if not np.allclose(recovered, q_rel, atol=1e-12):
             failures.append(f"#{i} 相对化未还原相对转动")
             break
@@ -355,6 +363,74 @@ def main():
             failures.append(f"#{i} 发布姿态应为 M·(相对转动)·Mᵀ")
             break
 
+    # 11. ★验收判据：位姿视图里"看得见的"旋转必须与物理转动同轴同向★
+    #     视图画的是 R_pub·(M·v)（体轴箭头 = R_pub 的三列），眼睛看到的表观
+    #     旋转 = R_pub(t)·R_pub(0)ᵀ；锚点那一瞬发布姿态是单位矩阵，所以它就
+    #     等于 R_pub(t) 本身。物理上绕"显示出来的第 k 根轴"转 deg，在中间帧里
+    #     就是绕 a = Mᵀ·e_k 左乘 ΔR（世界系转动，物理动作决定的就是它）。
+    #     修好后表观旋转必须恰好 = 绕 e_k 转 deg，**与锚点 R0 无关**。
+    #     （v1.3.13 的左乘相对化在这里给出 +Z / +Y / −X，R0 = R_x(−90°) 时
+    #       正是用户实测的三条，见下面那条反向钉。）
+    def world_rot_quat(axis, deg):
+        a = np.asarray(axis, dtype=float)
+        a = a / np.linalg.norm(a)
+        half = math.radians(deg) / 2.0
+        return (math.sin(half) * a[0], math.sin(half) * a[1],
+                math.sin(half) * a[2], math.cos(half))
+
+    # q0 = R_x(−90°)（真机锚点，= 第 4 节的 mid0）在前，随机锚点在后 ——
+    # 两条都要过：修好后表观轴与 R0 无关。
+    anchor_qs = [(-c, 0.0, 0.0, c)] + [random_unit_quaternion(rng)
+                                       for _ in range(3)]
+    for j, q0r in enumerate(anchor_qs):
+        for k in range(3):
+            for deg in (30.0, -30.0):
+                a = M.T @ np.eye(3)[k]        # 显示轴 e_k 对应的物理轴
+                q1 = quat_product(world_rot_quat(a, deg), q0r)
+                pub1 = finish_publish_pose(
+                    PoseSample(position=(0.0, 0.0, 0.0), rotation=q1,
+                               timestamp=2.0), q0r)
+                apparent = quat_to_matrix(*pub1.rotation)
+                want = quat_to_matrix(*world_rot_quat(np.eye(3)[k], deg))
+                if not np.allclose(apparent, want, atol=1e-9):
+                    failures.append(
+                        f"锚点#{j} 绕显示 {'XYZ'[k]} 轴 {deg:+.0f}° 的表观旋转"
+                        f"不是同轴同向：\n实际\n{np.round(apparent, 6)}\n"
+                        f"应为\n{np.round(want, 6)}")
+                    break
+    # 反向钉：左乘 R0⁻¹（v1.3.13 的 bug）在真机锚点 R_x(−90°) 下把表观转轴
+    # 按 `R_y(−90°)·(显示轴)` 搬走、角度符号不变 —— 逐条就是用户实测的
+    # 「绕 X → 绕 Z 同向、绕 Z → 绕 X 逆向、**绕 Y 不动**」。
+    # 第 0、2 根轴必须**对不上**（否则上面的验收判据是"两种写法都能过"的空
+    # 断言），第 1 根轴必须**恰好重合**（Y 正是那个搬运旋转的不动轴 —— 用户
+    # 看到的"只有绕 Y 是正常的"就是这一行）。
+    Rbug = np.array([[0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]])
+    q0r = anchor_qs[0]
+    for k in range(3):
+        a = M.T @ np.eye(3)[k]
+        q1 = quat_product(world_rot_quat(a, 30.0), q0r)
+        bug = quat_product(quat_conjugate(q0r), q1)    # 左乘相对化
+        bug_pub = quat_to_matrix(*quat_product(
+            quat_product(q_M, bug), quat_conjugate(q_M)))
+        if not np.allclose(
+                bug_pub,
+                quat_to_matrix(*world_rot_quat(Rbug @ np.eye(3)[k], 30.0)),
+                atol=1e-9):
+            failures.append(
+                f"左乘相对化的错法不是预期的 R_y(−90°) 搬运（显示轴 k={k}）")
+            continue
+        same = np.allclose(
+            bug_pub,
+            quat_to_matrix(*world_rot_quat(np.eye(3)[k], 30.0)), atol=1e-9)
+        if k == 1 and not same:
+            failures.append(
+                "绕 Y 的转动本该不受左乘 bug 影响（Y 是搬运旋转的不动轴）"
+                "—— 用户实测「只有绕 Y 正常」就靠这条")
+        if k != 1 and same:
+            failures.append(
+                f"绕 {'XYZ'[k]} 的 bug 竟然给出正确表观旋转 —— "
+                "上面的验收判据是空断言")
+
     if failures:
         print("FAIL:")
         for f in failures[:5]:
@@ -363,7 +439,8 @@ def main():
     print("PASS: 发布帧(+X下/+Y左/+Z前) 数学性质全部通过"
           "（轴映射/物理轴复现/200 随机位姿 M·R_z90·R·Mᵀ/首帧=单位阵即"
           "体轴与世界轴在原点重合/★体轴改名+顺序等价★/双应用与M³/"
-          "时基透传/轨迹等距/四元数积/原点相对化）")
+          "时基透传/轨迹等距/四元数积/原点相对化=右乘R0⁻¹/"
+          "★表观旋转轴==显示轴（用户验收判据）★）")
     return 0
 
 

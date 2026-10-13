@@ -422,7 +422,7 @@ venv/bin/python tools/audit_frame_gaps.py [任务目录] [选项]   # 默认 dat
 
 ## tests/ 测试
 
-测试脚本见 `tools/tests/`（当前 73 份；离线测试加 `QT_QPA_PLATFORM=offscreen` 无需任何硬件，真机测试需对应设备在线）。完整运行命令见 `README.md` 测试节。**下表只列了一部分**（早期 16 份 + 帧空洞相关的 5 份 + 夹爪配对/离线入口 + 位姿坐标帧的 5 份），其余按需现查文件名。
+测试脚本见 `tools/tests/`（当前 79 份；离线测试加 `QT_QPA_PLATFORM=offscreen` 无需任何硬件，真机测试需对应设备在线）。完整运行命令见 `README.md` 测试节。**下表只列了一部分**（早期 16 份 + 帧空洞相关的 5 份 + 夹爪配对/离线入口 + 位姿坐标帧的 5 份 + 删除真删除的 3 份 + 发布死区/跳变门的 3 份），其余按需现查文件名。
 
 | 文件 | 类型 | 一句话 |
 | --- | --- | --- |
@@ -436,6 +436,7 @@ venv/bin/python tools/audit_frame_gaps.py [任务目录] [选项]   # 默认 dat
 | `glove_widget_test.py` | 离线 | 手套控件配置路由 |
 | `grid_drag_fps_test.py` | 离线 | 网格拖拽/分割条 |
 | `device_panel_gui_smoke_test.py` | 离线 | 设备面板 GUI 冒烟 |
+| `device_dock_collapse_test.py` | 离线 | 设备检测栏 缩小/隐藏（栏宽地板回归哨兵 + ×/菜单收起 + 偏好持久化） |
 | `test_device_detector.py` | 离线 | 设备枚举 |
 | `d405_worker_test.py` | 真机 | D405 采集 worker |
 | `d435_e2e_test.py` | 真机 | D435 端到端 |
@@ -454,3 +455,9 @@ venv/bin/python tools/audit_frame_gaps.py [任务目录] [选项]   # 默认 dat
 | `test_gripper_slam_columns.py` | 离线 | SLAM 落盘列契约：**只落 `slam_trajectory`、不再落 `slam_pose`**（后者是被 26.5% 填零的定长 `[0]*7`，下游会把零当真实位姿） |
 | `test_gripper_latest_pose_frame.py` | 离线 | 原生帧 → 发布帧的实际差值就是那张 M（位置 `M·Rz(+90°)`、姿态还多一层体轴改名 `Mᵀ`），拿真数据比对而不是复述公式 |
 | `test_pose_view_qt.py` | 离线 | 位姿视图：轨迹常驻、世界轴与**跟随夹爪的三箭头**重合且标签带方向词、三箭头取**列**（体轴）不取行、夹爪模型换基后逐像素不变、主窗口那次四元数→矩阵转换把帧带上 |
+| `test_pose_publish_deadband.py` | 离线 | 发布死区语义：AR(1) 静止游走被冻结（>95% 帧保持、且保持的是上次的值）、慢速移动照常推进且误差不超死区、真实会话回放（`logs/` 不入库时会 SKIP，别把 SKIP 读成 PASS） |
+| `test_gripper_pose_deadband_publish.py` | 离线 | 死区真接在**发布出口**（`_publish_pose`）：静止发旧值、节拍/序号/丢失计数不变、每个发布值都是某帧原始值的发布帧像（替换而非插值/平均）、重锚丢参照、开机日志有那行可验收 |
+| `test_pose_guard_limits.py` | 离线 | 跳变门夹在实测包络中间（真实单步 ≤0.0601m 放行 / 异常 ≥0.1075m 拦下）、限值不再随 20/20/60ms 抽帧膨胀、native `kPose*` 与 Python 常量逐字一致 |
+| `test_local_delete.py` | 离线 | 删除即真删除：池化一段的三处文件（data/视频/meta）都清掉且不牵连邻居、删不掉时 `False` + 残留清单 + 中文报错而不是假装删掉、旧格式会话目录 rmtree 复检、录制行真删（含尾斜杠归一化、空路径 0 行） |
+| `test_task_delete.py` | 离线 | 任务页「🗑 删除」= 真删目录 + 真删录制行 + 只留 `hidden` 墓碑（确认框写明目录与片段数）；目录删不掉时**不隐藏任务**并弹窗报错 |
+| `lite_delete_test.py` | 离线 | lite 上传后删除的编号回归：列表 ep 与删除入参都必须是**全局号 N**（`_episode_max` 要把文件号 +1；`_delete_after_upload` 不许再加工——多 +1 会指向不存在的 N+1，残留复检空集 → 报成功却一个文件没删）、单段目录只删该段不 rmtree、无 parquet 的旧目录整目录删 |

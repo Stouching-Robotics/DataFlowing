@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 import os
-import shutil
 import threading
 from typing import Optional
 
@@ -511,30 +510,29 @@ class UploadDialog(QDialog):
 
     def _delete_after_upload(self, session_path: str, episode_index: int):
         """后台线程删除本地上传件：池化 = 彻底删除该 episode 文件组
-        （不走 _trash），旧格式会话目录 = 整目录删除。完成后经信号回
-        主线程收尾。"""
+        （不走 _trash），旧格式会话目录 = 整目录删除；两者都做删除后校验。
+        完成后经信号回主线程收尾。"""
         def _run():
-            err = ""
-            try:
-                if episode_index > 0:
-                    from core.helpers import delete_pooled_episode
-                    delete_pooled_episode(session_path, episode_index)
-                else:
-                    shutil.rmtree(session_path)
-            except Exception as e:   # noqa: BLE001 — 收尾线程兜底上报
-                err = str(e)
-            self._session_deleted.emit(session_path, err, episode_index)
+            from core.helpers import delete_local_session
+            ok, err = delete_local_session(session_path, episode_index)
+            self._session_deleted.emit(session_path, "" if ok else err,
+                                       episode_index)
         threading.Thread(target=_run, daemon=True).start()
 
     def _on_session_deleted(self, session_path: str, err: str, episode_index: int):
-        """删除收尾：失败只提示；成功标记录制记录并刷新列表。"""
+        """删除收尾：失败只提示；成功真删录制记录并刷新列表。"""
         name = self._pair_name((session_path, episode_index))
         if err:
             self._status_label.setText(
                 tr("[错误] 上传后自动删除失败: {}", f"{name} ({err})"))
             return
-        RecordingRepo.mark_uploaded_deleted(
-            session_path, episode_index=episode_index)
+        try:
+            RecordingRepo.delete_local_episode(
+                session_path, episode_index=episode_index)
+        except Exception as e:   # noqa: BLE001 — 文件已删净，记录删失败只提示
+            self._parent_log(
+                tr("[错误] 本地文件已删除，录制记录删除失败: {}",
+                   f"{name} ({e})"))
         self._refresh_list()
         self._status_label.setText(
             tr("☁ 上传完成，本地文件已删除: {}", name))

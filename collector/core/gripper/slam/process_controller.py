@@ -22,8 +22,9 @@ from core.gripper.runtime.device_access import device_access_guard, FAYS_SDK_INI
 from config import settings as app_settings
 
 from .protocol import (
-    FAYS_STAGE_KEYS, PoseSample, finish_publish_pose, parse_slam_line,
-    pose_rejection_reason, rotate_pose_z90,
+    FAYS_STAGE_KEYS, POSE_PUBLISH_DEADBAND_M, PoseSample, finish_publish_pose,
+    parse_slam_line, pose_below_deadband, pose_rejection_reason,
+    rotate_pose_z90,
 )
 
 
@@ -314,13 +315,18 @@ class SlamProcessController:
         self._pose_buffer_lock = threading.Lock()
         self._last_accepted_pose = None
         self._pose_rejecting = False
+        # 死区参照：**上次真正发布出去的位置**（发布帧）。保持期间**不更新**
+        # 它 —— 累计位移要一直算到超过死区才换值（见 _publish_pose）。
+        self._last_published_position = None
         # 原点后姿态相对化：设原点事件后捕获首帧**中间帧**姿态作为
-        # 基准，此后所有姿态左乘基准的逆 → 中间帧第一帧恒为单位矩阵，
+        # 基准，此后所有姿态**右乘**基准的逆（R·R0ᵀ = 世界系相对姿态；左乘
+        # 算出来的是锚点体轴系里的增量，差一个常数共轭、表观旋转轴整体转错）
+        # → 中间帧第一帧恒为单位矩阵，
         # 帧轴与轨迹同基准（相对原点），见 _publish_pose。
         # ★ 基准活在中间帧（rotate_pose_z90 的输出）里，**不是**发布帧。
         #   字段名里的 _mid 就是提醒这件事，改名前先读 _publish_pose。
         #   顺序本身自 v1.3.13 起不再敏感（姿态左右各乘一次 M 之后，
-        #   M 在两步相遇处整个约掉，(M·R0·Mᵀ)ᵀ(M·R·Mᵀ) 与先相对化再重标
+        #   M 在两步相遇处整个约掉，(M·R·Mᵀ)(M·R0·Mᵀ)ᵀ 与先相对化再重标
         #   逐元素相同，有回归钉着）；但基准必须与**进来的样本**同帧才好
         #   推理，而样本在这一步还是中间帧 —— 所以基准就留在中间帧。
         self._pose_rotation_zero_mid = None
@@ -436,6 +442,7 @@ class SlamProcessController:
             self._initial_origin_generation = None
             self._last_accepted_pose = None
             self._pose_rejecting = False
+            self._last_published_position = None
             self._last_pose_reject_log = float("-inf")
             self._fays_rates_alarm.reset()
             self._pose_raw_seq = 0
@@ -847,7 +854,7 @@ class SlamProcessController:
         # 发布帧自 v1.3.13 起是中间帧再叠一次世界重标，环境变量可回落。
         # ★ 相对化与重标的先后顺序自 v1.3.13 起**不再敏感**：姿态是左右各
         #   乘一次 M·R·Mᵀ，两步一倒 M 会在相遇处整个约掉，
-        #   (M·R0·Mᵀ)ᵀ(M·R·Mᵀ) == M·R0ᵀ·R·Mᵀ（回归钉在
+        #   (M·R·Mᵀ)(M·R0·Mᵀ)ᵀ == M·R·R0ᵀ·Mᵀ（回归钉在
         #   tools/tests/test_gripper_pose_axes.py 第 5 节）。改动之前那个
         #   "反过来就少换一次帧、夹爪跟轨迹差 90°" 的坑已经不在了。
         #   finish_publish_pose 仍是唯一入口，因为它同时管着锚定与要不要重标。
@@ -862,11 +869,11 @@ class SlamProcessController:
         # 原点后姿态相对化：C++ 设原点只把位置归零，静止首帧的姿态
         # 仍带部署校正/启动朝向的常数旋转（旋转跳变的根源，两轮
         # 变换形式修正都没能抵消它）。改为捕获首帧**中间帧**姿态为基准，
-        # 全部姿态左乘基准的逆 → 中间帧首帧恒为单位矩阵（帧轴与世界
-        # 轴对齐，不跳变），此后姿态 = 相对原点的真实转动，与轨迹
+        # 全部姿态**右乘**基准的逆（R·R0ᵀ）→ 中间帧首帧恒为单位矩阵（帧轴与
+        # 世界轴对齐，不跳变），此后姿态 = 相对原点的真实转动，与轨迹
         # （位置相对原点）同基准。位置不动，保持已验证的轨迹映射。
         #
-        # 基准捕获与左乘都必须留在中间帧里 —— 基准是拿来跟**进来的样本**
+        # 基准捕获与右乘都必须留在中间帧里 —— 基准是拿来跟**进来的样本**
         # 直接相乘的，样本走到这一步还是中间帧，基准就得同帧（字段名里的
         # _mid 就是这个约束）。
         # ⚠ 别再照抄老注释说"提到前面会让发布帧退回中间帧"：自 v1.3.13
@@ -882,6 +889,20 @@ class SlamProcessController:
             self._pose_rotation_zero_mid,
             relabel=self._publish_relabel,
         )
+        # 极小幅度噪声死区（最小可报告位移，见 protocol.POSE_PUBLISH_DEADBAND_M）：
+        # 静止时估计器的毫米级游走单帧远在跳变限值之下，跳变门管不着，于是
+        # 轨迹末端在放大视图里持续微抖。位移不足死区时**发布上次的值**——
+        # 不是像跳变门那样不发布：采样节拍、时间戳、落盘的 slam_trajectory
+        # 逐点时刻全部保持不变，只是值冻结，下游按时间对齐/回放那套契约
+        # 一个字都不动（轨迹是按发布位置追加的，冻结值 = 末端点不再加噪声）。
+        # 姿态这一路不动：静止姿态游走峰峰 p50 0.25°/max 1.80°（另一会话
+        # 3.46°，出处见 protocol.py 的 POSE_PUBLISH_DEADBAND_M 注释），比
+        # 位置更该镇，但按死区量化会把真实慢转也切成一档一档，得不偿失
+        # （要动先测清楚再动）。
+        if pose_below_deadband(pose.position, self._last_published_position):
+            pose = replace(pose, position=self._last_published_position)
+        else:
+            self._last_published_position = pose.position
         self._on_pose(pose)
         timestamp = pose.timestamp
         x, y, z = pose.position
@@ -974,6 +995,13 @@ class SlamProcessController:
             return
         if event.kind == "ready":
             self._set_state(status="READY - Press ENTER")
+            # 死区生效与否必须**在画面上能确认**：开机时把当次生效值打进日志。
+            # 用户是拿 GUI 验收的（静止时轨迹线/末端点还抖不抖），没有这一行
+            # 就只能靠"感觉没变"来判断，而感觉分辨不出 3mm。
+            self._log(
+                f"[SLAM] 发布位姿死区 {POSE_PUBLISH_DEADBAND_M * 1000:.1f}mm："
+                "静止时的毫米级游走不再进轨迹/落盘（真实移动不量化）"
+            )
             if self._auto_origin:
                 self.send_origin("initial origin")
             else:
@@ -982,10 +1010,14 @@ class SlamProcessController:
         if event.kind == "origin":
             self._last_accepted_pose = None
             self._pose_rejecting = False
+            # 重设原点 = 发布位置整体换锚（当前位姿归零），死区参照必须一起
+            # 丢：否则会拿旧锚下的位置去比新锚下的位置，差出来的那段锚位移
+            # 会把首帧顶掉或反过来冻住首帧。
+            self._last_published_position = None
             # 位置在原点帧被 C++ 归零，姿态却带着部署校正/启动朝向的
             # 常数残留（上次跳变的根源）；每个 origin 事件（含 NEW
             # ORIGIN）都重新捕获首帧姿态基准，与位置重归零保持一致。
-            # 重新锚定后发布帧的首帧姿态是**单位矩阵**（相对化 R0ᵀ·R 再
+            # 重新锚定后发布帧的首帧姿态是**单位矩阵**（相对化 R·R0ᵀ 再
             # 左乘 M、右乘 Mᵀ 给体轴改名，M·Mᵀ = I）——夹爪体轴与世界轴
             # 在原点那一瞬重合，跟位置的"首帧就是原点"一致。
             # ⚠只左乘不右乘（v1.3.13 之前）时它是常数 M，那才是要留心的

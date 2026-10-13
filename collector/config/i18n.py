@@ -32,6 +32,12 @@ _TRANSLATIONS = {
     "清空日志":                   {"en": "Clear Log",                     "zh": "清空日志"},
     "刷新历史记录":               {"en": "Refresh History",               "zh": "刷新历史记录"},
     "重置画面大小":               {"en": "Reset Camera Sizes",            "zh": "重置画面大小"},
+    "设备检测栏":                 {"en": "Device Panel",                  "zh": "设备检测栏"},
+    "显示/收起左侧设备检测栏（也可点它标题栏的 × 收起）": {
+        "en": "Show/collapse the left device panel "
+              "(or click the × on its title bar)",
+        "zh": "显示/收起左侧设备检测栏（也可点它标题栏的 × 收起）",
+    },
     "帮助(&H)":                  {"en": "&Help",                         "zh": "帮助(&H)"},
     "关于":                      {"en": "About",                         "zh": "关于"},
     "语言(&L)":                  {"en": "&Language",                     "zh": "语言(&L)"},

@@ -43,7 +43,8 @@ config/ 是应用全局配置、国际化与版本号所在的配置包。版本
 | `_camera_slot_name` | `(index: int) -> str` | OpenCV 设备索引 → EgoData 槽位名 | 0→`head_left_rgb`，1→`head_right_rgb`，2+→`head_right_rgb_N` |
 | `_camera_slot_name_legacy` | `(index: int) -> str` | 旧 LeRobot v3 会话命名兼容 | 0→`head_rgb`，其余→`head_rgb_N` |
 | `realsense_profile` | `(model_name: str) -> dict` | 按型号名（子串匹配）查 `REALSENSE_PROFILES` | 返回该型号配置；未收录回落 D435 默认配置 |
-| `_load_server_config` / `_save_server_config` | `() -> dict` / `(data: dict)` | 读 / merge-write `server_config.json` | 异常或不存在返回 `{}`；写盘保留旧字段 |
+| `_load_server_config` / `_save_server_config` | `() -> dict` / `(data: dict)` | 读 / merge-write `server_config.json` | 异常或不存在返回 `{}`；写盘保留旧字段；**离屏/无头进程（`QT_QPA_PLATFORM=offscreen\|minimal`）写默认真实路径时拒写并告警**（见 `_ui_prefs_writable`），返回值 = 是否真落盘 |
+| `_ui_prefs_writable` | `() -> bool` | 本次写入是否允许落到**用户真实**的 `server_config.json` | 显式重定向过 `SERVER_CONFIG_FILE`（测试/探针惯例）→ 放行；否则离屏进程拒写。防的是「离屏脚本建真 `MainWindow` → `closeEvent` 落盘 → 把用户的设备栏偏好改成已收起」这类污染（2026-10-13 实际发生过两次） |
 | `load_server_url` / `save_server_url` | `() -> str` / `(url: str)` | 读 / 存用户服务器地址 | 无保存值或空串时返回出厂默认 `SERVER_URL` |
 | `load_credentials` / `save_credentials` | `() -> tuple[str, str]` / `(username, password)` | 读 / 存登录凭据 | 返回 `(username, password)` |
 | `load_upload_auto_sync` / `save_upload_auto_sync` | `() -> bool` / `(on: bool)` | 读 / 存"录制完成后自动上传"开关 | 缺省默认 `True`（沿用历史行为） |
@@ -121,7 +122,7 @@ config/ 是应用全局配置、国际化与版本号所在的配置包。版本
 
 **JSON 字段约定**（由本模块的读写函数定义）：
 
-- `data/server_config.json`：`server_url`（str）、`username`（str）、`password`（str）、`upload_auto_sync`（bool，缺省 `True`）、`upload_delete_after`（bool，缺省 `False`）、`device_dock`（dict，设备检测栏的 `{"visible": bool, "width": int}`，缺省 `{"visible": True, "width": 240}`）。
+- `data/server_config.json`：`server_url`（str）、`username`（str）、`password`（str）、`upload_auto_sync`（bool，缺省 `True`）、`upload_delete_after`（bool，缺省 `False`）、`device_dock`（dict，设备检测栏的 `{"visible": bool, "width": int}`，缺省 `{"visible": True, "width": 240}`；**只有真实 GUI 进程会写这个文件**，离屏测试/探针写默认真实路径时被 `_ui_prefs_writable` 挡下 —— 要断言落盘请先把 `settings.SERVER_CONFIG_FILE` 指到临时文件）。
 - `data/device_names.json`：key = `DeviceInfo.stable_key`（形如 `"uvc:{by-id前缀}"` / `"uvc:usb-1-5"`（无 by-id 链接、或该前缀被同型号多台共用而归属会翻转时，退到 USB 拓扑路径）/ `"d435:{serial}"` / `"ble:{MAC}"` 等），value = `{"name": str, "sensor"?: str}`（`sensor` 仅 `data_ble` 设备用，绑定 parquet 列名 `right_glove`/`left_glove`，按 MAC 持久化）；旧版纯字符串自动升级为 `{"name": …}`。
 - `data/device_params.json`：key 同 `stable_key`，value = `{"exposure": {"auto": bool, "value": float}, "original": {同结构}}`；`auto=True` 时 `value` 忽略；`original` 首次看到才写入、之后永不覆盖，供"恢复默认"回到开机原厂曝光。
 

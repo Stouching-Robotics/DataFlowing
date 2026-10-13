@@ -237,6 +237,31 @@ COLOR_BTN_DISABLED_TEXT = "#616161"   # 禁用按钮文字
 # 出厂默认占位地址；实际地址由用户在页面中填写并持久化到 server_config.json。
 SERVER_URL = "http://127.0.0.1:8000"
 SERVER_CONFIG_FILE = os.path.join(DATA_DIR, "server_config.json")
+# 出厂默认路径（下面 _ui_prefs_writable 用它判断「用户真实配置」）
+_DEFAULT_SERVER_CONFIG_FILE = SERVER_CONFIG_FILE
+
+# 离屏/无头平台名：这类进程只可能是测试、探针或验证脚本，不可能是用户真在
+# 用的界面，因而不该把偏好写进真实配置。
+_OFFSCREEN_PLATFORMS = ("offscreen", "minimal")
+
+def _ui_prefs_writable() -> bool:
+    """判断本次写入是否允许落到**用户真实的** server_config.json。
+
+    为什么需要这道闸（2026-10-13）：凡是 `MainWindow()` 的离屏脚本/测试，都会走
+    真实的 closeEvent → save_device_dock_prefs()；没显式把 SERVER_CONFIG_FILE
+    指到临时文件的话，就会把「设备栏已收起」写进用户真实配置 —— 用户下次启动
+    设备栏凭空消失。当天被验证 agent 与仓库自带的 d435_gui_smoke_test（关窗 9 次）
+    实际踩过。显式重定向过路径（测试/探针惯例）→ 一律放行，回归测试照旧能断言落盘。
+    """
+    if SERVER_CONFIG_FILE != _DEFAULT_SERVER_CONFIG_FILE:
+        return True
+    platform = os.environ.get("QT_QPA_PLATFORM", "").strip().lower()
+    if platform in _OFFSCREEN_PLATFORMS:
+        print(f"[settings] 离屏进程（QT_QPA_PLATFORM={platform}）不写真实配置 "
+              f"{SERVER_CONFIG_FILE}：测试/探针请先把 settings.SERVER_CONFIG_FILE "
+              f"指到临时文件。", file=sys.stderr)
+        return False
+    return True
 
 def _load_server_config() -> dict:
     """读取 server_config.json，返回完整字典。"""
@@ -250,13 +275,20 @@ def _load_server_config() -> dict:
     return {}
 
 def _save_server_config(data: dict):
-    """持久化 server_config.json（合并写入，保留未传入的旧字段）。"""
+    """持久化 server_config.json（合并写入，保留未传入的旧字段）。
+
+    离屏/无头进程写真实路径时直接放弃（见 _ui_prefs_writable）；返回值表示是否真的
+    落盘，但调用方大多不必关心。
+    """
     import json
+    if not _ui_prefs_writable():
+        return False
     current = _load_server_config()
     current.update(data)
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(SERVER_CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(current, f, ensure_ascii=False, indent=2)
+    return True
 
 def load_server_url() -> str:
     """读取用户保存的服务器地址，若无则返回出厂默认值。"""

@@ -34,7 +34,7 @@
 
 ### ui/main_window.py
 
-**作用**：应用程序主窗口，界面层中枢。组合页面栈（任务选择页 + 数据采集页）、`CameraGrid` 主网格、左侧 `DevicePanel` 设备面板（`_device_dock`：可拖宽/拖窄，带 Closable 故标题栏有 × 可收起；宽度与收起状态经 `server_config.json` 的 `device_dock` 段跨启动保持，恢复入口为「视图 ▸ 设备检测栏」/ Ctrl+D）、底部日志 dock、右侧录制历史 dock、工具栏与菜单；启动时经 `_show_login_flow` 弹 `LoginDialog` 确定账号/游客身份，首次启动经 `_show_guide` 弹 `GuideDialog` 使用说明；持有 `CameraPipeline`、`DeviceScanner`、`TaskService`、`UploadManager` 与 `core.device_manager.DeviceManager` 注册表（`_workers` 为其 `entries` 别名）等核心对象并负责信号接线。所有设备的开启/关闭都经左侧面板开关按 `core.device_manager.dispatch_toggle` 分派到 `_open_*`/`_close_*` 系列方法：S80M 双目子进程 + 管道解析在 `core.s80m_manager.S80MDeviceManager`，D435 worker 生命周期与帧口径在 `core.d435_manager.D435DeviceManager`，手套以 BLE 引擎 + 渲染定时器运行。
+**作用**：应用程序主窗口，界面层中枢。组合页面栈（任务选择页 + 数据采集页）、`CameraGrid` 主网格、左侧 `DevicePanel` 设备面板（`_device_dock`：可拖宽/拖窄，带 Closable 故标题栏有 × 可收起；宽度与收起状态经 `server_config.json` 的 `device_dock` 段跨启动保持，恢复入口为「视图 ▸ 设备检测栏」/ Ctrl+D；只有**用户明确收起**（点 × / 走菜单）才记偏好，正常关窗与最小化不算收起）、底部日志 dock、右侧录制历史 dock、工具栏与菜单；启动时经 `_show_login_flow` 弹 `LoginDialog` 确定账号/游客身份，首次启动经 `_show_guide` 弹 `GuideDialog` 使用说明；持有 `CameraPipeline`、`DeviceScanner`、`TaskService`、`UploadManager` 与 `core.device_manager.DeviceManager` 注册表（`_workers` 为其 `entries` 别名）等核心对象并负责信号接线。所有设备的开启/关闭都经左侧面板开关按 `core.device_manager.dispatch_toggle` 分派到 `_open_*`/`_close_*` 系列方法：S80M 双目子进程 + 管道解析在 `core.s80m_manager.S80MDeviceManager`，D435 worker 生命周期与帧口径在 `core.d435_manager.D435DeviceManager`，手套以 BLE 引擎 + 渲染定时器运行。
 
 **模块级辅助与常量**（v1.0.3 后多为 core 模块的兼容 re-export，离线测试直接 patch 这些名字）：
 
@@ -153,12 +153,13 @@
 | --- | --- | --- | --- |
 | `_on_language_changed` | `(lang)` | 中英文切换：菜单/工具栏/dock 标题/历史表头/手部模式下拉全部 `tr()` 重刷，并调 `_task_page._on_language_changed` | — |
 | `_reset_camera_sizes` | `()` | 视图菜单「重置画面大小」：`grid._rebuild_layout()` 等分 | — |
-| `_apply_device_dock_visibility` | `()` | 设备栏可见性的唯一口径：`当前页==1 且 用户未收起` → `setVisible` + `resizeDocks` 复原宽度；期间置 `_device_dock_syncing` 挡「程序化改动被当成用户收起」 | 末尾同步菜单勾选 |
+| `_apply_device_dock_visibility` | `()` | 设备栏可见性的唯一口径：`当前页==1 且 用户未收起` → 先 `_capture_device_dock_width`（收起前记住栏宽）再 `setVisible`，显示且非浮动态才 `resizeDocks` 复原宽度；期间置 `_device_dock_syncing` 挡「程序化改动被当成用户收起」 | 末尾同步菜单勾选 |
 | `_toggle_device_dock` | `(checked)` | 视图菜单「设备检测栏」/ Ctrl+D：置 `_device_dock_user_hidden` → 应用可见性 → 落盘 | 任务页只记偏好不显示 |
-| `_on_device_dock_visibility` | `(visible)` | 设备栏可见性变化（标题栏 × 收起）：`_device_dock_syncing` 置位或不在采集页时直接返回；否则记用户收起 + 同步菜单 + 落盘 | — |
-| `_sync_device_dock_action` | `()` | 菜单勾选 = 用户是否想看设备栏（与当前页是否显示无关；`blockSignals` 防递归） | — |
-| `_save_device_dock_prefs` | `()` | `settings.save_device_dock_prefs(未收起, 栏宽)`；宽度由 `eventFilter`(Resize) 持续跟随 | closeEvent 也调一次 |
-| `eventFilter` | `(obj, event)` | 仅拦 `_device_dock` 的 `QEvent.Resize` → 记 `_device_dock_width`（拖窄/拖宽后收起或退出时才能落盘正确宽度） | 其余事件走 `super()` |
+| `_on_device_dock_visibility` | `(visible)` | 设备栏可见性变化 → 同步菜单勾选 + 落盘（幂等）。**不从可见性推断用户意图**：关窗/最小化/切页都会让 dock 不可见，把它们当成「用户收起」会让每次正常退出都写坏偏好；`_device_dock_syncing` 置位时直接返回 | 用户收起只由 × 的 Close 认定（见 `eventFilter`） |
+| `_sync_device_dock_action` | `()` | 菜单勾选 = 用户是否想看设备栏（与当前页是否显示无关；`blockSignals` 防递归，C++ action 已删时吞 `RuntimeError`） | — |
+| `_save_device_dock_prefs` | `()` | `_capture_device_dock_width()` 后 `settings.save_device_dock_prefs(未收起, 栏宽)`；**写盘失败只丢一次偏好不抛异常**（PyQt5 虚方法抛异常 = SIGABRT 134，会连带跳过停线程/拆 worker） | closeEvent 也调一次 |
+| `_capture_device_dock_width` | `()` | 抓「此刻真实栏宽」：浮动态（width() 是浮动窗口宽）与不可见时直接返回。**不跟随普通 Resize** —— 窗口缩小/最大化时 Qt 会把 dock 压到最小宽，那不是用户拖出来的宽度 | 收起前 / 退出前各抓一次 |
+| `eventFilter` | `(obj, event)` | 仅拦 `_device_dock` 的 `QEvent.Close` → 置 `_device_dock_user_hidden=True` + 抓栏宽，这是**唯一**认定「用户收起」的地方（点标题栏 × / 右键菜单关闭 / 浮动窗口关闭都走 `close()` 发 Close 事件；而主窗口关闭/最小化只发 Hide，不给 dock 发 Close —— 2026-10-13 实测） | 其余事件走 `super()` |
 | `_update_status` | `()` | 状态栏：摄像机数（排除 `sensor:`/`ble:` 占位槽）+ 录制中标记与颜色 | — |
 | `_process_hand_keypoints` | `(session_path="", silent=False)` | 后台提取手部关键点（`SessionHandProcessor.process_session`，mode 由手套/裸手下拉决定）；已有结果时弹确认（silent 模式跳过）；无路径用最近一条录制 | — |
 | `_on_hand_proc_progress` / `_on_hand_proc_finished` | `(current, total)` / `(session_path, error)` | 进度 → 状态栏+按钮；完成后 300ms 自动触发 `_auto_label`（silent） | — |

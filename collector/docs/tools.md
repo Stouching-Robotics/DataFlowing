@@ -424,6 +424,8 @@ venv/bin/python tools/audit_frame_gaps.py [任务目录] [选项]   # 默认 dat
 
 测试脚本见 `tools/tests/`（当前 79 份；离线测试加 `QT_QPA_PLATFORM=offscreen` 无需任何硬件，真机测试需对应设备在线）。完整运行命令见 `README.md` 测试节。**下表只列了一部分**（早期 16 份 + 帧空洞相关的 5 份 + 夹爪配对/离线入口 + 位姿坐标帧的 5 份 + 删除真删除的 3 份 + 发布死区/跳变门的 3 份），其余按需现查文件名。
 
+⚠️ **任何离屏脚本/一次性探针只要 `MainWindow()`，就必须先把 `settings.SERVER_CONFIG_FILE` 指到临时文件**（`tempfile.NamedTemporaryFile` + 结束时还原）。否则它走的是真实 `closeEvent` → `save_device_dock_prefs()`，会把「设备栏已收起」写进用户真实 `data/server_config.json`，用户下次启动就找不到设备栏（2026-10-13 被验证 agent 与 `d435_gui_smoke_test.py` 实际各踩一次）。`_ui_prefs_writable()` 现在是最后一道闸（离屏 + 默认真实路径 = 拒写 + stderr 告警），但别靠它兜底。
+
 | 文件 | 类型 | 一句话 |
 | --- | --- | --- |
 | `test_playback_multifps.py` | 离线 | 多帧率会话回放 |
@@ -436,7 +438,7 @@ venv/bin/python tools/audit_frame_gaps.py [任务目录] [选项]   # 默认 dat
 | `glove_widget_test.py` | 离线 | 手套控件配置路由 |
 | `grid_drag_fps_test.py` | 离线 | 网格拖拽/分割条 |
 | `device_panel_gui_smoke_test.py` | 离线 | 设备面板 GUI 冒烟 |
-| `device_dock_collapse_test.py` | 离线 | 设备检测栏 缩小/隐藏（栏宽地板回归哨兵 + ×/菜单收起 + 偏好持久化） |
+| `device_dock_collapse_test.py` | 离线 | 设备检测栏 缩小/隐藏（栏宽地板回归哨兵 + ×/菜单收起 + 偏好持久化 + **正常关窗/最小化不得被当成用户收起** + 浮动宽度不污染记忆栏宽 + 配置不可写时退出不 abort + **离屏进程不得写真实配置**） |
 | `test_device_detector.py` | 离线 | 设备枚举 |
 | `d405_worker_test.py` | 真机 | D405 采集 worker |
 | `d435_e2e_test.py` | 真机 | D435 端到端 |

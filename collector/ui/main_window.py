@@ -201,8 +201,9 @@ class MainWindow(QMainWindow):
         self._last_device_kinds: dict = {}      # key → kind（蓝牙刷屏过滤）
 
         # ── 设备检测栏（左侧停靠面板）显示偏好 ────────
-        # user_hidden：用户主动收起（标题栏 × / 视图▸设备检测栏）；任务选择页
-        # 隐藏是页面行为，不算收起。width：栏宽，由 eventFilter 跟随实际 resize。
+        # user_hidden：**用户主动收起**（标题栏 × 的 Close 事件 / 视图▸设备检测栏）；
+        # 任务选择页隐藏、关窗、最小化都只是 Qt 把 dock 藏起来，不算收起。
+        # width：栏宽，只在「收起前 / 退出前」抓一次真实值（见 _capture_device_dock_width）。
         # 二者随 closeEvent / 收起动作持久化到 server_config.json。
         self._device_dock_user_hidden = False
         self._device_dock_width = settings.DEVICE_DOCK_DEFAULT_WIDTH
@@ -397,7 +398,7 @@ class MainWindow(QMainWindow):
         prefs = settings.load_device_dock_prefs()
         self._device_dock_width = prefs["width"]
         self._device_dock_user_hidden = not prefs["visible"]
-        self._device_dock.installEventFilter(self)   # 跟随实际宽度（拖窄后落盘）
+        self._device_dock.installEventFilter(self)   # 认「用户点了 ×」（Close 事件）
         self.resizeDocks([self._device_dock], [self._device_dock_width],
                          Qt.Horizontal)
 
@@ -3084,12 +3085,32 @@ class MainWindow(QMainWindow):
     # ── 设备检测栏：显示 / 收起 / 宽度落盘 ───────────────
 
     def eventFilter(self, obj, event):
-        """跟随设备栏的实际宽度（拖动分割条 → 记住，收起/退出时落盘）。"""
-        if obj is self._device_dock and event.type() == QEvent.Resize:
-            w = self._device_dock.width()
-            if w > 0:
-                self._device_dock_width = w
+        """拦设备栏自己的 Close 事件 —— 这是**唯一**认定「用户收起设备栏」的地方。
+
+        点标题栏 ×（含右键菜单「关闭」、浮动窗口的关闭按钮）走的是
+        `QWidget.close()`，事件发给 dock 本身；而主窗口关闭/最小化时 Qt 只是把
+        dock 藏起来、并不给 dock 发 Close —— 后者曾被当成「用户收起」，导致每次
+        正常退出都把偏好覆写成「已收起」，下次启动设备栏凭空消失。
+
+        顺手在隐藏前抓一次宽度：dock 藏起来之后 width() 就不可信了。
+        """
+        if obj is self._device_dock and event.type() == QEvent.Close:
+            self._device_dock_user_hidden = True
+            self._capture_device_dock_width()
         return super().eventFilter(obj, event)
+
+    def _capture_device_dock_width(self):
+        """记住「此刻的栏宽」。
+
+        只认停靠 + 可见态：浮动态的 width() 是浮动窗口的宽（拖到 430 就把停靠栏
+        记成 430），不可见时读数无意义。也不跟随普通 Resize —— 窗口被缩小/最大化
+        时 Qt 会把 dock 压到最小宽，那不是用户拖出来的宽度。
+        """
+        if self._device_dock.isFloating() or not self._device_dock.isVisible():
+            return
+        w = self._device_dock.width()
+        if w > 0:
+            self._device_dock_width = w
 
     def _apply_device_dock_visibility(self):
         """按「当前页 + 用户是否收起」刷新设备栏可见性。
@@ -3098,10 +3119,12 @@ class MainWindow(QMainWindow):
         """
         show = (self._page_stack.currentIndex() == 1
                 and not self._device_dock_user_hidden)
-        self._device_dock_syncing = True   # 程序化改动 → 不当作用户收起
+        if not show:
+            self._capture_device_dock_width()   # 收起前先记住用户拖到的宽度
+        self._device_dock_syncing = True   # 程序化改动 → 不必再同步/落盘
         try:
             self._device_dock.setVisible(show)
-            if show:
+            if show and not self._device_dock.isFloating():
                 # 隐藏期间改过窗口大小 / 首次显示时，Qt 给的宽度未必是保存值
                 self.resizeDocks([self._device_dock], [self._device_dock_width],
                                  Qt.Horizontal)
@@ -3120,14 +3143,15 @@ class MainWindow(QMainWindow):
         self._save_device_dock_prefs()
 
     def _on_device_dock_visibility(self, visible: bool):
-        """设备栏可见性变化（点标题栏 × 收起）→ 同步菜单勾选 + 记偏好。
+        """设备栏可见性变化 → 同步菜单勾选 + 落盘（幂等，可安全重复调）。
 
-        页面切换与程序化改动期间 _device_dock_syncing=True，任务选择页的
-        隐藏也只是页面行为 —— 两者都不代表用户收起栏，直接返回。
+        ⚠️ 这里**不从可见性推断用户意图**：主窗口关闭/最小化/页面切换都会让
+        dock 变成不可见并触发本信号，把它们当成「用户收起」正是那个每次退出都
+        写坏偏好的 bug。用户收起只由 × 的 Close 事件认定（见 eventFilter）；
+        本信号只负责把菜单勾选与实际状态对齐。
         """
-        if self._device_dock_syncing or self._page_stack.currentIndex() != 1:
-            return
-        self._device_dock_user_hidden = not visible
+        if self._device_dock_syncing:
+            return              # 程序化改动：调用方自己会同步菜单与落盘
         self._sync_device_dock_action()
         self._save_device_dock_prefs()
 
@@ -3136,18 +3160,33 @@ class MainWindow(QMainWindow):
         action = getattr(self, "_device_dock_action", None)
         if action is None:      # _setup_menu 之前的调用（构建期）
             return
-        action.blockSignals(True)
-        action.setChecked(not self._device_dock_user_hidden)
-        action.blockSignals(False)
+        try:
+            action.blockSignals(True)
+            action.setChecked(not self._device_dock_user_hidden)
+            action.blockSignals(False)
+        except RuntimeError:
+            pass                # 关窗后迟到的可见性信号：C++ QAction 可能已删
 
     def _save_device_dock_prefs(self):
         """把设备栏的收起状态与宽度写回 server_config.json。
 
-        宽度取 `_device_dock_width`（由 eventFilter 跟随每次 Resize），不用
-        `self._device_dock.width()` —— 收起瞬间读到的是收起前的旧几何。
+        宽度用 `_capture_device_dock_width` 抓到的最后一次真实栏宽 —— 直接读
+        `self._device_dock.width()`，收起瞬间读到的是收起前的旧几何、浮动态读到
+        的则是浮动窗口宽度。
+
+        写盘失败（配置只读 / 磁盘满）只丢一次偏好，**不能把退出流程带崩**：
+        PyQt5 里虚方法抛异常会直接 abort()，用户看到的是「程序崩溃」而不是干净
+        退出，且后面的停线程/拆 worker 全都不会执行 —— 所以这里兜住。
         """
-        settings.save_device_dock_prefs(not self._device_dock_user_hidden,
-                                        self._device_dock_width)
+        self._capture_device_dock_width()
+        try:
+            settings.save_device_dock_prefs(not self._device_dock_user_hidden,
+                                            self._device_dock_width)
+        except Exception as exc:    # 宁可丢一次偏好，也不能 abort
+            try:
+                self._log(tr("设备栏显示偏好未能保存: {}", exc))
+            except Exception:
+                pass
 
     # ═══════════════════════════════════════════════════
     #  状态栏刷新

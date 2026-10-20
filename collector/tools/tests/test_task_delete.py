@@ -5,6 +5,9 @@
 tasks.json 只留 hidden 墓碑（防后端刷新复活）。删不干净就如实报错且**不隐藏**
 任务（用户能重试）。
 
+2026-10-15：本机任务（source=local）走同一套真删除，但结束后**整条移除**
+记录（后端不会推送它，不需要 hidden 墓碑）；第 4 节覆盖。
+
 用法:
     QT_QPA_PLATFORM=offscreen venv/bin/python tools/tests/test_task_delete.py
 """
@@ -90,11 +93,17 @@ def seed_db(db, task_dir):
     db.conn.commit()
 
 
-def write_tasks(tasks_file: str, hidden: bool = False, name: str = TASK_NAME):
+def write_tasks(tasks_file: str, hidden: bool = False, name: str = TASK_NAME,
+                task_id: str = TASK_ID, source: str | None = None,
+                created_by: str | None = None):
     """写单任务 tasks.json（用例 2 要先把用例 1 的墓碑复原）。"""
-    task = {"id": TASK_ID, "name": name, "status": "in_progress",
+    task = {"id": task_id, "name": name, "status": "in_progress",
             "total_required": 10, "local_count": 2, "synced_count": 2,
             "backend_count": 0}
+    if source:
+        task["source"] = source
+    if created_by:
+        task["created_by"] = created_by
     if hidden:
         task["hidden"] = True
     with open(tasks_file, "w", encoding="utf-8") as f:
@@ -127,6 +136,9 @@ def hidden_in_file(tasks_file: str) -> bool:
 def main():
     root = tempfile.mkdtemp(prefix="task_delete_")
     app = QApplication(sys.argv)
+    # 断言里写的是中文文案；默认语言是英文，这里显式切中文（进程内，不落盘）
+    from config.i18n import lang_manager
+    lang_manager.set_language("zh")
     real_mb = task_page_mod.QMessageBox
     task_page_mod.QMessageBox = FakeMB
     db = None
@@ -190,6 +202,30 @@ def main():
         check(any(k == "warning" and "拒绝删除" in str(t)
                   for k, t in FakeMB.calls), "拒绝删除有弹窗提示")
         check(not hidden_in_file(tasks_file), "拒绝时任务不隐藏")
+
+        print("── 4. 本机任务删除：真删数据 + 整条移除（无墓碑） ──")
+        FakeMB.calls.clear()
+        LOCAL_ID = "local-del-1"
+        write_tasks(tasks_file, name="Local_Del", task_id=LOCAL_ID,
+                    source="local", created_by="guest")
+        task_dir4 = os.path.join(rec_dir, "Local_Del")
+        make_episode(task_dir4, 0)
+        db.conn.execute("DELETE FROM recording")
+        db.conn.commit()
+        seed_db(db, task_dir4)
+        page4 = TaskPage()
+        check(len(page4._tasks) == 1, "本机任务在列表里（用例前提）")
+        page4._table.setCurrentCell(0, 0)
+        check(page4._rename_btn.isEnabled(), "本机任务选中后改名按钮可用")
+        page4._do_delete_task()
+        check(not os.path.isdir(task_dir4), "本机任务录制目录被删除")
+        check(len(db.conn.execute("SELECT 1 FROM recording").fetchall()) == 0,
+              "本机任务录制行被删除")
+        with open(tasks_file, encoding="utf-8") as f:
+            left = json.load(f)["tasks"]
+        check(left == [], "tasks.json 整条移除（不是 hidden 墓碑）")
+        qtext4 = FakeMB.calls[0][1] if FakeMB.calls else ""
+        check("本机任务" in qtext4, "确认框标明本机任务")
     finally:
         task_page_mod.QMessageBox = real_mb
         if db is not None:

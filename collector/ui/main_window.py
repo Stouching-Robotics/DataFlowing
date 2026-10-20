@@ -1054,7 +1054,8 @@ class MainWindow(QMainWindow):
             if record:
                 self._pipeline.write_external_frame(
                     slot_id, display_frame.copy(),
-                    hardware_ns=hardware_ns, imu_samples=imu_batch)
+                    hardware_ns=hardware_ns, imu_samples=imu_batch,
+                    capture_mono_ns=mono)
             # 空桶看门狗：stereo_left 主槽口径（wall 时钟计数，口径在
             # core.s80m_manager.s80m_drop_watch；超阈值弹一次告警）
             if slot_id == "stereo_left":
@@ -1199,7 +1200,7 @@ class MainWindow(QMainWindow):
 
     def _on_d435_frames(self, slot_id: str, frame: np.ndarray,
                         hardware_ns: int = 0, imu_samples: list = None,
-                        dev_key: str = None):
+                        extra: dict = None, dev_key: str = None):
         """接收 D435 帧信号（主线程执行，按 worker 注册表条目分派）。
 
         RGB 槽：显示 + 录制（外部帧源链路）；
@@ -1217,7 +1218,7 @@ class MainWindow(QMainWindow):
         self._note_frame_arrival(slot_id)
 
         display, _is_depth = self._d435_manager.process_frame(
-            entry, slot_id, frame, hardware_ns, dev_key)
+            entry, slot_id, frame, hardware_ns, dev_key, extra)
         w.video_widget.set_frame(display, flip_vertical=False)
 
     def _close_d435(self, dev_key: str):
@@ -1783,8 +1784,12 @@ class MainWindow(QMainWindow):
         if widget:
             widget.video_widget.set_frame(frame, flip_vertical=False)
         if self._pipeline.is_recording:
+            # capture_mono_ns=hw_ns：夹爪链路的 hardware_ns 就是采集回调里
+            # 取的 time.monotonic_ns()（bridge.py），直接当采集时刻用，
+            # 让 timestamp 不再吃录制队列的积压
             self._pipeline.write_external_frame(
-                sid, frame.copy(), hardware_ns=hw_ns)
+                sid, frame.copy(), hardware_ns=hw_ns,
+                capture_mono_ns=hw_ns)
 
     def _on_gripper_stereo(self, dev_key: str, slot, frame, hw_ns):
         """s80m 左目帧（bridge 线程 → 队列回主线程）：仅显示，节流到

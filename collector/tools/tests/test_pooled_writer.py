@@ -10,6 +10,7 @@ import os
 import sys
 import json
 import shutil
+import time
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -109,6 +110,50 @@ def main():
         check(stats["observation.right_glove"]["count"] == 4,
               f"stats.json 自含累加器 count=4: "
               f"{stats['observation.right_glove']['count']}")
+
+        print("── 2b. meta 时长 = 真实跨度（不是 行数/fps） ──")
+        # 独立目录：这一段只验时长口径，不参与后面的编号断言
+        out_dur = tempfile.mkdtemp(prefix="pooled_writer_dur_")
+        try:
+            w3 = EgoDataWriter()
+            ok3 = w3.start_episode(out_dur, {"head_left_rgb": (480, 640)}, 30.0,
+                                   sensors=["right_glove"], task_name="PoolTest")
+            check(ok3, "时长用例 episode 启动")
+            # 第 3 行之前有一次 500ms 停流：真实跨度 = 1/30 + 0.5，
+            # 而「行数 ÷ fps」= 2/30 —— 两种口径差了 15 倍，正是质检 C4 那条。
+            ts = [0.0, 1 / 30.0, 1 / 30.0 + 0.5]
+            for i, t in enumerate(ts):
+                w3.write_video_frame("head_left_rgb", frame)
+                w3.write_frame_row(
+                    i, t, sensors={"right_glove": np.ones(256, np.float32)})
+            w3.end_episode()
+            td3 = w3.task_dir
+            m3 = pq.read_table(pooled_episodes_path(td3, 1)).to_pylist()[0]
+            d3 = pq.read_table(
+                pooled_data_parquet_path(td3, 1))["timestamp"].to_pylist()
+            check(abs(m3["duration_sec"] - (d3[-1] - d3[0])) < 1e-5,
+                  f"duration_sec = data timestamp 跨度（{m3['duration_sec']:.4f}s "
+                  f"vs {d3[-1] - d3[0]:.4f}s）")
+            check(abs(m3["duration_sec"] - len(ts) / 30.0) > 0.3,
+                  f"duration_sec 不再等于 行数/fps（{m3['duration_sec']:.4f}s "
+                  f"vs {len(ts) / 30.0:.4f}s）")
+
+            # wall_time = 本段起始墙钟 + 本行相对时刻（不再是「落盘那一刻」）。
+            # 同一个 500ms 停流：旧口径三行几乎同时落盘 ⇒ 跨度 ~0；新口径跨度
+            # 必须等于 timestamp 跨度，且仍严格递增、仍是绝对 Unix 秒。
+            wall = pq.read_table(
+                pooled_data_parquet_path(td3, 1))["wall_time"].to_pylist()
+            check(abs((wall[-1] - wall[0]) - (d3[-1] - d3[0])) < 1e-5,
+                  f"wall_time 跨度 = timestamp 跨度（{wall[-1] - wall[0]:.4f}s "
+                  f"vs {d3[-1] - d3[0]:.4f}s）")
+            check(all(b > a for a, b in zip(wall, wall[1:])),
+                  "wall_time 严格递增")
+            check(abs(wall[0] - time.time()) < 300.0,
+                  "wall_time 仍是绝对 Unix 秒")
+            check(abs(wall[0] - d3[0] - (wall[-1] - d3[-1])) < 1e-5,
+                  "wall_time − timestamp 在全段是常数（可互推）")
+        finally:
+            shutil.rmtree(out_dur, ignore_errors=True)
 
         print("── 3. batch_index 权威（进度不回退） ──")
         n = next_pooled_episode_index(task_dir, batch_index=50)

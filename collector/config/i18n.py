@@ -458,6 +458,110 @@ _TRANSLATIONS = {
     "采集中":                     {"en": "In Progress",                    "zh": "采集中"},
     "该任务已采集完成，请更换其他任务": {"en": "Task collection complete, please switch to another task.", "zh": "该任务已采集完成，请更换其他任务"},
 
+    # ── 任务页：本机自建任务（新建 / 改名 / 来源）──────────
+    "＋ 新建任务":                {"en": "＋ New Task",                    "zh": "＋ 新建任务"},
+    "在本机新建一个采集任务（仅自己可见，不需要服务器）": {
+        "en": "Create a task on this machine (visible only to you; no server needed)",
+        "zh": "在本机新建一个采集任务（仅自己可见，不需要服务器）",
+    },
+    "来源":                       {"en": "Source",                          "zh": "来源"},
+    "本机":                       {"en": "Local",                           "zh": "本机"},
+    "服务端":                     {"en": "Server",                          "zh": "服务端"},
+    "本机任务：仅创建者可见，进度只在本机记录；上传时按任务名匹配/创建服务器项目": {
+        "en": "Local task: visible only to its creator, progress stored locally; "
+              "uploads match or auto-create a server project by task name",
+        "zh": "本机任务：仅创建者可见，进度只在本机记录；上传时按任务名匹配/创建服务器项目",
+    },
+    "✏ 改名":                     {"en": "✏ Rename",                       "zh": "✏ 改名"},
+    "✏ 改名任务…":                {"en": "✏ Rename Task…",                 "zh": "✏ 改名任务…"},
+    "只对本机任务可用":            {"en": "Available for local tasks only",  "zh": "只对本机任务可用"},
+    "只有本机任务可以改名。":      {"en": "Only local tasks can be renamed.", "zh": "只有本机任务可以改名。"},
+    "创建失败":                   {"en": "Create failed",                   "zh": "创建失败"},
+    "改名失败":                   {"en": "Rename failed",                   "zh": "改名失败"},
+    "已新建任务: {}":             {"en": "Created task: {}",                "zh": "已新建任务: {}"},
+    "已改名: {}":                 {"en": "Renamed to: {}",                  "zh": "已改名: {}"},
+    "该任务已有本地录制数据，改名会让数据失去归属；请先上传并删除本地数据后再改名。": {
+        "en": "This task has local recordings; renaming would orphan them. "
+              "Upload and delete the local data first.",
+        "zh": "该任务已有本地录制数据，改名会让数据失去归属；请先上传并删除本地数据后再改名。",
+    },
+    "这是本机任务，删除后不会从服务器重新出现。": {
+        "en": "This is a local task; it will not reappear from the server after deletion.",
+        "zh": "这是本机任务，删除后不会从服务器重新出现。",
+    },
+    "新建采集任务":               {"en": "New Collection Task",             "zh": "新建采集任务"},
+    "任务只保存在本机，仅当前身份（{}）可见；上传时按任务名匹配或自动创建服务器项目。": {
+        "en": "The task is stored only on this machine and visible only to the "
+              "current identity ({}). Uploads match or auto-create a server "
+              "project by task name.",
+        "zh": "任务只保存在本机，仅当前身份（{}）可见；上传时按任务名匹配或自动创建服务器项目。",
+    },
+    "例如 grasp_cylinder_01":     {"en": "e.g. grasp_cylinder_01",           "zh": "例如 grasp_cylinder_01"},
+    "段":                         {"en": "eps",                             "zh": "段"},
+    "可选：任务说明，录制时悬停任务名显示": {
+        "en": "Optional: task notes, shown when hovering the task name",
+        "zh": "可选：任务说明，录制时悬停任务名显示",
+    },
+    "任务名称:":                  {"en": "Task name:",                       "zh": "任务名称:"},
+    "目标段数:":                  {"en": "Target episodes:",                 "zh": "目标段数:"},
+    "任务描述:":                  {"en": "Description:",                     "zh": "任务描述:"},
+    "本机目录: {}":               {"en": "Local directory: {}",              "zh": "本机目录: {}"},
+    "取消":                       {"en": "Cancel",                           "zh": "取消"},
+    "创建任务":                   {"en": "Create Task",                      "zh": "创建任务"},
+    "该名称的录制目录已存在（{} 段）。新任务进度从 0 开始，录制会追加到同一目录。": {
+        "en": "A recording directory with this name already exists ({} episode(s)). "
+              "The new task starts at 0 and recordings append to the same directory.",
+        "zh": "该名称的录制目录已存在（{} 段）。新任务进度从 0 开始，录制会追加到同一目录。",
+    },
+    "任务改名":                   {"en": "Rename Task",                      "zh": "任务改名"},
+    "当前名称：{}":               {"en": "Current name: {}",                 "zh": "当前名称：{}"},
+    "新名称:":                    {"en": "New name:",                        "zh": "新名称:"},
+    "确定改名":                   {"en": "Rename",                           "zh": "确定改名"},
+    "新名称与当前名称相同":        {"en": "New name is the same as the current name", "zh": "新名称与当前名称相同"},
+    "任务名称不能为空":            {"en": "Task name cannot be empty",        "zh": "任务名称不能为空"},
+    "任务名称最多 {} 个字符":      {"en": "Task name must be at most {} characters", "zh": "任务名称最多 {} 个字符"},
+    "任务名称只能包含字母、数字、汉字、下划线和连字符": {
+        "en": "Task name may contain only letters, digits, Chinese characters, "
+              "underscores and hyphens",
+        "zh": "任务名称只能包含字母、数字、汉字、下划线和连字符",
+    },
+    "任务名称不可用（系统保留名）":  {"en": "This task name is reserved by the system", "zh": "任务名称不可用（系统保留名）"},
+    "已存在同名任务（可能属于其他账号或服务端）": {
+        "en": "A task with this name already exists (it may belong to another account or the server)",
+        "zh": "已存在同名任务（可能属于其他账号或服务端）",
+    },
+    "该名称的录制目录已存在":      {"en": "A recording directory with this name already exists", "zh": "该名称的录制目录已存在"},
+    "该任务在本机已有录制目录（{} 段）；改名不迁移数据，请先上传并删除本地数据": {
+        "en": "This task already has a local recording directory ({} episode(s)); "
+              "renaming does not move data, upload and delete the local data first",
+        "zh": "该任务在本机已有录制目录（{} 段）；改名不迁移数据，请先上传并删除本地数据",
+    },
+    "只能修改本机任务":            {"en": "Only local tasks can be modified", "zh": "只能修改本机任务"},
+    "任务不存在":                 {"en": "Task not found",                   "zh": "任务不存在"},
+    "目标段数需在 1~{} 之间":      {"en": "Target episodes must be within 1~{}", "zh": "目标段数需在 1~{} 之间"},
+    "任务描述最多 {} 个字符":      {"en": "Task description must be at most {} characters", "zh": "任务描述最多 {} 个字符"},
+    "操作失败：{}":               {"en": "Operation failed: {}",             "zh": "操作失败：{}"},
+    "确定要删除任务 \"{}\" 吗？\n\n将永久删除本地目录：\n{}\n（含 {} 个片段的全部文件与录制记录，不可恢复）": {
+        "en": "Delete task \"{}\"?\n\nThis permanently deletes the local directory:\n{}\n"
+              "(all files and recording records of {} episode(s); this cannot be undone)",
+        "zh": "确定要删除任务 \"{}\" 吗？\n\n将永久删除本地目录：\n{}\n（含 {} 个片段的全部文件与录制记录，不可恢复）",
+    },
+    "确定要删除任务 \"{}\" 吗？\n\n本机没有该任务的录制数据。": {
+        "en": "Delete task \"{}\"?\n\nThis machine has no recorded data for this task.",
+        "zh": "确定要删除任务 \"{}\" 吗？\n\n本机没有该任务的录制数据。",
+    },
+    "删除失败":                   {"en": "Delete failed",                    "zh": "删除失败"},
+    "任务名 \"{}\" 无法映射到本机录制目录下的子目录，已拒绝删除：\n{}": {
+        "en": "Task name \"{}\" cannot be mapped to a subdirectory of the local "
+              "recording directory; deletion refused:\n{}",
+        "zh": "任务名 \"{}\" 无法映射到本机录制目录下的子目录，已拒绝删除：\n{}",
+    },
+    "本地数据删除失败，任务未删除：\n{}": {
+        "en": "Failed to delete local data; the task was not deleted:\n{}",
+        "zh": "本地数据删除失败，任务未删除：\n{}",
+    },
+    "录制记录删除失败：\n{}":      {"en": "Failed to delete recording records:\n{}", "zh": "录制记录删除失败：\n{}"},
+
     # ── 登录对话框 / 身份 ───────────────────────────────
     "用户登录":                  {"en": "User Login",                     "zh": "用户登录"},
     "登录":                      {"en": "Login",                          "zh": "登录"},

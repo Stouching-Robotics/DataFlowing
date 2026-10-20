@@ -5,7 +5,7 @@ D435 深度双目设备管理器 —— worker 生命周期与帧处理口径
   - D435DeviceManager  每台一个条目：D435Worker 创建/接线/停止 +
                        帧处理口径（calib 首帧注入、深度热力图/EMA、
                        录制写入）
-  - 帧经 frames_ready(slot, ndarray, object, object, str) 交主线程
+  - 帧经 frames_ready(slot, ndarray, object, object, object, str) 交主线程
 
 worker 类由调用方传入（离线测试在 ui.main_window 模块 patch D435Worker
 替身仍生效）；hw_ns 用 object 封装（PyQt5 qint32 封送截断坑，同
@@ -31,13 +31,13 @@ class D435DeviceManager(QObject):
 
     信号
     ----
-    frames_ready(str, np.ndarray, object, object, str)
+    frames_ready(str, np.ndarray, object, object, object, str)
         — (slot_id, frame, hw_ns, imu_samples, dev_key)，采集线程 → 主线程
     log(str)
         — 跨线程日志
     """
 
-    frames_ready = pyqtSignal(str, np.ndarray, object, object, str)
+    frames_ready = pyqtSignal(str, np.ndarray, object, object, object, str)
     log = pyqtSignal(str)
 
     def __init__(self, pipeline, parent=None):
@@ -91,12 +91,13 @@ class D435DeviceManager(QObject):
         entry["worker"] = worker
 
     def _relay_frames(self, slot_id: str, frame, hardware_ns=0,
-                      imu_samples=None, dev_key: str = None):
+                      imu_samples=None, extra=None, dev_key: str = None):
         self.frames_ready.emit(slot_id, frame, hardware_ns,
-                               imu_samples, dev_key)
+                               imu_samples, extra, dev_key)
 
     def process_frame(self, entry: dict, slot_id: str, frame,
-                      hardware_ns: int = 0, dev_key: str = None) -> tuple:
+                      hardware_ns: int = 0, dev_key: str = None,
+                      extra: dict = None) -> tuple:
         """D435 帧处理口径 → 返回 (display_frame, is_depth)。
 
         calib 首帧注入（录制开始时写 calibration/head_stereo.json）；
@@ -135,7 +136,8 @@ class D435DeviceManager(QObject):
         if self._pipeline.is_recording:
             self._pipeline.write_external_frame(
                 slot_id, frame.copy(),
-                hardware_ns=hardware_ns, imu_samples=None)
+                hardware_ns=hardware_ns, imu_samples=None, extra=extra,
+                capture_mono_ns=(extra or {}).get("mono_ns", 0))
         return frame, False
 
     def close(self, entry: dict):

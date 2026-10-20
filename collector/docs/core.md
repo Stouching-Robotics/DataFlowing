@@ -116,7 +116,7 @@ RGB（BGR 三通道）+ 深度（uint16，归一化毫米）两路信号。左�
 | `D435Worker.original_exposure` | 无参 | 开流时读回的"最一开始"曝光基线 | `(auto, value)` 或 `None` |
 | `_build_calibration`（模块级） | `(profile, fps, resolution)` | 从 rs2 profile 提取左右红外内参/深度内参/基线 | `StereoCalibration`（right IR2 未开流时内参镜像左目） |
 
-**关键数据**：输出深度统一归一化到毫米（`_depth_unit_factor = 设备深度单位 / settings.DEPTH_SCALE`，D405 原生 0.1mm/单位）；帧时间戳用左红外帧 `frame_timestamp` 元数据（32 位 µs 计数，软件解绕 + 首帧归零 → 会话内单调 `hardware_ns`，与 S80M 语义一致）；流组合 color(rgb8) + depth(z16) + infrared#1(y8，仅内部)；标定 `cam_imu_timeshift=0.0`（D435 无 IMU）。`__main__` 为无头自检（运行 5s、抽帧存 `/tmp/d435_selftest`、打印标定）。
+**关键数据**：输出深度统一归一化到毫米（`_depth_unit_factor = 设备深度单位 / settings.DEPTH_SCALE`，D405 原生 0.1mm/单位）；帧时间戳**逐路取值**（v1.3.11 起）：RGB 行用**彩色帧**自己的 `frame_timestamp` 元数据、深度用**深度帧**自己的，各自软件解绕 + 首帧归零 → 会话内单调 `hardware_ns`（与 S80M 语义一致）。元数据契约单位为 µs（开流时做量级自检，若固件给 ms 则 ×1000 换算并告警）。**回退显式化**：元数据不可用且帧组戳域 `get_frame_timestamp_domain()` 非 `hardware_clock` 时，`hardware_ns` 写 0（0=未知）并把宿主时间另存 `host_ns`，绝不用宿主钟冒充设备钟。逐帧 `frame_counter` 判重/判跳号 → parquet 列 `depth_ns`/`rgb_dup`/`rgb_gap`/`depth_dup`/`depth_gap`/`ts_src`/`host_ns`。**设备时间戳归一**（`RECORD_UNIFORM_HW_TS`，默认开，v1.3.11；**v1.3.17 起只对设备钟链路生效**）：syncer 补帧会让**设备钟**的 `hardware_ns` 出现 Δ=0 / Δ=2T，录制期即改写成「锚点 + 序号 × T」，一帧不丢但时间戳均匀严格递增。判据是 `pipeline._stamp_is_device_clock(extra)`：只有 D435 带 `extra.ts_src ∈ {1,2}`。**宿主钟链路（S80M 双目 / 夹爪 RGB / 裸手 UVC）不重排、原样落盘** —— 它们的戳就是采集时刻，一视同仁地重排会让 `hardware_ns` 与真实采集时刻差到 ±100ms（实测 UMI 370~382 会话：锁定 T=33.1917ms vs 真实均值 33.33ms，一段累计 −103ms；叠加 30~38ms 双峰到达后残差是随机游走），而 `timestamp` 仍是对的。实现在 `core/timestamp_norm.UniformTsClock`（T 取干净间隔**均值**，按槽位 fps 建标称周期），挂在管线唯一出口 `CameraPipeline._write_one_frame`，每槽位一个归一器、每段 `begin_segment()` 重锚（跨 episode 空档不抹平）。原始值不丢：同写 `raw_hw_ns` 列（宿主钟链路上两列相同）；补帧/跳帧事实仍由 `rgb_dup`/`rgb_gap`/`depth_dup`/`depth_gap` 记录；落盘空洞看门狗吃归一前的原始戳（归一发生在它之后）。离线等价工具 `tools/fix_hardware_ns_uniform.py` 口径一致。定因记录见 `docs/` 与 `tools/d435_ts_probe.py`；流组合 color(rgb8) + depth(z16) + infrared#1(y8，仅内部)；标定 `cam_imu_timeshift=0.0`（D435 无 IMU）。`__main__` 为无头自检（运行 5s、抽帧存 `/tmp/d435_selftest`、打印标定）。
 
 **调用关系**：被 `ui/main_window.py`（`_open_d435`，worker 类经 `D435DeviceManager.spawn` 传入）、`tools/tests/d405_worker_test.py`、`tools/tests/d435_e2e_test.py`、`tools/tests/d435_gui_smoke_test.py`、`tools/tests/exposure_control_test.py` 引用；函数内延迟导入 `core/calibration.py`。
 
@@ -177,7 +177,7 @@ RGB（BGR 三通道）+ 深度（uint16，归一化毫米）两路信号。左�
 | `CameraPipeline.record_event` | `(device, event_type, message="")` | 记录设备连接/断开事件 → 写入线程每帧写 `status.<device>` 列 | 无 |
 | `CameraPipeline.is_recording` / `elapsed` / `last_recording_frames` | property | 录制状态/已录时长/上一轮每相机帧数快照 | 对应值 |
 
-**关键数据**：写入线程节拍 `frame_interval = 1.0 / settings.RECORDING_FPS`（30fps），sleep 到目标前 ~1ms 后 busy-wait 补齐；每帧先排空传感器队列取最新数据，CameraSlot 队列"排空取最新帧"、外部帧源队列"取一帧不排空"（输出均匀无抖动）；单目路径写 MP4 时上下翻转、外部双目帧路径已在 `ui/main_window._on_stereo_frame` 翻转故 `flip_vertical=False`；IMU 样本只随 `stereo_left` 写入（左右目共享一份，避免 `data/imu/` 重复行）；可选 `settings.CAMERA_MIRROR_HORIZONTAL` 水平镜像。**深度 MP4 补拍**（v1.0.11）：`_write_one_frame` 每个 master 槽节拍至多消费一帧深度——队列有新帧则写热力图 MP4 +（raw_depth 时）PNG16 并缓存于 `_last_depth_frames`；队列空（S80C 深度引擎 ~20fps 低于录制 30fps）则重写缓存帧到热力图 MP4（不落 PNG、不推进序号），保证深度 MP4 时长与 RGB 对齐。
+**关键数据**：写入线程节拍 `frame_interval = 1.0 / settings.RECORDING_FPS`（30fps），sleep 到目标前 ~1ms 后 busy-wait 补齐（落后超过一拍就重置节拍，并记 `drop_stats.write_pacing_resync_count` / `write_pacing_lag_max_ms` —— v1.3.17 前这次掉拍完全不可见，只能事后从 `wall_time` 与采集时刻的错位里猜）；每帧先排空传感器队列取最新数据，CameraSlot 队列"排空取最新帧"、外部帧源队列"取一帧不排空"（输出均匀无抖动）；单目路径写 MP4 时上下翻转、外部双目帧路径已在 `ui/main_window._on_stereo_frame` 翻转故 `flip_vertical=False`；IMU 样本只随 `stereo_left` 写入（左右目共享一份，避免 `data/imu/` 重复行）；可选 `settings.CAMERA_MIRROR_HORIZONTAL` 水平镜像。**深度 MP4 补拍**（v1.0.11）：`_write_one_frame` 每个 master 槽节拍至多消费一帧深度——队列有新帧则写热力图 MP4 +（raw_depth 时）PNG16 并缓存于 `_last_depth_frames`；队列空（S80C 深度引擎 ~20fps 低于录制 30fps）则重写缓存帧到热力图 MP4（不落 PNG、不推进序号），保证深度 MP4 时长与 RGB 对齐。
 
 **帧空洞与丢帧口径（v1.3.10）**：写入线程对每个外部槽跑一个 `core.frame_gap.GapWatch`
 （`_ext_gap_watches`，每槽一个，基座由该槽首帧锁定），取帧成功后、`_write_one_frame`
@@ -487,26 +487,41 @@ settings.DATA_DIR/tasks.json`）。核心设计：进度按**分账模型**持�
 按身份过滤可见范围（None=全部、`"guest"`=仅公共、用户名=公共+指派给该
 用户）。
 
+**采集端自建任务**（v1.3.16）：`create_local_task()` 写入 `source="local"`、
+`id` 前缀 `local-`、`created_by` 为创建身份的条目；`remove_local_task()` 整条
+移除（无 `hidden` 墓碑），`rename_local_task()` 仅改名且本机已有录制目录时
+拒绝（`has_data`）；`validate_task_name()` 做字符/长度/保留名/查重校验，错误
+码由 UI 本地化（`TaskValidationError.code`）。可见性：本机任务按 `created_by`
+过滤（仅创建者；缺失 `created_by` 视为无主，所有人可见），`assigned_user`
+恒 `None`；`merge_backend_tasks()` 的账号撤销清除显式豁免本机任务；进度只记
+`local_count`，`pending_sync_tasks()` 跳过本机任务（不上报服务器）。
+
 **类/函数**：
 
 | 名称 | 签名要点 | 作用 | 返回/副作用 |
 |---|---|---|---|
-| `load_tasks` | `(identity: str \| None = None)` | 加载任务，过滤 `hidden`，自动计算 `status`，按 `assigned_at` 新→旧排序；`identity` 过滤可见范围（None=全部/`"guest"`=仅公共/用户名=公共+指派） | `list[dict]`；旧数据缺同步字段时迁移回填并写回文件 |
-| `filter_by_identity` | `(tasks, identity: str \| None = None)` | 纯函数：按身份过滤任务列表（不修改原列表，供 UI 对已有列表即时过滤） | 新列表 |
+| `load_tasks` | `(identity: str \| None = None)` | 加载任务，过滤 `hidden`，自动计算 `status`，按 `assigned_at` 新→旧排序；`identity` 过滤可见范围（None=全部/`"guest"`=仅公共/用户名=公共+指派），本机任务按 `created_by` 过滤 | `list[dict]`；旧数据缺同步字段时迁移回填并写回文件 |
+| `filter_by_identity` | `(tasks, identity: str \| None = None)` | 纯函数：按身份过滤任务列表（不修改原列表，供 UI 对已有列表即时过滤）；本机任务走 `created_by`，服务端任务走 `assigned_user` | 新列表 |
 | `save_tasks` | `(tasks)` | 持久化任务元数据（含分账字段） | 写文件（哑写，不迁移不重算） |
-| `merge_backend_tasks` | `(backend_tasks, view_scope: str \| None = None)` | 后端任务合并进本地记录（id 合并/本地保留/(name, assigned_user) 同名去重墓碑/账号身份撤销清除/后端全局数权威+本机水位沿用） | 合并后列表（内部调用 `save_tasks` + `load_tasks`） |
-| `mark_hidden` | `(task_id)` | 标记任务隐藏（UI 不再显示） | 写文件 |
+| `merge_backend_tasks` | `(backend_tasks, view_scope: str \| None = None)` | 后端任务合并进本地记录（id 合并/本地保留/(name, assigned_user) 同名去重墓碑/账号身份撤销清除——**本机任务豁免**/后端全局数权威+本机水位沿用） | 合并后列表（内部调用 `save_tasks` + `load_tasks`） |
+| `mark_hidden` | `(task_id)` | 标记**服务端任务**隐藏（UI 不再显示） | 写文件 |
 | `refresh_progress` | 无参 | 用持久化计数重载任务列表 | `list[dict]` |
 | `increment_task_completed` | `(task_name, task_id: str \| None = None, assigned_user: str \| None = None)` | 一次录制完成：匹配优先级 id → (name, assigned_user) → 唯一同名回退；`local_count` +1 并重算显示值 | 更新后的任务 dict，无匹配返回 `None`；写文件 |
-| `pending_sync_tasks` | 无参 | 所有 `local_count > synced_count` 的任务快照（含 hidden，不按身份过滤）；纯读路径不触发迁移 | `list[dict]`（id/name/local_count/synced_count） |
+| `pending_sync_tasks` | 无参 | 所有 `local_count > synced_count` 的**非本机**任务快照（含 hidden，不按身份过滤）；纯读路径不触发迁移 | `list[dict]`（id/name/local_count/synced_count） |
 | `mark_synced` | `(task_id, synced_count, backend_count)` | flush 成功后回写：水位只前进不后退，`backend_count` 用响应值无条件替换 | 更新后的任务 dict 或 `None`；写文件 |
 | `task_by_id` | `(task_id)` | 按 id 查单个任务 | `dict` 或 `None` |
+| `is_local_task` | `(task) -> bool` | 是否采集端自建任务（`source == "local"` 或 id 前缀 `local-`） | bool |
+| `validate_task_name` | `(name, exclude_id=None) -> tuple[bool, str]` | 本机任务名校验：非空、≤64 字符、只允许字母/数字/汉字/`_`/`-`、非 Windows 保留名、不重名（大小写不敏感，含 hidden 与种子任务） | `(ok, 错误码)`：`name_empty` / `name_too_long` / `name_illegal` / `name_reserved` / `name_duplicate` |
+| `create_local_task` | `(name, total_required, description="", created_by="guest")` | 新建本机任务：校验后追加条目（id `local-…`、`source="local"`、`assigned_at`=UTC now、进度三字段 0） | 任务 dict；失败抛 `TaskValidationError`（另含 `total_invalid` / `description_too_long`） |
+| `rename_local_task` | `(task_id, new_name, allow_with_data=False)` | 改本机任务名；默认本机已有录制目录时拒绝（`has_data`），新名字目录已存在拒绝（`name_dir_exists`） | 更新后的任务 dict；失败抛 `TaskValidationError`（`task_not_found` / `not_local` / 名字错误码） |
+| `remove_local_task` | `(task_id) -> bool` | 硬移除本机任务（整条删除，无墓碑）；非本机任务返回 `False` | bool；写文件 |
+| `new_local_task_id` | 无参 | 生成 `local-YYYYmmdd-HHMMSS-<4hex>` | str |
 | `_read_raw` | 无参（内部） | 读 `tasks.json`；缺文件/解析失败时播种 | `list[dict]` |
 | `_write` | `(data)`（内部） | 原子写（`.tmp` + `os.replace`） | 写文件 |
 
-**关键数据**（`data/tasks.json` 结构）：顶层 `{"tasks": [...], "updated_at": iso字符串}`。任务条目字段：`id`、`name`、`description`、`status`（`load_tasks` 自动计算：`pending`(0%) / `in_progress`(>0%) / `completed`(100%)）、`total_required`、`assigned_at`（ISO 时间）、`assigned_user`（指派用户；null/空/缺失归一化为 None = 公共任务）、`params`（dict）、`completed_count`（派生显示值 = `backend_count + (local_count - synced_count)`）、`local_count`/`synced_count`/`backend_count`（进度分账三字段）、`hidden`（bool 墓碑）。内置播种任务：`task_001`（`cylinder_grasping`）、`task_002`（`cube_placement`）、`task_003`（`valve_rotation`）。`_count_sessions()` 按 `settings.RECORDING_DIR/<task_name>/<会话>/meta/info.json` 存在与否统计会话数，仅用于旧数据迁移回填。
+**关键数据**（`data/tasks.json` 结构）：顶层 `{"tasks": [...], "updated_at": iso字符串}`。任务条目字段：`id`、`name`、`description`、`status`（`load_tasks` 自动计算：`pending`(0%) / `in_progress`(>0%) / `completed`(100%)）、`total_required`、`assigned_at`（ISO 时间）、`assigned_user`（指派用户；null/空/缺失归一化为 None = 公共任务）、`source`（`"local"` = 采集端自建；缺失 = 服务端/历史任务）、`created_by`（本机任务创建身份，仅创建者可见）、`params`（dict）、`completed_count`（派生显示值 = `backend_count + (local_count - synced_count)`）、`local_count`/`synced_count`/`backend_count`（进度分账三字段）、`hidden`（bool 墓碑，仅服务端任务）。内置播种任务：`task_001`（`cylinder_grasping`）、`task_002`（`cube_placement`）、`task_003`（`valve_rotation`）。`_count_sessions()` 按 `settings.RECORDING_DIR/<task_name>/<会话>/meta/info.json` 存在与否统计会话数，仅用于旧数据迁移回填。
 
-**调用关系**：被 `ui/main_window.py`（`load_tasks`、`increment_task_completed`）、`ui/task_page.py`（`load_tasks`、`filter_by_identity`、`merge_backend_tasks`、`refresh_progress`、`mark_hidden`）引用。
+**调用关系**：被 `ui/main_window.py`（`load_tasks`、`increment_task_completed`）、`ui/task_page.py`（`load_tasks`、`filter_by_identity`、`merge_backend_tasks`、`refresh_progress`、`mark_hidden`、`is_local_task`、`create_local_task`、`rename_local_task`、`remove_local_task`）、`ui/task_create_dialog.py`（`validate_task_name`、`MAX_TASK_NAME_LEN` 等）引用。
 
 ## 上传与后端通信（原 network/）
 
@@ -581,7 +596,7 @@ GET `/api/v1/device/tasks?device_name=…`。设计模式参照已移除的 `Syn
 | --- | --- | --- | --- |
 | `CONNECT_TIMEOUT` | int | 10 | HTTP 请求超时（秒） |
 | `PROGRESS_RETRY_INTERVAL_S` | float | 600 | 进度端点 404 后进入降级，冷却期满再探一次（见 `_progress_retry_at`） |
-| 上报白名单 | — | `_cached_tasks` | 只上报最近一次成功轮询里存在的任务：本地自建任务（平台没这个项目）上报必被拒 400，跳过不发也不报错 |
+| 上报白名单 | — | `_cached_tasks` + `pending_sync_tasks()` | 只上报最近一次成功轮询里存在的任务：采集端自建任务（`source="local"`）在 `task_record.pending_sync_tasks()` 里就被跳过，没有平台侧对应项目，上报必被拒 400，跳过不发也不报错（白名单是第二道保险） |
 | 首报基线 | — | `_progress_source` | 后端该项目口径为 `"sessions"`（还没收到过任何上报）时，首次上报送本机**全量**而非增量 —— 只送增量会把后端计数从 session 数砸成增量本身（3/3/3 的项目再录一条变 1）；上报成功即本地转 `reported`，之后只送增量 |
 | 轮询间隔 | int | `settings.TASK_POLL_INTERVAL_MS`（默认 30000） | 读不到时 `getattr` 兜底 5000 毫秒（代码兜底值，非配置默认） |
 | 设备认领名 | str | `settings.DEVICE_NAME` | 读不到时回退 `"EGO_001"`；作为 `device_name` 查询参数 |

@@ -181,6 +181,15 @@ class EgoDataWriter(QObject):
         self._fps: float = 30.0
         self._frame_count = 0
         self._max_frame_idx = 0          # 单路最大帧号（用于时长计算）
+        # 首/末行的相对时刻（秒）——meta 的 duration_sec 用它算**真实跨度**；
+        # 在这里初始化（start_episode 会重置），因为测试/直接调用的路径可能
+        # 不经过 start_episode。
+        self._first_row_ts: Optional[float] = None
+        self._last_row_ts: Optional[float] = None
+        # 本段墙钟起点（wall_time = 它 + 行的相对时刻）与上一行 wall_time
+        # （后者用于保证严格递增；见 _row_wall_time）
+        self._episode_wall_base: float = 0.0
+        self._last_wall_time: float = 0.0
         self._episode_start_s: float = 0.0
         self._episode_created_at: float = 0.0
         self._rows: List[dict] = []
@@ -195,6 +204,8 @@ class EgoDataWriter(QObject):
         self._calib_dict: dict = {}      # 本 episode 标定（info.json/episodes 行）
         # 稀疏列跟踪：只落盘本 episode 实际有数据的列
         self._present_sensors: set = set()
+        self._present_ts_diag: bool = False   # 本 episode 是否有时间戳取证列
+        self._present_raw_hw: bool = False    # 本 episode 是否写了归一前的原始戳
         self._present_imu: bool = False
         self._present_glove_imu: set = set()   # USB 手套 IMU 稀疏列（按传感器名）
         self._present_gripper: set = set()     # UMI 夹爪稀疏列（state/force/matrix/trajectory）
@@ -396,11 +407,20 @@ class EgoDataWriter(QObject):
         self._episode_created_at = time.time()
         self._frame_count = 0
         self._max_frame_idx = 0
+        # 首/末行的相对时刻（秒）：meta 的 duration_sec 用它算**真实跨度**，
+        # 不再拿「行数 ÷ fps」冒充时长（录制中途掉帧/停流时那两者差得很远，
+        # 实测一段 161 行跨 9.38s 的段被写成 5.37s，质检每次都要报 C4）。
+        self._first_row_ts: Optional[float] = None
+        self._last_row_ts: Optional[float] = None
+        self._episode_wall_base = self._episode_start_s
+        self._last_wall_time = 0.0
         self._rows.clear()
         self._present_sensors = set()
         self._present_imu = False
         self._present_glove_imu = set()
         self._present_gripper = set()
+        self._present_ts_diag = False   # 每段重置（v1.3.11 时间戳取证列）
+        self._present_raw_hw = False
         self._matrix_dtype = {}
         self._matrix_scale = {}          # 倍率由采集侧重新登记；防上一段残留
         self._reset_stats()
@@ -664,7 +684,9 @@ class EgoDataWriter(QObject):
                         imu_samples: Optional[List] = None,
                         glove_imu: Optional[Dict[str, tuple]] = None,
                         glove_kpts: Optional[Dict[str, np.ndarray]] = None,
-                        gripper: Optional[Dict] = None):
+                        gripper: Optional[Dict] = None,
+                        extra: Optional[dict] = None,
+                        raw_hw_ns: int = 0):
         """写入一行到 data parquet 缓冲区。
 
         Args:
@@ -709,10 +731,38 @@ class EgoDataWriter(QObject):
             "frame_index":   frame_index,
             "timestamp":     np.float32(timestamp_s),
             "task_index":    0,
-            "wall_time":     float(time.time()),   # 绝对 Unix 秒（宿主锚定）
+            # 绝对 Unix 秒：本段起始墙钟 + 本行相对时刻（严格递增）。
+            # 旧口径是 time.time()（落盘那一刻）—— 录制队列一积压、写线程掉一拍，
+            # wall_time 就与采集时刻差出整整一行（实测 11 段差 33ms），而它看起来
+            # 又像「时刻」。改成这种渲染后，wall_time − timestamp 恒为常数。
+            "wall_time":     self._row_wall_time(float(timestamp_s)),
             "hardware_ns":   int(hardware_ns or 0),
             "action":        [0.0],
         }
+        # 归一前的原始设备戳（v1.3.11）：hardware_ns 在录制期被重写成均匀递增，
+        # 原始值另存这一列，便于事后审计真实的到达/采集节奏。
+        if raw_hw_ns:
+            row["raw_hw_ns"] = int(raw_hw_ns)
+            self._present_raw_hw = True
+        # ── 时间戳取证列（v1.3.11，D435 链路才带；其余链路恒为 0/缺省） ──
+        # hardware_ns 的语义是「本行那一帧自己的设备时钟」，但 rs2 的 syncer
+        # 在多流模式下会给本拍没出新帧的那一路补上一帧旧帧（frame_counter 不
+        # 前进），所以「戳没变」既可能是真重复帧、也可能是上一拍漏取。这几列
+        # 把这件事讲清楚，下游据此判重/判丢，不必猜：
+        #   depth_ns    本行深度成员的设备时钟 ns（0=未知）
+        #   rgb_dup/rgb_gap     彩色帧是否与上一行是同一物理帧 / 中间跳过几帧
+        #   depth_dup/depth_gap 同上，针对深度成员
+        #   ts_src      0=无设备钟(0 值) 1=逐帧元数据 2=帧组戳(设备钟) 3=帧组戳(宿主钟)
+        #   host_ns     仅 ts_src=3 时非 0：宿主单调钟 ns（不冒充设备钟）
+        if extra:
+            row["depth_ns"] = int(extra.get("depth_ns", 0) or 0)
+            row["rgb_dup"] = int(extra.get("rgb_dup", 0) or 0)
+            row["rgb_gap"] = int(extra.get("rgb_gap", 0) or 0)
+            row["depth_dup"] = int(extra.get("depth_dup", 0) or 0)
+            row["depth_gap"] = int(extra.get("depth_gap", 0) or 0)
+            row["ts_src"] = int(extra.get("ts_src", 0) or 0)
+            row["host_ns"] = int(extra.get("host_ns", 0) or 0)
+            self._present_ts_diag = True
         for sn in self._sensor_names:
             data = sensors.get(sn)
             if data is None:
@@ -807,6 +857,10 @@ class EgoDataWriter(QObject):
         with QMutexLocker(self._mutex):
             self._rows.append(row)
         self._frame_count += 1
+        ts_rel = float(timestamp_s)
+        if self._first_row_ts is None:
+            self._first_row_ts = ts_rel
+        self._last_row_ts = ts_rel
         if frame_index + 1 > self._max_frame_idx:
             self._max_frame_idx = frame_index + 1
 
@@ -957,6 +1011,18 @@ class EgoDataWriter(QObject):
             "action":        pa.array([r["action"] for r in rows],
                                       pa.list_(pa.float32(), 1)),
         }
+        # 归一前的原始设备戳（所有 RGB 槽位都可能有）
+        if self._present_raw_hw:
+            cols["raw_hw_ns"] = pa.array(
+                [int(r.get("raw_hw_ns", 0)) for r in rows], pa.int64())
+        # 时间戳取证列（本 episode 有 D435 帧才写，见 write_frame_row）
+        if self._present_ts_diag:
+            for k in ("depth_ns", "host_ns"):
+                cols[k] = pa.array([int(r.get(k, 0)) for r in rows], pa.int64())
+            for k in ("rgb_dup", "depth_dup", "ts_src"):
+                cols[k] = pa.array([int(r.get(k, 0)) for r in rows], pa.int8())
+            for k in ("rgb_gap", "depth_gap"):
+                cols[k] = pa.array([int(r.get(k, 0)) for r in rows], pa.int32())
         # 稀疏传感器列（有真实数据的才写）
         for sn in sorted(self._present_sensors):
             name = f"observation.{sn}"
@@ -1023,6 +1089,42 @@ class EgoDataWriter(QObject):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         _atomic_write_parquet(table, path)
 
+    def _row_wall_time(self, ts_rel: float) -> float:
+        """本行的绝对 Unix 秒 = 本段起始墙钟 + 本行相对时刻（严格递增）。
+
+        为什么不取 time.time()：那是**落盘那一刻**，写线程掉一拍、队列积压一涨，
+        它就与采集时刻错开整行（UMI 实测 11 段差 33ms、队列滞留从 0 长到 42ms），
+        而字段名让它看起来像「时刻」。渲染成「起始墙钟 + timestamp」之后：
+
+          * wall_time − timestamp 恒为常数（跨模态对齐可互推）；
+          * 段内严格递增（多相机同拍也不会倒退，靠 _last_wall_time 兜底）；
+          * 写入侧掉拍只体现在 drop_stats 的 write_pacing_* 里，不再污染时间轴。
+
+        没走 start_episode 的调用方（测试/工具）退回 time.time()，行为不变。
+        """
+        if not self._episode_wall_base:
+            return float(time.time())
+        wall = float(self._episode_wall_base) + float(ts_rel)
+        if wall <= self._last_wall_time:
+            # 两路相机同拍、或调用方传了非单调的相对时刻：保持严格递增
+            wall = self._last_wall_time + 1e-6
+        self._last_wall_time = wall
+        return wall
+
+    def _episode_duration_sec(self) -> float:
+        """本段真实时长（秒）：末行到首行的相对时刻。
+
+        优先用逐行 timestamp 的跨度（= data parquet 里 timestamp 列的
+        last − first，质检与 tools/trim_episode_tail.py 同口径）；拿不到
+        （空段/老调用方）才退回「行数 ÷ fps」。两者在掉帧或停流时差别很大：
+        fps 口径假设每行恰好一帧、且一帧恰好 1/fps 秒，录制抖动时这两条都不成立。
+        """
+        if (self._first_row_ts is not None and self._last_row_ts is not None):
+            span = float(self._last_row_ts - self._first_row_ts)
+            if span > 0:
+                return span
+        return float(self._max_frame_idx / max(self._fps, 1.0))
+
     def _append_episode_row(self):
         """meta/episodes/chunk-NNN/episode-NNN.parquet 每段一个文件、单行原子写。
 
@@ -1044,7 +1146,7 @@ class EgoDataWriter(QObject):
             "end_frame_index": max(0, self._max_frame_idx - 1),
             "length": self._max_frame_idx,
             "created_at": float(self._episode_created_at),
-            "duration_sec": float(self._max_frame_idx / max(self._fps, 1.0)),
+            "duration_sec": float(self._episode_duration_sec()),
             "drop_stats": json.dumps(self._drop_stats or {},
                                      ensure_ascii=False),
             "video_codec": json.dumps(self._video_codec_meta(),
@@ -1147,9 +1249,14 @@ class EgoDataWriter(QObject):
             elif key.endswith("_ns"):
                 # 采集时刻：宿主单调钟纳秒，与 hardware_ns 同一时基。
                 # 下游按此把力样本重采样到 RGB 帧时刻（见 docs/data.md）。
+                # missing_sentinel=0：本行**没有样本**（采样相位与 30fps 行网格
+                # 不同步，实测 7%~15% 的行是这种）。这是**声明**，不是约定俗成——
+                # 不写下来，任何第三方读者都会把 0 当成时刻 0（时间轴质检器
+                # 就这么中过招：1814 条「时间戳回退」全是它）。
                 features[f"observation.{key}"] = {
                     "dtype": "int64", "shape": [1],
-                    "encoding": "host_monotonic_ns"}
+                    "encoding": "host_monotonic_ns",
+                    "missing_sentinel": 0}
             elif key.endswith("_force_matrix"):
                 features[f"observation.{key}"] = matrix_features[
                     f"observation.{key}"]
@@ -1242,6 +1349,18 @@ class EgoDataWriter(QObject):
             "calibration": self._calib_dict,   # 任务级最新标定
             "total_episodes": len(list_task_episodes(self._task_dir)),
             "video_extensions": merged_exts,
+            # 时间轴语义（只加不改，既有键原样）：字段名看不出「哪个是真实采集
+            # 时刻、哪个是行网格」，写清楚，第三方不必靠猜或靠踩坑。
+            "time_axis": {
+                "align_by": "timestamp（或各模态自己的 *_ns）；不要按行号/行网格对齐",
+                "timestamp": "逐帧采集时刻相对本段起点（秒，f32）—— 对齐首选",
+                "wall_time": "Unix 秒 = 本段起始墙钟 + timestamp（严格递增）",
+                "hardware_ns": (
+                    "该帧自带的 ns 戳：宿主钟链路（夹爪/S80M/裸手）里它=采集时刻、"
+                    "与 raw_hw_ns 相同；设备钟链路（D435）里它被重排成"
+                    "「锚点+序号×T」的均匀网格（≈行网格，非采集时刻），真实值见 raw_hw_ns"),
+                "raw_hw_ns": "归一化前的原始戳（仅设备钟链路与 hardware_ns 不同）",
+            },
         })
         # 只在真有 SLAM 轨迹的任务上标帧，别给无 SLAM 的任务塞无关键
         if any(k.endswith("slam_trajectory") for k in self._present_gripper):

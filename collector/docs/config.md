@@ -147,6 +147,6 @@ config/ 是应用全局配置、国际化与版本号所在的配置包。版本
 
 | 名称 | 类型 | 说明 |
 | --- | --- | --- |
-| `_TRANSLATIONS` | dict | 键为中文原文，值为 `{"en": …, "zh": …}`；覆盖录制记录、菜单栏、工具栏、相机控件、状态栏、日志消息、双目 S80M、相机模式切换、RealSense、错误消息、对话框、面板标题、关于、空状态、传感器面板、设备检测、设备统一接入、每设备曝光、状态显示、回放、上传、上传开关、数据查看器、任务选择页面、手部关键点、自动标注等全部界面文案 |
+| `_TRANSLATIONS` | dict | 键为中文原文，值为 `{"en": …, "zh": …}`；覆盖录制记录、菜单栏、工具栏、相机控件、状态栏、日志消息、双目 S80M、相机模式切换、RealSense、错误消息、对话框、面板标题、关于、空状态、传感器面板、设备检测、设备统一接入、每设备曝光、状态显示、回放、上传、上传开关、数据查看器、任务选择页面、本机任务新建/改名（含名称校验错误文案）、手部关键点、自动标注等全部界面文案 |
 
-**调用关系**：被 `ui/main_window.py`、`ui/camera_widget.py`、`ui/device_panel.py`、`ui/camera_grid.py`、`ui/glove_widget.py`、`ui/playback_dialog.py`、`ui/upload_dialog.py`、`ui/exposure_dialog.py`、`ui/task_page.py`、`tools/tests/device_panel_gui_smoke_test.py`、`tools/tests/glove_widget_test.py`、`tools/tests/exposure_control_test.py`、`tools/tests/test_playback_multifps.py` 等 import。依赖 `PyQt5.QtCore`（`QObject`、`pyqtSignal`）。
+**调用关系**：被 `ui/main_window.py`、`ui/camera_widget.py`、`ui/device_panel.py`、`ui/camera_grid.py`、`ui/glove_widget.py`、`ui/playback_dialog.py`、`ui/upload_dialog.py`、`ui/exposure_dialog.py`、`ui/task_page.py`、`ui/task_create_dialog.py`、`tools/tests/device_panel_gui_smoke_test.py`、`tools/tests/glove_widget_test.py`、`tools/tests/exposure_control_test.py`、`tools/tests/test_playback_multifps.py` 等 import。依赖 `PyQt5.QtCore`（`QObject`、`pyqtSignal`）。

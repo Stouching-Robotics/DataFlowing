@@ -26,7 +26,8 @@
 | `ui/guide_dialog.py` | 使用说明窗口（首次启动自动弹出、帮助菜单重开；中英 HTML 模板；「不再显示」持久化到 QSettings）+ `VisibleCheckBox` 复选组件 |
 | `ui/playback_dialog.py` | 录制回放对话框：统一网格同步播放全部视频 + 传感器渲染，深度槽识别、手部关键点叠加、批量删除 |
 | `ui/pose_view_qt.py` | 夹爪位姿视图控件：QPainter 手绘的实时轨迹 + 世界坐标轴 + 跟随夹爪的体轴三箭头 + 夹爪模型（两张夹板按开合度张合） |
-| `ui/task_page.py` | 启动时的任务选择页：任务表、服务器地址/凭据输入、连接状态、进入采集 |
+| `ui/task_page.py` | 启动时的任务选择页：任务表（5 列，含「来源」）、新建/改名/删除本机任务、服务器地址/凭据输入、连接状态、进入采集 |
+| `ui/task_create_dialog.py` | 本机任务对话框：新建（名称/目标段数/描述 + 实时校验）与改名（已有录制目录时禁止），错误码本地化 |
 | `ui/upload_dialog.py` | 录制会话一键打包上传对话框 |
 | `ui/__init__.py` | 空包标记（0 行） |
 
@@ -448,7 +449,9 @@
 
 ### ui/task_page.py
 
-**作用**：启动时显示的任务选择页（页面栈 index 0）。顶栏只读显示服务器地址（`set_server_display`）与当前身份，附「切换账号」按钮（发射 `switch_account_requested`）；中部任务表（4 列），底部「→ 进入采集」与「🗑 删除」。任务数据来自 `data/tasks.json`（`core.task_record.load_tasks`），后端任务经 `merge_backend_tasks` 合并，并 `set_identity` 按身份过滤（游客仅见公共任务）；用户选中任务点「进入采集」发射 `task_selected(dict)`，主窗口切换到数据采集页。
+**作用**：启动时显示的任务选择页（页面栈 index 0）。顶栏只读显示服务器地址（`set_server_display`）与当前身份，附「切换账号」「＋ 新建任务」「🔄 刷新」按钮；中部任务表（5 列，含「来源」），底部「→ 进入采集」「✏ 改名」「🗑 删除」。任务数据来自 `data/tasks.json`（`core.task_record.load_tasks`），后端任务经 `merge_backend_tasks` 合并，并 `set_identity` 按身份过滤（游客仅见公共任务）；用户选中任务点「进入采集」发射 `task_selected(dict)`，主窗口切换到数据采集页。
+
+**采集端自建任务**：顶栏「＋ 新建任务」打开 `TaskCreateDialog`，落库为 `source="local"`（`id` 前缀 `local-`、`created_by` 记当前身份）。本机任务**仅创建者可见**（过滤在 `core.task_record.filter_by_identity`），进度只在本机累计、不上报服务器；「来源」列显示「本机」，服务端任务显示「服务端」。本机任务可「✏ 改名」（已有录制目录时拒绝）与删除（真删数据 + `remove_local_task` 整条移除，无 hidden 墓碑）；服务端任务删除仍走 `mark_hidden` 墓碑。
 
 **模块级**：
 
@@ -467,22 +470,53 @@
 | `update_task_progress` | `(task_id: str, completed_count: int)` | 录制完成回写进度：`refresh_progress()` 后按 `_tid` 找行刷新 | — |
 | `set_connection_status` | `(connected: bool)` | 更新连接圆点与「后端已连接/未连接」文案 | — |
 | `on_login_result` | `(ok: bool, msg: str)` | 登录结果反馈（`登陆成功` / `登陆失败: msg[:30]`） | — |
-| `set_identity` | `(identity: str \| None)` | 更新当前身份（"guest" 或用户名）并即时按新身份重滤任务表 | — |
+| `set_identity` | `(identity: str \| None)` | 更新当前身份（"guest" 或用户名）并即时按新身份重滤任务表（含本机任务可见性） | — |
 | `set_server_display` | `(url)` | 更新顶栏服务器地址显示与 tooltip（登录对话框改地址后由主窗口调用） | — |
 | `current_task` | `() -> dict \| None` | 当前选中行任务 | dict 或 None |
-| `_on_cell_changed` | `(row, _col, _pr, _pc)` | 选行联动：completed 任务禁用「进入采集」（tooltip 提示换任务） | — |
+| `_on_cell_changed` | `(row, _col, _pr, _pc)` | 选行联动：completed 任务禁用「进入采集」；本机任务才启用「✏ 改名」，任一选中行启用「🗑 删除」 | — |
 | `_on_double_clicked` / `_on_enter_clicked` | `()` | 双击行=快捷进入；进入前 completed 任务弹警告 | 发射 `task_selected` |
-| `_do_delete_task` | `()` | 删除任务（按钮与右键菜单共用）：二次确认后 `delete_local_session` 真删该任务录制目录 + `RecordingRepo.delete_local_dir` 删录制行，再 `mark_hidden` 留墓碑 → 重载列表；目录没删净则弹错并**不隐藏**任务。删除目标先做兜底校验（必须是 `RECORDING_DIR` 的**直接子目录**）——`_sanitize_tag` 把纯空白任务名清洗成空串后 `task_dir_of` 会退化成 `RECORDING_DIR` 本身，不拦就会把**所有任务**的录制整根 rmtree | — |
-| `_on_context_menu` | `(pos)` | 右键菜单「🗑 删除任务」 | — |
+| `_on_new_task_clicked` | `()` | 打开 `TaskCreateDialog`（传入当前身份）→ `create_local_task` → `_refilter` → 选中新行；校验失败弹「创建失败」 | 写 `tasks.json` |
+| `_on_rename_clicked` | `()` | 仅本机任务：打开 `TaskRenameDialog` → `rename_local_task` → `_refilter` → 保持选中；失败弹「改名失败」 | 写 `tasks.json` |
+| `_select_task_by_id` | `(task_id) -> int` | 按 id 选中行（新建/改名后保持选中） | 行号或 -1 |
+| `_task_error_message` | `(code) -> str` | `TaskValidationError.code` → 本地化弹窗文案（`has_data`/`name_too_long` 补默认参数） | str |
+| `_do_delete_task` | `()` | 删除任务（按钮与右键菜单共用）：二次确认后 `delete_local_session` 真删该任务录制目录 + `RecordingRepo.delete_local_dir` 删录制行；**本机任务**调 `remove_local_task` 整条移除，**服务端任务**调 `mark_hidden` 留墓碑 → 重载列表；目录没删净则弹错并**不删除**任务。删除目标先做兜底校验（必须是 `RECORDING_DIR` 的**直接子目录**）——`_sanitize_tag` 把纯空白任务名清洗成空串后 `task_dir_of` 会退化成 `RECORDING_DIR` 本身，不拦就会把**所有任务**的录制整根 rmtree | — |
+| `_refresh_after_delete` | `()` | 删除后重载列表并清空选中态（三个操作按钮禁用） | — |
+| `_on_context_menu` | `(pos)` | 右键菜单：服务端任务只有「🗑 删除任务」，本机任务多一项「✏ 改名任务…」；**先 `setCurrentCell` 到右键行**，避免操作落到之前选中的别的任务 | — |
 | `_on_refresh_clicked` | `()` | 发射 `refresh_requested`，按钮 1.5s 内显示「刷新中…」禁用 | — |
-| `_on_language_changed` | `(lang)` | 表头/占位符/按钮文字刷新并重建表 | — |
+| `_on_language_changed` | `(lang)` | 5 列表头/按钮文字（新建/改名/删除等）刷新并重建表 | — |
 
 **关键数据**：
 
-- 表格 4 列：`任务名称 / 状态 / 进度 / 发布时间`（`_COL_NAME=0` … `_COL_DATE=3`）；状态列用彩色方块+文字的 badge（`_STATUS_CONFIG`：pending 灰 `#757575`、in_progress 蓝 `#42A5F5`、completed 绿 `#66BB6A`）；进度列 `completed/total` 右对齐。
+- 表格 5 列：`任务名称 / 来源 / 状态 / 进度 / 发布时间`（`_COL_NAME=0`、`_COL_SOURCE=1`、`_COL_STATUS=2`、`_COL_PROGRESS=3`、`_COL_DATE=4`；列宽 90/150/110/130）。来源列「本机」绿色、「服务端」灰色；状态列用彩色方块+文字的 badge（`_STATUS_CONFIG`：pending 灰 `#757575`、in_progress 蓝 `#42A5F5`、completed 绿 `#66BB6A`）；进度列 `completed/total` 右对齐；名称 tooltip 显示描述。
 - 身份与地址：服务器地址/记住账号由 `LoginDialog` 校验后经 `MainWindow._show_login_flow` 写入（`settings.save_server_url` / `save_remembered_username`）；登录态 cookie 由 `TaskService.adopt_login` 接管；身份过滤 scope 经 `_identity_scope()` 传给 `core.task_record`。
 
-**调用关系**：由 `ui/main_window.py` 构造；任务服务信号在 `_connect_task_service` 中双向接线。依赖 `core.task_record`（`load_tasks`/`merge_backend_tasks`/`refresh_progress`/`mark_hidden`）、`config.settings`、`config.i18n`。
+**调用关系**：由 `ui/main_window.py` 构造；任务服务信号在 `_connect_task_service` 中双向接线。依赖 `core.task_record`（`load_tasks`/`merge_backend_tasks`/`refresh_progress`/`mark_hidden`/`is_local_task`/`create_local_task`/`rename_local_task`/`remove_local_task`/`TaskValidationError`）、`ui.task_create_dialog`、`config.settings`、`config.i18n`。
+
+### ui/task_create_dialog.py
+
+**作用**：本机任务对话框（v1.3.16）。`TaskCreateDialog` 采集「任务名称 + 目标段数 + 描述」，`TaskRenameDialog` 只改名称；两者都做实时校验并在对话框内拦住非法输入。落盘由调用方（`ui/task_page.py`）经 `core.task_record` 完成，本模块不写文件。名称规则与 `core.task_record.validate_task_name` 一致：只允许字母/数字/汉字/下划线/连字符（空格、点、斜杠等一律拒绝），去首尾空白后 ≤64 字符，拒绝 Windows 保留名与重名；因此**任务名 = 录制目录名 = 上传会话/项目名**。新建时显示本机目录预览与「仅当前身份可见」提示；若同名目录已存在（无任务记录的孤儿目录）给出追加录制警告（允许创建）。改名时若本机已有录制目录则禁用确认按钮并说明原因（改名不迁移数据）。
+
+**模块级**：
+
+| 名称 | 签名要点 | 作用 | 返回/副作用 |
+| --- | --- | --- | --- |
+| `_ERROR_TEXT` | dict | 错误码 → 中文源文案（缺失键回退「操作失败：code」） | — |
+| `task_error_text` | `(code, *args) -> str` | 错误码经 `tr()` 本地化（英文文案在 `config/i18n.py`） | str |
+| `_identity_display` | `(identity) -> str` | `"guest"` 显示「游客」，其余原样 | str |
+| `_label` / `_cancel_button` / `_ok_button` | 控件工厂 | 与 `LoginDialog` 一致的深色样式 | 控件 |
+
+**类/函数**：
+
+| 名称 | 签名要点 | 作用 | 返回/副作用 |
+| --- | --- | --- | --- |
+| `TaskCreateDialog` | `(parent=None, identity="guest")` | 新建任务对话框；`exec_()` 后 `name()/total_required()/description()` 取值 | — |
+| `_validate` | `() -> str` | 名称/段数/描述校验，返回错误码（空串=通过） | str |
+| `_refresh_state` | `()` | 实时刷新目录预览、错误/警告行、创建按钮可用性 | — |
+| `accept` | `()` | 再次校验后 `QDialog.accept()`（非法输入不关闭） | — |
+| `TaskRenameDialog` | `(parent=None, task=None)` | 改名对话框；`new_name()` 取值；本机已有录制目录时 `_has_data=True` 禁止确认 | — |
+| `_refresh_state` / `accept` | `()` | 校验新名称与目录占用，重复/非法/已有数据时保持打开 | — |
+
+**调用关系**：仅被 `ui/task_page.py` 构造；依赖 `core.task_record`（校验/常量）、`core.helpers`（`task_dir_of`/`list_task_episodes`）、`config.settings`、`config.i18n`。
 
 ### ui/upload_dialog.py
 

@@ -78,7 +78,9 @@
 | `params` | object | 任务自定义参数（如对象、用手等） |
 | `completed_count` | int | 录制完成次数（持久化权威值，每次录制完成 +1，与本地文件是否被删除无关） |
 | `status` | string | `pending` / `in_progress` / `completed`，每次加载时由 `completed_count` 与 `total_required` 重新推算 |
-| `hidden` | bool | 删除墓碑：用户删除过的任务标 `true`，防止后端再次推送时“复活”（任务页删除同时会真删本地录制目录与录制记录，这里只留墓碑；进度 `local_count` 不回退） |
+| `source` | string | `"local"` = 采集端自建任务（任务页「＋ 新建任务」创建，id 前缀 `local-`）；缺失 = 服务端任务/历史任务 |
+| `created_by` | string | 本机任务的创建身份（`"guest"` 或用户名）；**仅创建者可见**。缺失视为「无主」，对所有身份可见（兼容手工写的数据） |
+| `hidden` | bool | 删除墓碑：用户删除过的**服务端任务**标 `true`，防止后端再次推送时“复活”（任务页删除同时会真删本地录制目录与录制记录，这里只留墓碑；进度 `local_count` 不回退）。本机任务删除时**整条移除**，不留墓碑 |
 
 行为要点（均来自代码）：
 
@@ -90,9 +92,29 @@
 - 旧数据缺少 `completed_count` 时，一次性按 `data/recordings/<name>/` 下含
   `meta/info.json` 的会话目录数回填初值并写回，此后以持久化值为准。
 - 任务页「🗑 删除」= 真删除：先按 `<RECORDING_DIR>/<task_tag>/` 校验删净
-  （删不掉则弹窗报错且任务不隐藏），再删除该目录下的录制记录行，最后只在本
+  （删不掉则弹窗报错且任务不删除），再删除该目录下的录制记录行，最后只在本
   文件写 `hidden` 墓碑。`completed_count` 等进度计数按「持久化权威值」处理，
   不随删除回退。
+- **采集端自建任务**（`source="local"`，任务页「＋ 新建任务」）：
+  - 名称只允许字母/数字/汉字/下划线/连字符（拒绝空格、点、斜杠等），
+    去首尾空白后 ≤64 字符，大小写不敏感查重（含 `hidden` 与种子任务），
+    拒绝 Windows 保留名（CON/PRN/AUX/NUL/COM1-9/LPT1-9）。规则保证
+    `name == task_tag(name)`，即任务名 = 录制目录名 = 上传会话/项目名。
+  - `id` 形如 `local-YYYYmmdd-HHMMSS-<4hex>`；`assigned_user` 恒为 `null`
+    （不算指派任务），可见性由 `created_by` 决定：**仅创建者可见**，游客建的
+    只对游客可见。后端轮询不会删除本机任务（`merge_backend_tasks` 账号撤销
+    清除显式豁免本机任务）。
+  - 进度只在本机累计（`local_count`，`synced_count`/`backend_count` 恒 0）；
+    `pending_sync_tasks` 跳过本机任务，**不向服务器上报任务进度**。录制数据
+    仍按任务名正常上传，服务器按名称匹配/自动创建项目。
+  - 删除 = 真删本地目录 + 录制记录行 + 从本文件**整条移除**（后端永远不会
+    推送它，不需要 `hidden` 墓碑；同名任务可以重建）。
+  - 改名只对本机任务开放，且**本机已有录制目录时拒绝**（改名不迁移数据，
+    避免旧目录失去归属、上传队列路径脱节）；新名字目录已存在也拒绝。
+  - 服务端后来推送同名任务时走既有同名去重（`(name, assigned_user)`，按
+    `assigned_at` 新者胜出）：本机任务可能被隐藏，录制目录由同名服务端任务
+    继续使用，进度以服务端任务为准 —— 创建时会拒绝与现有任务重名，正常操作
+    不会主动制造这种情况。
 
 ### 2.4 `device_params.json`
 
@@ -297,14 +319,17 @@ data/recordings/                          # 录制根目录（settings.RECORDING
 
 ### 4.5.1 UMI 夹爪列与跨模态时间对齐
 
-启用夹爪时 episode parquet 增加下列稀疏列（无样本的行填 0/空）：
+启用夹爪时 episode parquet 增加下列稀疏列。**无样本的行**：`*_ns` 时刻列填
+`0`、3 向量力填 `[0,0,0]`、力矩阵填空 list —— 这个 0 是**哨兵不是时刻**
+（`features[...].missing_sentinel = 0` 已声明），读数时先滤掉再当时间轴用
+（实测 7%~15% 的行是这种：力按 30Hz 采、行也是 30Hz，相位不同步时必然有空窗）：
 
 | 列 | 类型 | 含义 |
 |---|---|---|
 | `observation.gripper_{left,right}_force` | list<float32, 3> | 3 向量力 `[fx,fy,fz]` mN |
-| `observation.gripper_{left,right}_force_ns` | int64 | 该力样本的采集时刻 |
+| `observation.gripper_{left,right}_force_ns` | int64 | 该力样本的采集时刻（宿主单调钟 ns；0 = 本行无样本） |
 | `observation.gripper_{left,right}_force_matrix` | list<int16> / list<float32> | 250×250×3 力矩阵（档位见下） |
-| `observation.gripper_{left,right}_force_matrix_ns` | int64 | 该力矩阵样本的采集时刻 |
+| `observation.gripper_{left,right}_force_matrix_ns` | int64 | 该力矩阵样本的采集时刻（0 = 本行无样本） |
 | `observation.slam_trajectory` | list<double> | 轨迹点 `[t,x,y,z,qx,qy,qz,qw]`×N，变长（坐标帧见下） |
 | `observation.slam_trajectory_ns` | list<int64> | 每个轨迹点对应取样帧的**宿主时刻**，与 `slam_trajectory` 同序等长 |
 | `observation.gripper_state` | list<float32, 3> | `[open_pct, gripped, fz_mn]` |

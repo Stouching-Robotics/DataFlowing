@@ -3,6 +3,12 @@ Task selection page - shown on startup. User selects a task, then clicks
 "Enter Collection" to switch to the data collection page.
 
 All task data reads from data/tasks.json via storage.task_record.
+
+本机任务（采集端自建）：
+  * 顶栏「＋ 新建任务」打开 TaskCreateDialog，写入 tasks.json（source=local）；
+  * 任务表「来源」列区分 服务端 / 本机；
+  * 本机任务支持右键/底部「✏ 改名」与「🗑 删除」（删除=真删数据 + 整条移除）；
+  * 本机任务仅创建者可见（过滤在 core.task_record.filter_by_identity）。
 """
 
 from __future__ import annotations
@@ -13,20 +19,26 @@ from PyQt5.QtGui import QColor, QPixmap
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QAbstractItemView,
-    QHeaderView, QMessageBox, QMenu,
+    QHeaderView, QMessageBox, QMenu, QDialog,
 )
 
 from config import settings
 from config.i18n import tr, lang_manager
 from core.task_record import (
     load_tasks, merge_backend_tasks, refresh_progress, mark_hidden,
-    filter_by_identity, _tid,
+    filter_by_identity, _tid, is_local_task, create_local_task,
+    remove_local_task, rename_local_task, TaskValidationError,
+    MAX_TASK_NAME_LEN, MAX_TASK_DESCRIPTION_LEN, MAX_TOTAL_REQUIRED,
+)
+from ui.task_create_dialog import (
+    TaskCreateDialog, TaskRenameDialog, task_error_text,
 )
 
 _COL_NAME = 0
-_COL_STATUS = 1
-_COL_PROGRESS = 2
-_COL_DATE = 3
+_COL_SOURCE = 1
+_COL_STATUS = 2
+_COL_PROGRESS = 3
+_COL_DATE = 4
 
 # Status display config
 _STATUS_CONFIG = {
@@ -165,6 +177,20 @@ class TaskSelectionPage(QWidget):
         )
         url_bar.addWidget(self._conn_label)
 
+        self._new_btn = QPushButton(tr("＋ 新建任务"))
+        self._new_btn.setFixedHeight(28)
+        self._new_btn.setCursor(Qt.PointingHandCursor)
+        self._new_btn.setToolTip(tr("在本机新建一个采集任务（仅自己可见，不需要服务器）"))
+        self._new_btn.setStyleSheet(
+            f"QPushButton {{ background:{settings.COLOR_BTN_DEFAULT_BG}; "
+            f"color:{settings.COLOR_TEXT_PRIMARY}; "
+            f"border:1px solid {settings.COLOR_BORDER}; "
+            f"border-radius:4px; padding:4px 14px; font-size:11px; }}"
+            f"QPushButton:hover {{ background:{settings.COLOR_BTN_HOVER}; }}"
+        )
+        self._new_btn.clicked.connect(self._on_new_task_clicked)
+        url_bar.addWidget(self._new_btn)
+
         self._refresh_btn = QPushButton(tr("🔄 刷新"))
         self._refresh_btn.setFixedHeight(28)
         self._refresh_btn.setStyleSheet(
@@ -179,10 +205,10 @@ class TaskSelectionPage(QWidget):
 
         root.addLayout(url_bar)
 
-        # ── Task table (4 columns) ──
-        self._table = QTableWidget(0, 4)
+        # ── Task table (5 columns) ──
+        self._table = QTableWidget(0, 5)
         self._table.setHorizontalHeaderLabels([
-            tr("任务名称"), tr("状态"), tr("进度"), tr("发布时间"),
+            tr("任务名称"), tr("来源"), tr("状态"), tr("进度"), tr("发布时间"),
         ])
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -197,12 +223,14 @@ class TaskSelectionPage(QWidget):
         hdr = self._table.horizontalHeader()
         hdr.setStretchLastSection(False)
         hdr.setSectionResizeMode(_COL_NAME, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(_COL_SOURCE, QHeaderView.Fixed)
         hdr.setSectionResizeMode(_COL_STATUS, QHeaderView.Fixed)
         hdr.setSectionResizeMode(_COL_PROGRESS, QHeaderView.Fixed)
         hdr.setSectionResizeMode(_COL_DATE, QHeaderView.Fixed)
+        self._table.setColumnWidth(_COL_SOURCE, 90)
         self._table.setColumnWidth(_COL_STATUS, 150)
-        self._table.setColumnWidth(_COL_PROGRESS, 100)
-        self._table.setColumnWidth(_COL_DATE, 110)
+        self._table.setColumnWidth(_COL_PROGRESS, 110)
+        self._table.setColumnWidth(_COL_DATE, 130)
 
         self._table.setStyleSheet(
             f"QTableWidget {{ "
@@ -255,6 +283,23 @@ class TaskSelectionPage(QWidget):
         )
         self._enter_btn.clicked.connect(self._on_enter_clicked)
         footer.addWidget(self._enter_btn)
+
+        self._rename_btn = QPushButton(tr("✏ 改名"))
+        self._rename_btn.setEnabled(False)
+        self._rename_btn.setMinimumSize(90, 40)
+        self._rename_btn.setCursor(Qt.PointingHandCursor)
+        self._rename_btn.setToolTip(tr("只对本机任务可用"))
+        self._rename_btn.setStyleSheet(
+            f"QPushButton {{ background:transparent; color:#42A5F5; "
+            f"font-weight:bold; font-size:13px; "
+            f"border:1px solid #42A5F5; border-radius:6px; padding:8px 16px; }}"
+            f"QPushButton:hover {{ background:#152A3A; }}"
+            f"QPushButton:disabled {{ "
+            f"color:{settings.COLOR_BTN_DISABLED_TEXT}; "
+            f"border-color:{settings.COLOR_BORDER}; }}"
+        )
+        self._rename_btn.clicked.connect(self._on_rename_clicked)
+        footer.addWidget(self._rename_btn)
 
         self._delete_btn = QPushButton(tr("🗑 删除"))
         self._delete_btn.setEnabled(False)
@@ -381,9 +426,25 @@ class TaskSelectionPage(QWidget):
         name_item.setData(Qt.UserRole, task)
         name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
         f = name_item.font(); f.setPointSize(10); f.setBold(True); name_item.setFont(f)
+        desc = (task.get("description") or "").strip()
+        if desc:
+            name_item.setToolTip(desc)
         self._table.setItem(row, _COL_NAME, name_item)
 
-        # Col 1: status badge (colored square + text)
+        # Col 1: source（服务端 / 本机自建）
+        local = is_local_task(task)
+        source_item = QTableWidgetItem(tr("本机") if local else tr("服务端"))
+        source_item.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+        source_item.setFlags(source_item.flags() & ~Qt.ItemIsEditable)
+        source_item.setForeground(
+            QColor(settings.COLOR_STOPPED) if local else QColor("#9E9E9E"))
+        if local:
+            source_item.setToolTip(tr(
+                "本机任务：仅创建者可见，进度只在本机记录；"
+                "上传时按任务名匹配/创建服务器项目"))
+        self._table.setItem(row, _COL_SOURCE, source_item)
+
+        # Col 2: status badge (colored square + text)
         status = task.get("status", _compute_status(task))
         cfg = _STATUS_CONFIG.get(status, _STATUS_CONFIG["pending"])
         color = cfg["color"]
@@ -402,7 +463,7 @@ class TaskSelectionPage(QWidget):
         dummy.setFlags(Qt.NoItemFlags)
         self._table.setItem(row, _COL_STATUS, dummy)
 
-        # Col 2: progress
+        # Col 3: progress
         total = task.get("total_required", 0)
         completed = task.get("completed_count", 0)
         progress_item = QTableWidgetItem(f"{completed}/{total}")
@@ -419,7 +480,7 @@ class TaskSelectionPage(QWidget):
         pf = progress_item.font(); pf.setBold(True); progress_item.setFont(pf)
         self._table.setItem(row, _COL_PROGRESS, progress_item)
 
-        # Col 3: date
+        # Col 4: date
         created = task.get("assigned_at", task.get("created_at", ""))
         date_item = QTableWidgetItem(_format_date(created))
         date_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -433,9 +494,14 @@ class TaskSelectionPage(QWidget):
         self._current_row = row
         if row < 0 or row >= len(self._tasks):
             self._enter_btn.setEnabled(False)
+            self._rename_btn.setEnabled(False)
+            self._delete_btn.setEnabled(False)
             self._selection_summary.setText("")
             return
         task = self._tasks[row]
+        local = is_local_task(task)
+        self._rename_btn.setEnabled(local)
+        self._delete_btn.setEnabled(True)
         status = task.get("status", _compute_status(task))
         if status == "completed":
             self._enter_btn.setEnabled(False)
@@ -463,13 +529,94 @@ class TaskSelectionPage(QWidget):
                 return
             self.task_selected.emit(task)
 
+    # ── 本机任务：新建 / 改名 ───────────────────────────
+
+    def _on_new_task_clicked(self):
+        """新建本机任务：对话框校验 → 写 tasks.json → 选中新行。"""
+        identity = self._identity or "guest"
+        dlg = TaskCreateDialog(self, identity=identity)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        try:
+            task = create_local_task(
+                dlg.name(), dlg.total_required(), dlg.description(),
+                created_by=identity)
+        except TaskValidationError as e:
+            QMessageBox.warning(self, tr("创建失败"),
+                                self._task_error_message(e.code))
+            return
+        except OSError as e:
+            QMessageBox.warning(self, tr("创建失败"), str(e))
+            return
+        self._refilter()
+        self._select_task_by_id(_tid(task))
+        self._selection_summary.setText(
+            tr("已新建任务: {}", task.get("name", "")))
+
+    def _on_rename_clicked(self):
+        """本机任务改名（只对本机任务；已有录制目录时对话框内拒绝）。"""
+        row = self._table.currentRow()
+        if row < 0 or row >= len(self._tasks):
+            return
+        task = self._tasks[row]
+        tid = _tid(task)
+        if not is_local_task(task):
+            QMessageBox.information(
+                self, tr("提示"), tr("只有本机任务可以改名。"))
+            return
+        dlg = TaskRenameDialog(self, task)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        new_name = dlg.new_name()
+        if new_name == (task.get("name") or ""):
+            return
+        try:
+            updated = rename_local_task(tid, new_name)
+        except TaskValidationError as e:
+            QMessageBox.warning(self, tr("改名失败"),
+                                self._task_error_message(e.code))
+            return
+        except OSError as e:
+            QMessageBox.warning(self, tr("改名失败"), str(e))
+            return
+        self._refilter()
+        self._select_task_by_id(tid)
+        self._selection_summary.setText(
+            tr("已改名: {}", updated.get("name", "")))
+
+    def _task_error_message(self, code: str) -> str:
+        """core 错误码 → 页面级弹窗文案（带占位符的补齐默认参数）。"""
+        if code == "name_too_long":
+            return task_error_text(code, MAX_TASK_NAME_LEN)
+        if code == "description_too_long":
+            return task_error_text(code, MAX_TASK_DESCRIPTION_LEN)
+        if code == "total_invalid":
+            return task_error_text(code, MAX_TOTAL_REQUIRED)
+        if code == "has_data":
+            return tr("该任务已有本地录制数据，改名会让数据失去归属；"
+                      "请先上传并删除本地数据后再改名。")
+        return task_error_text(code)
+
+    def _select_task_by_id(self, task_id: str) -> int:
+        """按 id 选中行（新建/改名后保持选中）；返回行号，未找到 -1。"""
+        for row, task in enumerate(self._tasks):
+            if _tid(task) == task_id:
+                self._table.setCurrentCell(row, _COL_NAME)
+                self._current_row = row
+                self._on_cell_changed(row, _COL_NAME, -1, -1)
+                return row
+        return -1
+
     def _do_delete_task(self):
         """Execute task deletion (called by both button and right-click).
 
         真删除：删掉该任务在本机的全部录制数据（<RECORDING_DIR>/<task_tag>/
-        整个目录）连同库里的录制行；tasks.json 只保留 hidden 墓碑（后端再次
-        推送时据此识别为已删除，否则任务会死而复生）。目录没删净就如实报错，
-        并且不隐藏任务（留给用户重试）。
+        整个目录）连同库里的录制行；目录没删净就如实报错，并且不删任务
+        （留给用户重试）。删除后的任务记录：
+          * 服务端任务 —— 只写 hidden 墓碑（后端再次推送时据此识别为已删除，
+            否则任务会死而复生）；
+          * 本机任务 —— remove_local_task() 整条移除（后端不会推送它，
+            不需要墓碑，同名任务可以重建）。
         """
         row = self._table.currentRow()
         if row < 0 or row >= len(self._tasks):
@@ -477,6 +624,7 @@ class TaskSelectionPage(QWidget):
         task = self._tasks[row]
         name = task.get("name", task.get("task_name", ""))
         tid = _tid(task)
+        local = is_local_task(task)
         from core.helpers import (delete_local_session, list_task_episodes,
                                   task_dir_of)
         task_dir = task_dir_of(settings.RECORDING_DIR, name)
@@ -501,12 +649,14 @@ class TaskSelectionPage(QWidget):
         else:
             ask = tr("确定要删除任务 \"{}\" 吗？\n\n本机没有该任务的录制数据。",
                      name)
+        if local:
+            ask += "\n\n" + tr("这是本机任务，删除后不会从服务器重新出现。")
         reply = QMessageBox.question(self, tr("确认"), ask)
         if reply != QMessageBox.Yes:
             return
         if has_dir:
             ok, err = delete_local_session(task_dir, 0)
-            if not ok:      # 目录没删净：不隐藏任务，让用户能重试
+            if not ok:      # 目录没删净：不删任务，让用户能重试
                 QMessageBox.warning(
                     self, tr("删除失败"),
                     tr("本地数据删除失败，任务未删除：\n{}", f"{task_dir} ({err})"),
@@ -520,13 +670,21 @@ class TaskSelectionPage(QWidget):
                 self, tr("提示"),
                 tr("录制记录删除失败：\n{}", str(e)),
             )
-        mark_hidden(tid)
+        if local:
+            remove_local_task(tid)
+        else:
+            mark_hidden(tid)
+        self._refresh_after_delete()
+
+    def _refresh_after_delete(self):
+        """删除后重载列表并清空选中态（按钮全部禁用）。"""
         self._tasks = filter_by_identity(load_tasks(), self._identity_scope())
         for t in self._tasks:
             t["status"] = _compute_status(t)
         self._rebuild_table()
         self._current_row = -1
         self._enter_btn.setEnabled(False)
+        self._rename_btn.setEnabled(False)
         self._delete_btn.setEnabled(False)
         self._selection_summary.setText("")
 
@@ -534,19 +692,25 @@ class TaskSelectionPage(QWidget):
         self._do_delete_task()
 
     def _on_context_menu(self, pos):
-        """Right-click context menu."""
+        """Right-click context menu（右键行即选中行，操作不会落到别的任务）。"""
         row = self._table.rowAt(pos.y())
         if row < 0 or row >= len(self._tasks):
             return
+        self._table.setCurrentCell(row, _COL_NAME)
         menu = QMenu(self)
         menu.setStyleSheet(
             f"QMenu {{ background:{settings.COLOR_BG_WIDGET}; "
             f"color:{settings.COLOR_TEXT_PRIMARY}; border:1px solid {settings.COLOR_BORDER}; }}"
             f"QMenu::item:selected {{ background:{settings.COLOR_BTN_HOVER}; }}"
         )
+        rename_action = None
+        if is_local_task(self._tasks[row]):
+            rename_action = menu.addAction(tr("✏ 改名任务…"))
         delete_action = menu.addAction(tr("🗑 删除任务"))
         action = menu.exec_(self._table.viewport().mapToGlobal(pos))
-        if action == delete_action:
+        if rename_action is not None and action == rename_action:
+            self._on_rename_clicked()
+        elif action == delete_action:
             self._do_delete_task()
 
     def _on_switch_clicked(self):
@@ -566,23 +730,27 @@ class TaskSelectionPage(QWidget):
         if self._current_row >= len(self._tasks):
             self._current_row = -1
             self._enter_btn.setEnabled(False)
+            self._rename_btn.setEnabled(False)
+            self._delete_btn.setEnabled(False)
             self._selection_summary.setText("")
 
     # ── Language ───────────────────────────────────────
 
     def _on_language_changed(self, lang: str):
         self._table.setHorizontalHeaderLabels([
-            tr("任务名称"), tr("状态"), tr("进度"), tr("发布时间"),
+            tr("任务名称"), tr("来源"), tr("状态"), tr("进度"), tr("发布时间"),
         ])
         self._server_label.setText(tr("服务器地址:"))
         self._identity_caption_label.setText(tr("当前身份:"))
         self._update_identity_label()
         self._switch_btn.setText(tr("切换账号"))
+        self._new_btn.setText(tr("＋ 新建任务"))
         self._refresh_btn.setText(tr("🔄 刷新"))
         self._enter_btn.setText(tr("→ 进入采集"))
+        self._rename_btn.setText(tr("✏ 改名"))
         self._delete_btn.setText(tr("🗑 删除"))
         self._update_connection_ui()
-        # Rebuild to refresh status labels
+        # Rebuild to refresh status/source labels
         self._rebuild_table()
         if 0 <= self._current_row < len(self._tasks):
             name = self._tasks[self._current_row].get("name", "")

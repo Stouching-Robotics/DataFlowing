@@ -764,14 +764,18 @@ class LiteWindow(QMainWindow):
 
     def _on_d435_frames(self, slot_id: str, frame: np.ndarray,
                         hardware_ns: int = 0, imu_samples: list = None,
-                        dev_key: str = None):
+                        extra: dict = None, dev_key: str = None):
         """D435 帧信号（主线程执行）：帧处理口径（calib 首帧注入/热力图/
-        录制写入）全在 d435_manager，lite 只把显示帧丢预览 ring。"""
+        录制写入）全在 d435_manager，lite 只把显示帧丢预览 ring。
+
+        extra: 逐帧时间戳诊断（v1.3.11，见 core/d435_camera._stamp_frame），
+        随行落 parquet 取证列。
+        """
         entry = self._workers.get(dev_key) if dev_key else None
         if not entry or entry.get("kind") != "d435":
             return
         display, _is_depth = self._d435_manager.process_frame(
-            entry, slot_id, frame, hardware_ns, dev_key)
+            entry, slot_id, frame, hardware_ns, dev_key, extra)
         self._ring[slot_id] = display   # last-write-wins，防积压
 
     def _preview_frame(self):
@@ -824,7 +828,9 @@ class LiteWindow(QMainWindow):
         """UVC 帧信号（主线程执行）：预览 ring + 录制写帧。"""
         self._ring[slot_id] = frame   # last-write-wins，防积压
         if self._pipeline.is_recording:
-            self._pipeline.write_external_frame(slot_id, frame, hardware_ns=0)
+            self._pipeline.write_external_frame(
+                slot_id, frame, hardware_ns=0,
+                capture_mono_ns=time.monotonic_ns())
 
     # ── 手套 ──────────────────────────────────────────
 
@@ -1077,8 +1083,9 @@ class LiteWindow(QMainWindow):
         if bridge is not None and hw_ns and hw_ns > 0:
             bridge.note_rgb_dispatch_lag(time.monotonic_ns() - int(hw_ns))
         if self._pipeline.is_recording:
+            # hw_ns 即采集回调里的 time.monotonic_ns()（bridge），当采集时刻用
             self._pipeline.write_external_frame(
-                sid, frame.copy(), hardware_ns=hw_ns)
+                sid, frame.copy(), hardware_ns=hw_ns, capture_mono_ns=hw_ns)
 
     def _on_gripper_pose(self, dev_key: str, position, quat, trajectory=(),
                          timestamp=None, host_ns=None):

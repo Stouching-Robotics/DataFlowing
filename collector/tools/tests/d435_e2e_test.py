@@ -73,10 +73,10 @@ def main():
     stats = {"frames": 0}
     rx_log = open("/tmp/d435_rx_log.txt", "w") if os.environ.get("D435_RX_LOG") else None
 
-    def on_frames(slot_id, frame, hw_ns, imu):
+    def on_frames(slot_id, frame, hw_ns, imu, extra=None):
         # 完全复刻 MainWindow._on_d435_frames 的录制链路
         if rx_log:
-            rx_log.write(f"{slot_id},{hw_ns}\n")
+            rx_log.write(f"{slot_id},{hw_ns},{extra}\n")
             rx_log.flush()
         if not calib_sent[0]:
             c = worker.get_calibration()
@@ -87,7 +87,8 @@ def main():
             pipe.write_depth(frame)
         else:
             pipe.write_external_frame(slot_id, frame.copy(),
-                                      hardware_ns=hw_ns, imu_samples=None)
+                                      hardware_ns=hw_ns, imu_samples=None,
+                                      extra=extra)
         stats["frames"] += 1
 
     worker.frames_ready.connect(on_frames)
@@ -194,21 +195,64 @@ def main():
     if not (0.040 < cal.get("baseline", 0) < 0.060):
         errors.append(f"baseline 异常: {cal.get('baseline')}")
 
-    # ── 5. 时间戳: data parquet 的 hardware_ns 列 ──────
+    # ── 5. 时间戳取证（v1.3.11）：一列一源 + 判重列 ────
     pq_path = pooled_data_parquet_path(ep, 1)
     if not os.path.isfile(pq_path):
         errors.append("缺少 data/chunk-000/episode-000.parquet")
     else:
         t = pq.read_table(pq_path)
-        n_ts = len(t.column("hardware_ns"))
+        hw = np.array(t.column("hardware_ns"), dtype=np.int64)
+        n_ts = len(hw)
         print(f"  hardware_ns 行数: {n_ts}")
+        for c in ("depth_ns", "rgb_dup", "rgb_gap",
+                  "depth_dup", "depth_gap", "ts_src", "host_ns"):
+            if c not in t.column_names:
+                errors.append(f"缺少时间戳取证列: {c}")
+        if "ts_src" in t.column_names:
+            src = np.array(t.column("ts_src"))
+            print(f"  ts_src 取值: {sorted(set(src.tolist()))} "
+                  f"(1=逐帧元数据)")
+            if set(src.tolist()) != {1}:
+                errors.append(
+                    f"ts_src 应为 1（彩色帧元数据），实测 {sorted(set(src.tolist()))}")
+        if "rgb_dup" in t.column_names and n_ts > 1:
+            dup = np.array(t.column("rgb_dup"))
+            gap = np.array(t.column("rgb_gap"))
+            d = np.diff(hw)
+            # v1.3.11：hardware_ns 在录制期已归一为「锚点 + 序号 × T」
+            # → 必须严格递增、且步长只有一种取值；补帧事实改由 rgb_dup 记录
+            steps = set(d.tolist())
+            print(f"  hardware_ns 步长取值={steps}（应为单一值）")
+            print(f"  补帧 {int(dup.sum())} / {n_ts}，跳号累计 {int(gap.sum())}"
+                  f"（这两个诊断列不受归一影响）")
+            if int((d <= 0).sum()):
+                errors.append(f"hardware_ns 非严格递增: {int((d <= 0).sum())} 处")
+            if len(steps) != 1:
+                errors.append(f"hardware_ns 步长不唯一（未归一？）: {sorted(steps)[:5]}")
+        # timestamp 必须是**采集侧**口径：它相对 hardware_ns 只允许有两个钟
+        # 基差 + 速率差（设备钟 0.032%），不允许把录制队列积压算进去
+        # （写入侧取戳会带来整段恒定的 3~5 帧 = 95~165 ms 台阶）
+        if "rgb_dup" in t.column_names and n_ts > 30:
+            ts = np.array(t.column("timestamp"), dtype=np.float64)
+            rel = (hw - hw[0]) / 1e9
+            d = ts - rel
+            drift = float(d.max() - d.min())
+            print(f"  timestamp - (hw-hw0): 起点 {d[0] * 1000:.1f}ms "
+                  f"终点 {d[-1] * 1000:.1f}ms 段内漂移 {drift * 1000:.1f}ms")
+            if drift > 0.030:
+                errors.append(
+                    f"timestamp 含队列积压（段内漂移 {drift * 1000:.1f}ms > 30ms）")
 
     # ── 6. 无 IMU（D435 不携带 IMU 样本） ────────────
     if os.path.isfile(pq_path):
         t = pq.read_table(pq_path)
-        n_imu = sum(len(x.as_py()) for x in t.column("observation.imu"))
-        if n_imu:
-            errors.append(f"不应存在 IMU 样本: {n_imu} 个")
+        # IMU 列是稀疏列：D435 无 IMU → 压根不写该列（不是空列）
+        if "observation.imu" in t.column_names:
+            n_imu = sum(len(x.as_py()) for x in t.column("observation.imu"))
+            if n_imu:
+                errors.append(f"不应存在 IMU 样本: {n_imu} 个")
+        else:
+            print("  observation.imu: 未写列（D435 无 IMU，符合稀疏列约定）")
 
     print()
     if errors:

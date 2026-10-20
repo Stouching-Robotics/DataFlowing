@@ -131,6 +131,11 @@ D435_FPS         = 30
 D435_DEPTH_NEAR_MM = 300           # 实时显示深度范围过滤（毫米，参考 S80M 深度 demo 0.3m）
 D435_DEPTH_FAR_MM  = 4000          # 实时显示深度范围过滤（毫米，4.0m）
 D435_PNG_COMPRESSION = 1           # 原始深度 PNG 压缩级（1 最快）
+# 录制期设备时间戳归一（v1.3.11）—— **所有 RGB 视频帧**（D435 / S80M / 夹爪 / UVC）
+# 的 hardware_ns 一律重写成「锚点 + 序号 × T」：一帧不丢，但时间戳均匀严格递增。
+# 原始值不丢：另存 raw_hw_ns 列；补帧/跳帧事实记在 rgb_dup/rgb_gap 等列。
+RECORD_UNIFORM_HW_TS = True
+RECORD_UNIFORM_LOCK_FRAMES = 60    # 收满这么多干净间隔后锁定 T（中位）
 D435_STALL_TIMEOUT_S = 5           # 流停滞阈值（秒）：连续无帧超过该值触发重连
                                    # （双 RealSense 第二台开流偶发静默停滞，无此
                                    # 看门狗会无限空转且无任何报错）

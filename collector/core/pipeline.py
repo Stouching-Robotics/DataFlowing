@@ -17,6 +17,7 @@ from config import settings
 from core.camera import CameraWorker, CameraState
 from core.egodata_writer import EgoDataWriter
 from core.frame_gap import GapWatch
+from core.timestamp_norm import UniformTsClock
 from core.timing import Stopwatch
 
 
@@ -59,6 +60,30 @@ class DropStats:
 #   imu_overflow                             遗留键：防丢缓冲超限次数，非帧
 _NON_FRAME_SUFFIXES = ("_ms", "_ns", "_count")
 _LEGACY_NON_FRAME_KEYS = frozenset({"imu_overflow"})
+
+# hardware_ns 的两种来源，决定要不要「均匀化」（见 _write_one_frame）：
+#   设备钟（D435: ts_src 1/2）—— rs2 syncer 会给本拍没出新帧的那一路补旧帧，
+#       于是戳出现 Δ=0 / Δ=2T，**不是到达时刻**，重排成均匀网格是有益的清理；
+#   宿主钟（夹爪 RGB / S80M 双目 / 裸手 UVC：包里或回调里的 time.monotonic）——
+#       戳就是采集时刻，逐帧间隔本来就是 30~33 / 36~38ms 双峰，重排成「序号×T」
+#       会让 hardware_ns 与真实采集时刻差到 ±100ms（实测 UMI 370~382 会话：
+#       锁定 T=33.1917ms vs 真实均值 33.33ms，一段累计差 −103ms）。
+_TS_SRC_DEVICE = (1, 2)
+
+
+def _stamp_is_device_clock(extra) -> bool:
+    """这一帧的 hardware_ns 是不是**设备钟**（只有设备钟才需要均匀化）。
+
+    只有 D435 会带 `extra.ts_src`（1=逐帧元数据 / 2=帧组硬件戳）；宿主钟来源的
+    帧不带 extra。宿主钟的戳原样落盘 ⇒ hardware_ns 与 timestamp 同源同值，
+    跨模态对齐再也没有「重采样网格」这层最多 ~100ms 的误差。
+    """
+    if not extra:
+        return False
+    try:
+        return int(extra.get("ts_src", 0) or 0) in _TS_SRC_DEVICE
+    except (TypeError, ValueError):
+        return False
 
 
 def is_frame_drop_key(key: str) -> bool:
@@ -162,6 +187,9 @@ class CameraPipeline(QObject):
         self._last_recording_frames: Dict[str, int] = {}  # 上一轮录制的每相机帧数快照
         self._start_time: float = 0.0
         self._episode_start_s: float = 0.0         # episode 起始 Unix 秒（用于相对时间戳）
+        # episode 起始的宿主单调钟 ns：有采集侧时刻时用它算 timestamp（v1.3.11）。
+        # 与 _episode_start_s（time.time()）是两个钟，不能混用；见 _write_one_frame。
+        self._episode_mono_base_ns: int = 0
         self._timer_running = False
         self._codec_name = ""
         self._session_path: Optional[str] = None
@@ -224,6 +252,14 @@ class CameraPipeline(QObject):
         self._external_queues: Dict[str, queue.Queue] = {}
         self._external_dims: Dict[str, tuple] = {}
         self._external_fps: Dict[str, float] = {}
+
+        # 录制期设备时间戳归一（v1.3.11）：每个槽位一个归一器（各自的锚点/周期）。
+        # v1.3.17 起**只对设备钟链路生效**（D435 的 extra.ts_src ∈ {1,2}）；
+        # 宿主钟链路（夹爪/S80M/裸手）原样落盘，理由见 _stamp_is_device_clock。
+        # 实现见 core/timestamp_norm.py
+        self._uniform_clocks: Dict[str, UniformTsClock] = {}
+        self._uniform_ts = bool(getattr(settings, "RECORD_UNIFORM_HW_TS", True))
+        self._uniform_lock = int(getattr(settings, "RECORD_UNIFORM_LOCK_FRAMES", 60))
 
         # B+ 方案: 独立写入线程，用 time.perf_counter() 精确控制 30fps
         self._write_thread: Optional[threading.Thread] = None
@@ -337,6 +373,20 @@ class CameraPipeline(QObject):
         self._external_dims.pop(slot_id, None)
         self._external_fps.pop(slot_id, None)
 
+    def _uniform_clock(self, sid: str) -> UniformTsClock:
+        """取该槽位的归一时钟（首次用到时按该槽位 fps 建标称周期）。"""
+        c = self._uniform_clocks.get(sid)
+        if c is None:
+            try:
+                fps = float(self._external_fps.get(sid)
+                            or settings.RECORDING_FPS or 30.0)
+            except Exception:
+                fps = 30.0
+            c = UniformTsClock(int(round(1e9 / max(fps, 1e-6))),
+                               self._uniform_lock)
+            self._uniform_clocks[sid] = c
+        return c
+
     def _drain_external_queues(self):
         """排空外部帧源队列（丢弃未消费的旧帧）。
 
@@ -355,19 +405,32 @@ class CameraPipeline(QObject):
 
     def write_external_frame(self, slot_id: str, frame: np.ndarray,
                              hardware_ns: int = 0,
-                             imu_samples: Optional[List] = None):
+                             imu_samples: Optional[List] = None,
+                             extra: Optional[dict] = None,
+                             capture_mono_ns: int = 0):
         """将外部帧推入录制队列（线程安全，非阻塞）。
 
         帧由写入线程以固定帧率均匀消费，保证输出视频无抖动。
 
         Args:
-            hardware_ns: 帧的 SDK 硬件纳秒时间戳（双目相机，与 IMU 同源）
+            hardware_ns: 帧的 SDK 硬件纳秒时间戳（双目相机，与 IMU 同源；
+                         D435 链路上 = **该路自己那一帧**的设备时钟，见
+                         core/d435_camera._stamp_frame）
             imu_samples: 本帧窗口内的 IMU 样本 [(ts_ns, gx,gy,gz, ax,ay,az), ...]
+            extra: 逐帧诊断（D435 时间戳取证）：depth_ns/rgb_dup/rgb_gap/
+                   depth_dup/depth_gap/ts_src/host_ns，逐列落 parquet
+            capture_mono_ns: **采集时刻的宿主单调钟 ns**（生产者侧取，越小越好）。
+                   给了它，parquet 的 timestamp 列就用「采集侧相对秒」而不是
+                   「写入侧相对秒」—— 后者会把录制队列的积压算进去（实测常驻
+                   3~5 帧 = 95~165 ms 且整段恒定，见 tmp_docfill/ts_audit 的
+                   UMI ep317~347 复核）。给 0（默认）= 保持旧口径，不影响
+                   既有调用方。
         """
         q = self._external_queues.get(slot_id)
         if q is not None and self._recording:
             try:
-                q.put_nowait((frame, hardware_ns, imu_samples))
+                q.put_nowait((frame, hardware_ns, imu_samples, extra,
+                              capture_mono_ns))
             except queue.Full:
                 # ★ v1.0.9 丢帧保 IMU：帧+hardware_ns 成对丢弃（视频帧与
                 # parquet 行同步少一行，序号对齐不受影响），但 stereo_left
@@ -533,6 +596,9 @@ class CameraPipeline(QObject):
         # 先设标志防重复触发，再后台初始化
         self._recording_slot = slot_id
         self._recording = True
+        # 每个槽位的归一时间轴随本段重锚（保留已锁定的 T）：跨 episode 的空档不被抹平
+        for _c in self._uniform_clocks.values():
+            _c.begin_segment()
         self._device_status.clear()          # 清空上一轮的状态
         self._start_time = time.monotonic()
         self._timer_running = True
@@ -621,6 +687,7 @@ class CameraPipeline(QObject):
         self._depth_frame_idx = {}
         self._last_depth_frames = {}
         self._episode_start_s = time.time()
+        self._episode_mono_base_ns = time.monotonic_ns()
 
         # 清空录制前残留的旧帧和传感器数据
         for sid, sl in self._slots.items():
@@ -736,7 +803,12 @@ class CameraPipeline(QObject):
                 while time.perf_counter() < next_write:
                     pass
             elif sleep_for < -frame_interval:
-                # 落后超过一帧（系统卡顿），重置时钟防止帧爆发
+                # 落后超过一帧（系统卡顿），重置时钟防止帧爆发。
+                # 记进 drop_stats：这一拍会让 wall_time 与采集时刻错开整整一行，
+                # 以前只能靠事后质检猜（见 data_qc 的 C5「帧级时刻差在漂」）。
+                self._drop_stats.inc("write_pacing_resync_count")
+                self._drop_stats.note_max(
+                    "write_pacing_lag_max_ms", int(round(-sleep_for * 1000.0)))
                 next_write = now + frame_interval
 
             # 推进到下一帧时刻（用 += 防止累积误差）
@@ -785,7 +857,13 @@ class CameraPipeline(QObject):
                         item = q.get_nowait()
                     except queue.Empty:
                         continue
-                    if isinstance(item, tuple) and len(item) == 3:
+                    extra = None
+                    cap_mono_ns = 0
+                    if isinstance(item, tuple) and len(item) == 5:
+                        frame, hw_ns, imu_s, extra, cap_mono_ns = item
+                    elif isinstance(item, tuple) and len(item) == 4:
+                        frame, hw_ns, imu_s, extra = item
+                    elif isinstance(item, tuple) and len(item) == 3:
                         frame, hw_ns, imu_s = item
                     else:  # 兼容旧格式（仅帧）
                         frame, hw_ns, imu_s = item, 0, None
@@ -793,6 +871,9 @@ class CameraPipeline(QObject):
                     # 而非生产者侧：只统计「确实进了队列、确实写进了视频」的
                     # 帧，队列满丢掉的帧已由 write_external_frame 的 ext: 计数
                     # 认领，两边不重复也不互相掩盖。
+                    # 空洞看门狗吃**原始**设备戳：归一在 _write_one_frame 出口才做，
+                    # 这里拿到的 hw_ns 仍是设备/宿主钟原值 —— 真实停流照常告警，
+                    # 不会被"均匀化"掩盖
                     self._note_ext_gap(sid, hw_ns)
                     # IMU 样本只随主槽位写入（左右目共享同一份，
                     # 避免 data/imu/ 出现重复行；S80M/夹爪各自的主槽）
@@ -820,6 +901,8 @@ class CameraPipeline(QObject):
                                           flip_vertical=False,
                                           hardware_ns=hw_ns,
                                           imu_samples=imu_s,
+                                          extra=extra,
+                                          capture_mono_ns=cap_mono_ns,
                                           glove_imu=glove_imu,
                                           glove_kpts=glove_kpts,
                                           gripper=gripper)
@@ -834,28 +917,60 @@ class CameraPipeline(QObject):
                          imu_samples: Optional[List] = None,
                          glove_imu: Optional[Dict[str, tuple]] = None,
                          glove_kpts: Optional[Dict[str, np.ndarray]] = None,
-                         gripper: Optional[Dict] = None):
+                         gripper: Optional[Dict] = None,
+                         extra: Optional[dict] = None,
+                         capture_mono_ns: int = 0):
         """写入单帧到 MP4 + Parquet。
 
         Args:
             flip_vertical: 是否在 write_video_frame 中上下翻转。
                            单目 CameraSlot 路径为 True（默认）；
                            双目外部帧路径为 False（已在 _on_stereo_frame 完成翻转）。
-            hardware_ns: SDK 硬件纳秒时间戳（双目相机帧）
+            hardware_ns: SDK 硬件纳秒时间戳（双目相机帧；D435 = 本路自己那帧）
             imu_samples: 本帧窗口的 IMU 样本列表（双目，随 stereo_left 携带）
+            extra: 逐帧诊断（D435 时间戳取证），落 parquet 稀疏列
+            capture_mono_ns: 采集侧宿主单调钟 ns；给了就用它算 timestamp
+                             （见 write_external_frame 的说明）
             glove_imu: {传感器名: (quats 64×f32, valid 16×f32)} USB 手套 IMU 快照
             glove_kpts: {传感器名: 63×f32 骨架关键点} USB 手套骨架快照
             gripper: UMI 夹爪稀疏列快照（P3/P4，见 write_gripper_*）
         """
         cam_frame_idx = self._per_cam_frame.get(sid, 0)
-        rel_ts = time.time() - self._episode_start_s
+        # ── 设备时间戳归一（v1.3.11；v1.3.17 起只对**设备钟**生效）──
+        # 设备钟（D435）：rs2 的 Δ=0/Δ=2T 是 syncer 补帧/跳号的产物，不是到达
+        # 时刻 ⇒ 重写成「本段首帧锚点 + 序号 × T」，均匀严格递增，原始值另存
+        # raw_hw_ns。
+        # 宿主钟（夹爪/S80M/裸手）：戳就是采集时刻，逐帧间隔的 30~38ms 双峰是
+        # 真实节奏 ⇒ **原样落盘**。以前一视同仁地重排，结果 hardware_ns 与真实
+        # 采集时刻能差 ~100ms（锁定 T 有偏 + 双峰随机游走），而 timestamp 仍是真的，
+        # 两者对不上，跨模态对齐被引到错的轴上。
+        raw_hw_ns = int(hardware_ns or 0)
+        hw_out = raw_hw_ns
+        if self._uniform_ts and raw_hw_ns and _stamp_is_device_clock(extra):
+            hw_out = self._uniform_clock(sid).to_ns(raw_hw_ns)
+        # timestamp = 帧的**采集**时刻相对 episode 起点的秒数。
+        # 采集侧时刻可用时优先用它：写入侧取戳会把录制队列的积压算进去
+        # （FIFO 里常驻 3~5 帧 = 95~165 ms，且整段恒定），于是 timestamp
+        # 与视频 PTS(i/30)、hardware_ns 三边对不上。
+        rel_ts = None
+        if capture_mono_ns and self._episode_mono_base_ns:
+            cand = (int(capture_mono_ns) - self._episode_mono_base_ns) / 1e9
+            # 防呆：生产者若把「另一个时基」的钟塞进 capture_mono_ns（例如设备钟
+            # 或跨机时钟），差值会是天文数字。只接受 [−1s, +1h] 的合理区间，
+            # 否则退回写入侧口径 —— 宁可回到旧口径，也不能把时间轴写歪。
+            if -1.0 <= cand <= 3600.0:
+                rel_ts = cand
+        if rel_ts is None:
+            rel_ts = time.time() - self._episode_start_s
         self._writer.write_video_frame(sid, frame, flip_vertical=flip_vertical)
         self._writer.write_frame_row(
             cam_frame_idx, rel_ts,
             sensors=sensor_data if sensor_data else None,
             connection_status=self._device_status,
-            hardware_ns=hardware_ns,
+            hardware_ns=hw_out,
+            raw_hw_ns=raw_hw_ns,
             imu_samples=imu_samples,
+            extra=extra,
             glove_imu=glove_imu,
             glove_kpts=glove_kpts,
             gripper=gripper,

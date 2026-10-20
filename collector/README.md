@@ -1,6 +1,6 @@
 # collector — Multimodal Data Acquisition SDK · 多模态数据采集 SDK
 
-![Version](https://img.shields.io/badge/version-1.3.15-blue)
+![Version](https://img.shields.io/badge/version-1.3.17-blue)
 ![Python](https://img.shields.io/badge/python-3.10-blue)
 ![License](https://img.shields.io/badge/license-TBD-lightgrey)
 
@@ -57,6 +57,10 @@ weights, and tests.
   EgoData / LeRobot v3 sessions
 - **HTTP upload**: post-recording upload to a self-hosted server, with
   optional auto-sync/delete of local files
+- **Tasks from the server or created locally**: the task page merges
+  backend-published tasks with a local cache; **＋ New Task** creates a
+  machine-local task (name / target episodes / description, visible only to its
+  creator) that can be renamed and deleted without a server
 - **Chinese / English UI switching** (i18n)
 - **3D hand keypoints**: D435 RGB-D pipeline
   ([tools/hand_3d_d435/](tools/hand_3d_d435/)), S80C / S80M stereo
@@ -411,6 +415,42 @@ are documented in [docs/index.md](docs/index.md#开发约定).
 
 ### Changelog
 
+- **v1.3.17** — time axis: stop lying about *when*. Two fixes, both change recorded values.
+  **(1) `hardware_ns` is only re-gridded for device-clock links now.** The
+  uniform-ts rewrite (`anchor + k × T`) was meant for the D435, whose `rs2`
+  syncer emits Δ=0/Δ=2T artefacts. Applying it to *host-stamped* links
+  (gripper RGB / S80M stereo / bare-hand UVC) replaced the true arrival instants
+  with a 30 fps grid: the locked `T` can be biased (measured 33.1917 ms vs a real
+  33.33 ms mean in one session) and the bimodal 30–38 ms arrivals make the
+  residual a random walk — `hardware_ns` drifted up to **±100 ms** away from the
+  true capture time within one episode while `timestamp` stayed correct.
+  Host-clock frames now keep their raw stamp (identical to `raw_hw_ns`);
+  `extra.ts_src ∈ {1,2}` (D435) still gets the uniform grid.
+  **(2) `wall_time` = episode start wall clock + row relative time** instead of
+  `time.time()` at row-write: the old value carried the write-queue backlog and
+  a whole row (33 ms) whenever the writer thread missed a tick (measured in 11
+  episodes). The writer now also counts those misses in `drop_stats`
+  (`write_pacing_resync_count` / `write_pacing_lag_max_ms`).
+  Both semantics are declared in `meta/info.json` → `time_axis`.
+  `tools/data_qc.py` 1.1.1 fixes the `max_segment_step_ms` unit (was ns reported as ms).
+
+- **v1.3.16** — collector-side task creation. The task page gains **＋ New Task**:
+  enter a name, target episode count and optional description, and the task is
+  stored in `data/tasks.json` as `source="local"` (id prefix `local-`,
+  `created_by` = current identity). Local tasks are **visible only to their
+  creator**, their progress stays **local-only** (skipped by
+  `pending_sync_tasks`, so nothing is reported to the server), but recorded data
+  still uploads and the server matches/creates the project by task name. Names
+  must be directory-safe (letters/digits/Chinese/`_`/`-`, ≤64 chars, no
+  duplicates, no Windows reserved names) so that task name = recording directory
+  = upload project name. The task table grows to 5 columns with a **Source**
+  column (Server/Local); local tasks can be **renamed** (only while no local
+  recording directory exists) and deleted like server tasks (real data deletion;
+  local tasks are removed from `tasks.json` entirely instead of leaving a hidden
+  tombstone). Also fixes: the task page's Delete button was never enabled after
+  selecting a row, and right-click deletion acted on the previously selected row
+  rather than the clicked one. Tests: `tools/tests/test_task_create.py` (new) and
+  section 4 of `test_task_delete.py`; docs and the user manual (5.4) updated.
 - **v1.3.15** — pose-semantics documentation/comment corrections, a gripper
   pairing error-message split, and a chunk-aware episode-number fix in lite.
   **Fixed a false equation**: `finish_publish_pose`'s docstring asserted
@@ -1050,6 +1090,9 @@ HTTP 上传，输出 [EgoData](https://github.com/facebookresearch/egodata) /
 - **BLE 数据手套**：左右手各一只，触觉数据与视频同步采集
 - **录制历史与回放**：SQLite 持久化，兼容 EgoData / LeRobot v3 会话
 - **HTTP 上传**：录制完成后上传至自建服务器，可自动同步/删除本地文件
+- **任务可来自服务器，也可在采集端自建**：任务页合并后端下发与本地缓存；
+  「＋ 新建任务」在本机创建任务（名称 / 目标段数 / 描述，仅创建者可见），
+  支持改名与删除，不需要服务器
 - **中英文界面切换**（i18n）
 - **手部 3D 关键点**：D435 RGB-D 管线（[tools/hand_3d_d435/](tools/hand_3d_d435/)）、
   S80C / S80M 双目三角化、MediaPipe 裸手管线，另有黑手套专用管线
@@ -1359,6 +1402,30 @@ i18n 文案经 `tr()` 翻译、PyQt5 信号参数用 `object` 封送大整数、
 
 ### 更新记录
 
+- **v1.3.17** —— 时间轴：不再谎报「什么时候」。两处改动都会改变落盘数值。
+  **① `hardware_ns` 只对设备钟链路重排**。均匀化（「锚点 + 序号 × T」）本来是为
+  D435 修的（`rs2` syncer 会补帧/跳号，戳出现 Δ=0 / Δ=2T）；一视同仁地套到
+  **宿主戳**链路（夹爪 RGB / S80M 双目 / 裸手 UVC）上，等于把真实到达时刻换成
+  30fps 网格：锁定的 T 可能有偏（实测一段会话 33.1917ms vs 真实均值 33.33ms），
+  叠加 30~38ms 双峰到达，残差是随机游走 —— `hardware_ns` 在一段内能偏离真实采集
+  时刻 **±100ms**，而 `timestamp` 仍是对的，两者对不上。现在宿主钟帧**原样落盘**
+  （与 `raw_hw_ns` 相同），只有 `extra.ts_src ∈ {1,2}`（D435）才重排。
+  **② `wall_time` = 本段起始墙钟 + 行相对时刻**，不再是落行那一刻的 `time.time()`：
+  旧值会带上写队列积压，写线程掉一拍就差整整一行（实测 11 段差 33ms）。掉拍现在
+  记进 `drop_stats`（`write_pacing_resync_count` / `write_pacing_lag_max_ms`）。
+  两条语义都写进 `meta/info.json` 的 `time_axis`。
+  质检器 `tools/data_qc.py` 1.1.1 修 `max_segment_step_ms` 单位（原来 ns 当 ms 报）。
+
+- **v1.3.16** —— 采集端自建任务。任务页新增「＋ 新建任务」：输入名称、目标段数、描述，
+  以 `source="local"`（id 前缀 `local-`、`created_by` 记当前身份）写入
+  `data/tasks.json`。本机任务**仅创建者可见**、进度**只在本机**（`pending_sync_tasks`
+  跳过，不上报服务器），但录制数据仍可上传，服务器按任务名匹配/自动创建项目。
+  名称必须目录安全（字母/数字/汉字/`_`/`-`、≤64 字符、不重名、非 Windows 保留名），
+  因此任务名 = 录制目录名 = 上传项目名。任务表 4 列 → 5 列（新增「来源」= 服务端/本机）；
+  本机任务可**改名**（仅在没有本地录制目录时）与删除（真删数据；本机任务从 `tasks.json`
+  整条移除，不留 hidden 墓碑）。顺手修两处既有问题：任务页「🗑 删除」按钮选中行后一直
+  禁用从未启用；右键删除作用于之前选中的行而非右键行。测试：`tools/tests/test_task_create.py`
+  （新增）+ `test_task_delete.py` 第 4 节；文档与使用手册 5.4 同步。
 - **v1.3.15** —— 姿态语义的文档/注释校正 + 夹爪配对报错分型 + lite 取号跨 chunk。
   **修一处数学错误**：`finish_publish_pose` 的 docstring 把
   `M·(R0ᵀ·R)·Mᵀ = (M·R0ᵀ·Mᵀ)·(M·R·Mᵀ)·(M·R0ᵀ·Mᵀ)ᵀ` 写成恒等式，代数上不成立

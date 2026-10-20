@@ -14,6 +14,9 @@
 | `tools/diag_frame_layout.py` | ctypes 直连 FaysSense SDK 打印标定/帧布局/双目相关性（需 `FAYSSENSE_SDK_DIR`） |
 | `tools/diag_frame_trace.py` | 陈旧帧取证：判「只戳错（H1）」还是「旧帧被重投递（H2）」（离线读取证目录，不需相机） |
 | `tools/audit_frame_gaps.py` | 帧空洞全库审计：画面复核判「真丢/画面连续/判不了」+ 双钟定性（只读，见「诊断工具」节） |
+| `tools/data_qc.py` | 数据集时间轴质检器：五项基础检查（回退/重复/跳变/帧数不齐/时钟偏移）+ **PDF 报告**（`--pdf`），零配置可复用、自带合成自检（只读，见「诊断工具」节） |
+| `tools/trim_episode_tail.py` | 裁掉 episode 尾部 N 秒（parquet + meta + 视频一起，默认预演/自动备份），用于尾部模态缺失的对齐（见「诊断工具」节） |
+| `tools/make_qc_report.py` | **薄封装**（已并入 `data_qc.py --pdf`），仅保留旧命令可用 |
 | `tools/hand_3d_d435/` | D435 RGB-D 单目 3D 手部关键点独立模块（实时 demo + 离线批处理 + 验收探针） |
 | `tools/hand_3d_d435/probes/` | 6 个离线验收探针（对齐/一致性/完整性/标签/传播/骨长） |
 | `tools/hand_3d_d435/tools/` | 3 个配套小工具（parquet 渲染、交付版 demo 导出、标定提取） |
@@ -420,6 +423,190 @@ venv/bin/python tools/audit_frame_gaps.py [任务目录] [选项]   # 默认 dat
 （10 组、全合成 fixture，不依赖真机数据；含「渐变条」画面模型使一帧运动量与 30 帧
 运动量在数值上分得开，以及「静止场景不许判成没丢」的反向用例）。
 
+#### `data_qc.py`
+
+**作用**：录制数据的**时间轴质检器**（只读，不写任何东西）—— 把「这段数据的时间轴
+能不能用」变成可量化、可回归、可进 CI 的判据。与 `audit_frame_gaps.py` 的分工：
+后者是**像素级取证**（判视频真丢没丢，需 ffmpeg 画面复核）；本脚本是**时间轴体检**
+（只看戳，不碰像素，全库 25 段 3.0GB 约 0.8s 跑完），两者互补。
+
+```bash
+venv/bin/python tools/data_qc.py <数据集目录>                    # 只读体检，打印报告
+venv/bin/python tools/data_qc.py <数据集目录> --json qc.json     # 另存机器可读报告
+venv/bin/python tools/data_qc.py --selftest                     # 判据自检（合成数据，不碰真实数据）
+```
+
+选项：`--config F.json`（深度合并到默认值）、`--episodes 000,001`（或全局号 1,2）、
+`--jobs N`（默认 `min(4,CPU)`，`1` 为串行便于调试）、`--check-video`（额外用
+`ffprobe` 读头部比「视频帧数 vs parquet 行数」，默认关）、`--strict`（有 warn 也
+返回 1）、`--out-dir DIR`（同时落 `report.json`/`report.txt`）、`--top N`、
+`--list-streams`（只打印推断出的流模型）、`--emit-config F.json`（导出可改的配置模板）、
+`--pdf PATH`（出 PDF 报告，见下）。
+
+**五项检查**（用户口径 → 实现判据）：
+
+| 编号 | 名称 | 判据 |
+|---|---|---|
+| C1 | 时间戳回退 | 相邻样本 `d = v[i+1] − v[i] < 0`。分**行内回退**（同一帧行的样本列表内）与**跨行回退**（上一行末样本 > 下一行首样本）。±2^32/2^64 计数器**绕回**自动识别解卷，单列 info、不算回退。**样本流（见下）先剔除 0 占位行再判** |
+| C2 | 时间戳重复 | `|d| ≤ 该列量化步长`。分**行内重复**（恒 error）与**跨行重复**（同一样本被挂进两行，可能只是重报，按比例定级 warn/error） |
+| C3 | 时间戳跳变 | `d > gap_factor × 标称周期` 且超出量 ≥ `min_excess_ms` ⇒ **空洞**（给出毫秒数、×标称倍数、折算丢几个样本）；`d < compress_factor × 标称` ⇒ **压缩**（攒批突发，与空洞成对出现，info） |
+| C4 | 不同数据帧数不齐 | 七项子检查：meta `length` vs 实际行数、`frame_index` 连续性、各流**段中间空行**与**攒批行**、实测采样率 vs 声明 `rate_hz`、流覆盖率、**成对的 ts 列与数值列存在性是否对齐**、同频各流样本数是否互相对得上、**与 `meta/episodes` 的 `drop_stats` 自报计数对账**（见下） |
+| C5 | 不同时间戳有偏移 | ① 每个流相对**同域参考帧列**的偏移（中位数/IQR/漂移 ppm/分段台阶），与基线比；② 同域且**锚定同一参考列**的两流相互偏移（如左右手套失同步）；③ 帧级时间列两两之间的偏移**稳定性**（跨时钟纪元时刻只判稳定性，不判绝对值） |
+
+另附 C6 结构一致性（数据集级）：`N = c × chunks_size + f + 1` 编号公式、`episode_index`
+重号、data 与 meta 的 `episode_index` 是否一致。
+
+**三条流速（1.1.0 起）**——决定 C1~C5 各按什么口径判：
+
+| 类型 | 是什么 | 怎么判 |
+|---|---|---|
+| `frame` | 行自己的时刻：`timestamp`/`wall_time`/`hardware_ns`/`raw_hw_ns`/`host_ns`/`depth_ns`/`frame_index` | 五项全查；严格单调是硬要求 |
+| `list` | 一行挂多个样本的变长戳：手套 `ts`、`imu_ts_ns`、`slam_trajectory_ns` | 标称周期取**平均**间隔（不是中位——攒批流是双峰，中位会落到短峰上）；间隔呈攒批（p95 ≥ 1.5×中位）时空洞还须超过 1.5×p95，error 门槛取 2×p95 —— SLAM 位姿实测就是 20/20/60 三连发，这不是丢样本 |
+| `sample` | 每行**至多一个**采样值、采样时刻与行时刻无关的标量 `*_ns`（夹爪力的 `*_force_ns`/`*_force_matrix_ns`，`encoding=host_monotonic_ns`） | `0`（`features.missing_sentinel`）= **本行没有样本**，不是时刻 0：剔除后再判回退/重复；缺样本只按覆盖率报 info（<50% 属正常相位差），比例过高才 warn；比的是**行号配对偏移**（样本戳 − 本行帧戳），中位报 info（队列滞留差），IQR/台阶才升 warn/error |
+
+**稀疏列**：`pq.read_table` 只取本段真实存在的列；某段整列没有某条流时按 C4
+「本段整列缺失（0 样本）」报，**不再**把 `No match for FieldRef.Nested(...)` 记成
+C6 结构 error（那会让该段的 C1~C5 一条都没查过）。流模型取自所有段 schema 的**并集**。
+
+**drop_stats 对账（C4 里最有价值的一条）**：`meta/episodes/*.parquet` 的 `drop_stats`
+是**录制器自己记的账**（`frames_without_left_hand` / `hand_samples_right` /
+`imu_samples` / `frames_without_imu` …），本工具从时间戳列**独立数**出同样的量，两边
+逐项比。键↔流按名字 token 自动配对（`frames_without_*` → 空行数，`*_samples` → 样本数；
+含 `unpaired/unknown/dropped` 等限定词的键跳过，它们不是总数），也可在配置的
+`drop_stats_map` 里写死。**记住不能把配到同一条流的多个时间戳列求和** —— 宿主戳列和
+设备戳列是同一条物理流的两个副本，计数本来就相等。
+
+实测（25 段 × 6 项 = 144 项，**全部一致，0 项对不上**）。这条对账的实际用途：
+episode-003 右手套尾部掉了 19 帧，本工具数出 19 个空行、录制器自报
+`frames_without_right_hand: 19`、`status.right_glove` 在**完全相同的** 1455..1473 行
+从 `connected` 翻成 `unmatched` —— 三方独立互证，缺陷是真的，不是工具的口径问题。
+
+**判据里三条最要紧的认知**（不认识会得出错结论）：
+
+1. **三个时钟纪元各不相同**，绝对差没有意义 —— 相机设备钟（`hardware_ns`）、手套设备
+   钟（`*_glove_device_ts_ns`）、宿主钟（`wall_time`/`*_glove_ts_ns`/`slam_trajectory_ns`）
+   各自从 0 起。所以 C5 只比**同域且锚定同一参考列**的流；跨纪元只判**稳定性**（漂移、
+   台阶），因为「差值在变」永远说明有问题，而「差值是多少」不一定。
+2. **左右手套的设备计数器是两个独立计数器**（各自开机时刻不同，纪元差几百 ms 到几秒），
+   拿它们的绝对值相减得到的是「各自何时上电」，不是失同步 —— 这类无参考列的流直接不
+   参与成对比较；左右手套的同步性要看它们的**宿主戳**（实测中位 −0.5ms）。
+3. **偏移基线是数据自带的**：手套宿主戳为对齐视频被**故意**整体 +85/+115ms（见
+   `meta/info.json` 的 `alignment.glove_shift_ms`）。所以「手套 − SLAM ≈ 基线」是设计
+   要求，不是缺陷；只有**偏离基线**才算。基线自动读 `info.json`，也可在 `--config`
+   的 `baselines` 里写（支持 fnmatch 通配）。
+
+**复用方式**：零配置可用（流的清单、时钟域、标称率、配对列全部从 `info.json` 的
+`features[].rate_hz / clock / ts_key` 推出）；`info.json` 缺失时按「列类型 + 列名」自动
+发现（`list<整数>` 且名字像戳）；连 `data/` 目录结构都没有时，接受「目录本身就是一堆
+parquet」。只 import `numpy` + `pyarrow`，不 import `core/`，可直接拷到别的项目跑。
+
+**PDF 报告**（`--pdf 报告.pdf`）：把五项检查的结果渲染成 A4 PDF，版式对齐客户给的
+《1013视塔手套数据质检.pdf》（GitHub-Markdown 风格：编号检查表 + ✅/⚠/❌ 徽标 +
+运行页眉 + 底部居中页码）。报告结构：1 数据结构与基础信息（目录树 / 概览 / 数据字段 /
+视频规格）→ 2 质检结果（2.1 文件完整性、2.2 时间戳质量**五项基础检查**、2.3 手套数据
+质量、2.4 视频帧数↔行数一致性、2.5 drop_stats 对账）→ 3 结论与建议。
+
+选项：`--pdf-title T`（默认「数据质检报告」）、`--pdf-date D`、`--pdf-html PATH`
+（保留中间 HTML）、`--chrome PATH`。多数据集时 `--pdf` 是**合并成一份**报告，而
+`--json`/`--emit-config` 会自动加数据集名后缀、`--out-dir` 各占一个子目录。
+
+**为什么走 CDP 而不是 `chrome --print-to-pdf`**：命令行版只能用 Chrome 自带的页眉页脚
+（日期在左、标题在右、URL 在左下），改不了；CDP 的 `Page.printToPDF` 收
+`headerTemplate`/`footerTemplate`，才能做成参考件那样「标题在左、日期在右、底部居中
+N/M」。实现要点：Chrome 必须带 `--remote-allow-origins=*`，否则 CDP 的 WebSocket 握手
+会被 403 拒掉；WebSocket 用 `websocket-client`。**这两样都是惰性使用** —— 不出 PDF 时
+本文件仍然只依赖 numpy + pyarrow，可以单独拷走。
+
+报告段自己现采的指标（质检器本体不管）：手套 NaN 占比、IMU valid 通道占比、四元数模长
+及偏离 >1% 的个数、**活跃传感器数**（16 传感器 × 16 轴分组，任一轴在动即算活跃）、视频
+编码/分辨率/像素格式/帧率/帧数、逐段时长、以及每个数据集的**数据指纹**（info.json /
+data / meta 三处 mtime）。
+
+**数据指纹与陈旧守卫**：导出管线是边写边替换的（先 data、再 meta/episodes、最后
+info.json），报告若落在中间窗口，会拿**新数据**配**旧元数据**，把「读不到时钟域/参考列」
+误报成满屏缺陷 —— 2026-10-15 踩过一次（24 段各报 2 条，共 48 条假警告）。现在报告会
+比对三处 mtime：差**秒~1 小时**判为「导出中途」（红，结论不可信，请重跑）；差**几小时
+以上**判为「元数据没跟数据一起重建」（黄，建议一并重建）。
+
+也可当库用：
+
+```python
+import data_qc
+reps = [data_qc.run(d, data_qc.DEFAULT_CONFIG) for d in dirs]
+data_qc.write_pdf_report(dirs, reps, "报告.pdf")
+```
+
+**退出码**：0 = 无 error（有 warn 仍为 0，除非 `--strict`）；1 = 有 error 级问题；
+2 = 用法/读取错误。适合直接接 CI 回归。
+
+**自检**：`venv/bin/python tools/data_qc.py --selftest` —— 现场合成 9 段数据（1 段干净 +
+5 段各注入 C1~C5 一类缺陷 + 3 段验新口径：样本流 0 占位不算回退/重复、稀疏列不算读不动、
+20/20/60 攒批不算丢样本而只报注入的 200ms 断流。时间轴形状刻意贴近真实数据：手套
+2.03 样本/行、IMU 16.71 样本/行、`floor` 量化模拟「样本挂到帧行」的抖动），断言
+「该报的报了、干净段一个 warn 都没有」。
+**改判据先跑它。**
+
+**基线数据实测**（2026-10-15，`/home/stouch/out/offline/Data_examples_2`，25 段 / 78,181 帧 /
+3.0GB / 0.8s）：无 C1、无 C2；C3 只有 episode-000 的左手套 7 处空洞（最大 166.8ms =
+10.0× 标称，折合丢约 35 个样本）+ 右手套 2 处（最大 66.7ms）；C4 抓到段中间掉样本
+（ep000 左手套 14 行、ep003 右手套 18 行）与同频各流样本数差（ep000 少 52 个）；
+C5 抓到 episode-002 右手套宿主戳比基线偏 −29.4ms。IMU↔`hardware_ns` 偏移全程
+−22.07ms（IQR 1.6ms）、手套↔`wall_time` IQR ~8ms，说明这些流本身是稳的。
+
+#### `trim_episode_tail.py`
+
+**作用**：裁掉 episode 尾部的 N 秒（默认 1 秒），把「尾部先停的模态」对齐掉
+——主要给「某流最后若干行没有样本」的段用（例：episode-003 右手套段末 19 帧无样本，
+而 RGB/左手套/IMU/SLAM 一直录到最后一帧）。默认**预演**，`--apply` 才落地。
+
+```bash
+venv/bin/python tools/trim_episode_tail.py <数据集目录> --episodes 003          # 预演
+venv/bin/python tools/trim_episode_tail.py <数据集目录> --episodes 003 --apply   # 落地（自动备份）
+```
+
+选项：`--seconds 1.0` / `--frames N`（按 `info.json` 的 fps 折算）、`--episodes`
+（三位段号或全局号，默认全部）、`--no-video`、`--no-backup`、`--force`
+（已在 `info.json` 记录过也照做）、`--recalc-stats`（**危险**，见下）。
+
+**四件事一起做**（顺序不能反）：data parquet 行切片 → 视频 `-c copy` 裁到同帧数 →
+`meta/episodes` 同步 `length`/`end_frame_index`/`duration_sec`/`video_codec.frames`
+与 `drop_stats` 里**由保留行决定**的计数（`frames`/`last_user_data_seq`/
+`hand_samples_*`/`frames_without_*`/`imu_samples`；会话级累计计数如 `dropped_bytes`
+保持原值）→ 在 `info.json` 写 `tail_trim` 记录。备份落在 `_pre_tail_trim/`
+（按相对路径镜像，否则 data/ 与 meta/ 下的同名 `episode-NNN.parquet` 会互相覆盖）。
+
+**两条实测口径**：
+
+* **`-c copy` 可以精确裁到任意帧，不限于关键帧**。ep003（h264 3200×1200 / GOP=30 /
+  1474 帧 / 关键帧在 0,30,…,1440,1470）用 `-c copy -frames:v 1444` 得到恰好 1444 帧，
+  保留帧 0/720/1440/1441/1442/1443 与原件**逐像素 md5 相同**（断点之后的 B/P 帧
+  回溯引用的关键帧 1440 仍在保留区间内）。耗时 0.07s，无需重编码。
+* **`video == rows` 是全库不变量**（24 段无一例外），所以两边必须一起裁，否则
+  `data_qc.py --check-video` 会报、按帧号取图的工具会错位。
+
+⚠ **stats.json 默认不动**，两个原因：① `core.helpers.recalc_stats` 走 `np.stack`，
+对「每行样本数不等」的列（本数据集 `observation.left_glove` 每行 1/2/72 个样本）
+会抛 `ValueError` 被 `except` 静默 `continue`，等于**把该列从 stats.json 删掉**；
+② stats.json 由池化转换器产出，本就可能落后于数据（本次实测它记的是上一版
+25 段 / 157,825 个手套样本，而数据已是 24 段 / 138,433）。要准请在导出管线里重新生成。
+
+**局限**：裁尾**修不了段中间的缺失**。落地前工具会把「裁后仍存在的空行」逐流打出来
+核对（本次结果：`slam_trajectory_ns×1` —— SLAM 首行恒为空，是全库 24 段共有的头部
+形状，裁尾不改变它）。
+
+#### `make_qc_report.py`
+
+**已并入 `data_qc.py` 的 `--pdf`**，本文件保留为**薄封装**（把老参数翻译过去，
+自身无逻辑，只有一份实现）——旧命令仍可用：
+
+```bash
+venv/bin/python tools/make_qc_report.py <数据集目录> [...] -o 报告.pdf
+# 等价于
+venv/bin/python tools/data_qc.py <数据集目录> [...] --pdf 报告.pdf
+```
+
+PDF 的采集/版式/渲染细节全部见上一节 `data_qc.py` 的「PDF 报告」小节。
+
 ## tests/ 测试
 
 测试脚本见 `tools/tests/`（当前 79 份；离线测试加 `QT_QPA_PLATFORM=offscreen` 无需任何硬件，真机测试需对应设备在线）。完整运行命令见 `README.md` 测试节。**下表只列了一部分**（早期 16 份 + 帧空洞相关的 5 份 + 夹爪配对/离线入口 + 位姿坐标帧的 5 份 + 删除真删除的 3 份 + 发布死区/跳变门的 3 份），其余按需现查文件名。
@@ -461,5 +648,6 @@ venv/bin/python tools/audit_frame_gaps.py [任务目录] [选项]   # 默认 dat
 | `test_gripper_pose_deadband_publish.py` | 离线 | 死区真接在**发布出口**（`_publish_pose`）：静止发旧值、节拍/序号/丢失计数不变、每个发布值都是某帧原始值的发布帧像（替换而非插值/平均）、重锚丢参照、开机日志有那行可验收 |
 | `test_pose_guard_limits.py` | 离线 | 跳变门夹在实测包络中间（真实单步 ≤0.0601m 放行 / 异常 ≥0.1075m 拦下）、限值不再随 20/20/60ms 抽帧膨胀、native `kPose*` 与 Python 常量逐字一致 |
 | `test_local_delete.py` | 离线 | 删除即真删除：池化一段的三处文件（data/视频/meta）都清掉且不牵连邻居、删不掉时 `False` + 残留清单 + 中文报错而不是假装删掉、旧格式会话目录 rmtree 复检、录制行真删（含尾斜杠归一化、空路径 0 行） |
-| `test_task_delete.py` | 离线 | 任务页「🗑 删除」= 真删目录 + 真删录制行 + 只留 `hidden` 墓碑（确认框写明目录与片段数）；目录删不掉时**不隐藏任务**并弹窗报错 |
+| `test_task_delete.py` | 离线 | 任务页「🗑 删除」= 真删目录 + 真删录制行 + 只留 `hidden` 墓碑（确认框写明目录与片段数）；目录删不掉时**不隐藏任务**并弹窗报错；第 4 节：本机任务（`source=local`）删除 = 真删目录/录制行 + `tasks.json` 整条移除（无墓碑），确认框标明本机任务 |
+| `test_task_create.py` | 离线 | 本机任务（v1.3.16）9 节：创建字段/`source`/`created_by`/进度初值；名称校验（空、超长、空格/点/斜杠/制表、Windows 保留名、大小写不敏感重名、hidden 墓碑重名）；目标段数边界（1~100000，bool/字符串拒绝）；**仅创建者可见** + 账号轮询不清除本机任务 + 合并保留计数；进度只记 `local_count` 且 `pending_sync_tasks` 不含本机任务；改名（无数据可改、重名/非法/已有录制目录/新目录已存在/非本机任务拒绝）；删除整条移除无墓碑；任务页 5 列/来源列/新建后选中/改名/删除；对话框实时校验与已有数据禁用改名 |
 | `lite_delete_test.py` | 离线 | lite 上传后删除的编号回归：列表 ep 与删除入参都必须是**全局号 N**（`_episode_max` 要把文件号 +1；`_delete_after_upload` 不许再加工——多 +1 会指向不存在的 N+1，残留复检空集 → 报成功却一个文件没删）、单段目录只删该段不 rmtree、无 parquet 的旧目录整目录删 |

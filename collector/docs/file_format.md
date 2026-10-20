@@ -4,6 +4,9 @@
 > 服务器导入器、离线处理工具、第三方数据读取器。凡本文标注 **MUST** 的条目，
 > 写入方必须产出、读取方必须容忍；标注 SHOULD 为建议。歧义以 `core/helpers.py`
 > 与 `core/egodata_writer.py` 的实现为准。
+>
+> 多设备并存（多相机 / 双夹爪 / ego 相机多轨迹）时的槽位与列名分配、`meta`
+> 声明细节见 [`multi_device_storage.md`](multi_device_storage.md)。
 
 v1.1.0 起录制数据从「每会话一个子目录」改为**任务级池化布局**（LeRobot v3
 命名）。v1.1.1 起 `stats.json` 自含累加器（每块加 `count`），`.stats_state.json`
@@ -250,7 +253,13 @@ fnum  = (N - 1) % 1000      # 三位零起：episode-000 .. episode-999
 | `timestamp` | float32 | **墙钟相对秒**（episode 内相对，f32 精度够） |
 | `task_index` | int64 | 现恒 0 |
 | `wall_time` | float64 | **绝对 Unix 秒**（宿主时钟锚） |
-| `hardware_ns` | int64 | 设备时钟硬件时间戳（ns，可绕回）；IMU 挂靠基准 |
+| `hardware_ns` | int64 | 设备时钟硬件时间戳（ns，可绕回）；IMU 挂靠基准。**D435（v1.3.11 起）取本行那一帧自己的戳**（RGB 行=彩色帧、深度=深度帧）；取不到设备钟时写 0（=未知），宿主时间另存 `host_ns` |
+| `depth_ns` | int64 | （D435）本行深度成员的设备钟 ns；深度轨对齐用，0=未知 |
+| `rgb_dup` / `rgb_gap` | int8 / int32 | （D435）彩色帧是否与上一行同一物理帧 / 中间跳过几帧（`frame_counter` 口径）|
+| `depth_dup` / `depth_gap` | int8 / int32 | （D435）同上，针对深度成员 |
+| `raw_hw_ns` | int64 | **归一前**的原始戳（v1.3.11，所有 RGB 槽位）。设备钟链路（D435）的 `hardware_ns` 在录制期被重写成「锚点 + 序号 × T」，原始值在这一列；**宿主钟链路（夹爪/S80M/裸手）两列相同**（v1.3.17 起不再重排） |
+| `ts_src` | int8 | （D435）时间戳来源：0=无设备钟 1=逐帧元数据 2=帧组戳(设备钟) 3=帧组戳(宿主钟) |
+| `host_ns` | int64 | （D435）仅 `ts_src=3` 时非 0：宿主单调钟 ns，不冒充设备钟 |
 
 ### 7.2 观测列（稀疏）
 
@@ -308,7 +317,7 @@ meta 行，不碰 data 字节）。
 
 | 列 | 盖戳者 | 语义 |
 |---|---|---|
-| `wall_time` | **写入线程**，建行落盘处 `time.time()` | 该行**写下来**的时刻（宿主墙钟，绝对 Unix 秒） |
+| `wall_time` | **写入线程**，`episode 起始墙钟 + timestamp`（v1.3.17 起） | 该行**采集时刻**的绝对 Unix 秒；`wall_time − timestamp` 恒为常数、段内严格递增。旧口径是落行那一刻的 `time.time()`，会带上写队列积压与掉拍（实测差整行 33ms） |
 | `hardware_ns` | **采集侧**，相机/传感器取到帧处 | 该帧**取到**的时刻。双目是 SDK 硬件戳（与 IMU 同源）；夹爪 RGB 是采集线程的宿主单调钟（≤078 段被截成有符号 32 位、每 4.295s 锯齿一次，读取方须按 2^32 解卷 —— `tools/audit_frame_gaps.py` 的 `trunc32`） |
 
 两者之差 = 中间队列的滞留（+ 两钟固定偏移）。**空洞**（相邻行 `hardware_ns` 间隔

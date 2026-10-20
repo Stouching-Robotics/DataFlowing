@@ -134,7 +134,7 @@ VENV_PY=/path/to/python ./tools/hand_3d_d435/run_live_d435.sh
 | `scripts/` | 录制后离线处理：手部关键点提取/标注/可视化导出（`process_hands.py`）；离线部署打包（`pack_wheels.py`）与手套工具包裁剪（`pack_toolkit.py`） | `docs/scripts.md` |
 | `tools/stereo_s80m/` | S80M 双目工具：`read_stereo_rgb.py`、`stereo_triangulate.py`、`render_stereo.py`、`hand_3d/`、离线 SLAM 导出（`export_offline_slam_dataset.py`、`validate_offline_dataset.py`） | `docs/stereo_s80m.md` |
 | `tools/` | 诊断与手部 3D 工具：`diag_*.py`、`hand_3d_d435/`（独立 D435 3D 手部管线模块）、`hand_3d_s80c/`（S80C 双目实时裸手/手套关键点 demo，含自包含 SDK）、`fayssense_depth_sdk/`（FaysSense VI Kit 深度引擎 SDK，专有）、`glove_package/`、`tests/`（回归/冒烟测试）、`weights/`（大权重）、`models/`（模型权重） | `docs/tools.md` |
-| `ui/` | PyQt5 界面：`main_window.py`、`camera_grid.py`、`playback_dialog.py`（回放）、`upload_dialog.py`、`task_page.py`、`device_panel.py`（设备检测面板）等 | `docs/ui.md` |
+| `ui/` | PyQt5 界面：`main_window.py`、`camera_grid.py`、`playback_dialog.py`（回放）、`upload_dialog.py`、`task_page.py`、`task_create_dialog.py`（本机任务新建/改名）、`device_panel.py`（设备检测面板）等 | `docs/ui.md` |
 | `tools/models/` | 模型权重：`hand_landmarker.task`（MediaPipe 裸手关键点，供 `tools/hand_detection/demo_stereo_hands.py` 等使用） | — |
 | `keypoints_output/` | 录制后手部关键点输出（镜像录制目录结构，gitignore） | — |
 | `dist/` | 自包含 demo 发布包（gitignore） | — |
@@ -230,6 +230,7 @@ VENV_PY=/path/to/python ./tools/hand_3d_d435/run_live_d435.sh
 各模块细节见 `docs/` 下的分文档：
 
 - `docs/data.md` — `data/` 配置与数据存储结构（本文档集）
+- `docs/multi_device_storage.md` — 多设备存储结构接口：设备 → 落点 → 命名 → 声明（双夹爪 / ego 多 SLAM 轨迹）
 - `docs/config.md`、`docs/core.md` — 配置、SDK 核心（采集/设备管理器/录制落盘/上传/回放/手套传感）
 - `docs/ui.md`、`docs/scripts.md` — 界面、离线脚本
 - `docs/demos.md`、`docs/stereo_s80m.md`、`docs/tools.md`、`docs/hand_detection.md` — demo、S80M、工具与手部检测

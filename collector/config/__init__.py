@@ -3,8 +3,56 @@
 版本号集中定义于此：settings.APP_VERSION 及其他模块均从这里取值。
 """
 
-__version__ = "1.3.15"
+__version__ = "1.3.17"
 
+# v1.3.17 —— 时间轴：不再谎报「什么时候」。两处改动都会改变落盘数值。
+#   ①**hardware_ns 只对设备钟链路重排**：均匀化（「锚点 + 序号 × T」）本来是为
+#   D435 修的（`rs2` syncer 补帧/跳号，戳出现 Δ=0 / Δ=2T）；一视同仁地套到
+#   **宿主戳**链路（夹爪 RGB / S80M 双目 / 裸手 UVC）上，等于把真实到达时刻换成
+#   30fps 网格 —— 锁定的 T 可能有偏（实测一段会话 33.1917ms vs 真实均值
+#   33.33ms），叠加 30~38ms 双峰到达后残差是随机游走，`hardware_ns` 在一段内能
+#   偏离真实采集时刻 **±100ms**，而 `timestamp` 仍是对的，两者对不上。现在宿主钟
+#   帧**原样落盘**（与 `raw_hw_ns` 相同），只有 `extra.ts_src ∈ {1,2}`（D435）
+#   才重排；判据 `pipeline._stamp_is_device_clock(extra)`，实现在
+#   `core/timestamp_norm.UniformTsClock`（T 取干净间隔均值，按槽位 fps 建标称
+#   周期；每槽位一个归一器、每段 `begin_segment()` 重锚）。原始值不丢：同写
+#   `raw_hw_ns`；补帧/跳帧事实仍由 `rgb_dup`/`rgb_gap`/`depth_dup`/`depth_gap`
+#   记录；落盘空洞看门狗吃归一前的原始戳。
+#   ②**`wall_time` = 本段起始墙钟 + 行相对时刻**，不再是落行那一刻的
+#   `time.time()`：旧值会带上写队列积压，写线程掉一拍就差整整一行（实测 11 段
+#   差 33ms）。掉拍现在记进 `drop_stats`（`write_pacing_resync_count` /
+#   `write_pacing_lag_max_ms`），此前完全不可见。
+#   两条语义都写进 `meta/info.json` 的 `time_axis`。质检器 `tools/data_qc.py`
+#   1.1.1 修 `max_segment_step_ms` 单位（原来 ns 当 ms 报）。
+#   测试：tools/tests/{test_uniform_ts_clock, test_capture_timestamp,
+#   test_uniform_hw_ts_recording, test_rebuild_hw_ts_from_host}.py；
+#   文档：docs/{core,file_format,data,tools}.md 与新增的
+#   docs/multi_device_storage.md。
+#
+# v1.3.16 —— 采集端自建任务（任务页新建 / 改名 / 删除本机任务）
+#   ①任务页顶栏「＋ 新建任务」→ TaskCreateDialog（名称 + 目标段数 + 描述），
+#   落 data/tasks.json：source="local"、id 前缀 local-、created_by 记创建身份。
+#   ②**仅创建者可见**：filter_by_identity 对本机任务按 created_by 过滤（assigned_user
+#   恒 None，不算指派任务；created_by 缺失视为无主、所有人可见）；merge_backend_tasks
+#   的账号撤销清除显式豁免本机任务 —— 否则账号轮询会把自建任务当「后端撤销」删掉。
+#   ③**进度只在本机**：pending_sync_tasks 跳过本机任务（服务端无对应任务，上报
+#   必被拒 400）；local_count 累计，synced/backend 恒 0；录制数据照常上传，
+#   服务器按任务名匹配/自动创建项目（与 lite 的自由任务名同一后端路径）。
+#   ④**名字即目录即上传项目名**：只允许字母/数字/汉字/下划线/连字符，拒绝空格/
+#   点/斜杠等非法字符（不做隐式清洗）、去首尾空白后 ≤64 字符、拒绝 Windows 保留名
+#   （CON/PRN/AUX/NUL/COM1-9/LPT1-9），大小写不敏感查重（含 hidden 墓碑与种子任务）
+#   —— 保证 name == task_tag(name)，不会出现「界面 A、目录 B、上传项目 C」。
+#   ⑤任务表 4 列 → 5 列（新增「来源」= 服务端/本机，本机绿、服务端灰）；底部新增
+#   「✏ 改名」（仅本机任务；**本机已有录制目录时拒绝** —— 改名不迁移数据，避免
+#   旧目录失去归属、上传队列路径脱节；新名字目录已存在也拒绝）；名称 tooltip 显示描述。
+#   ⑥删除本机任务 = 真删数据 + tasks.json 整条移除（后端不会再推送它，不需要 hidden
+#   墓碑；同名任务可重建）；服务端任务仍走 mark_hidden + 墓碑。
+#   ⑦顺手修两处既有问题：任务页「🗑 删除」按钮在选中行后一直是禁用的（从未
+#   setEnabled(True)，只能靠右键）；右键菜单删除作用于 currentRow 而非右键行，
+#   右键未选中行时会删错任务 —— 现在右键先 setCurrentCell 到该行。
+#   测试：tools/tests/test_task_create.py（新增 9 节）+ test_task_delete.py 第 4 节；
+#   文档 docs/{data,core,ui,index,tools}.md 与使用手册第 5 章（含 5.4 新建本机任务）。
+#
 # v1.3.15 —— 姿态语义的文档/注释校正 + 夹爪配对报错分型 + lite 取号跨 chunk
 #   ①**修一处数学错误**：protocol.finish_publish_pose 的 docstring 把
 #   「M·(R0ᵀ·R)·Mᵀ = (M·R0ᵀ·Mᵀ)·(M·R·Mᵀ)·(M·R0ᵀ·Mᵀ)ᵀ」写成恒等式，代数上不成立
